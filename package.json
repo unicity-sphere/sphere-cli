@@ -1,0 +1,83 @@
+{
+  "name": "@unicity-sphere/cli",
+  "version": "0.0.0",
+  "description": "The unified CLI for Sphere SDK and agentic-hosting control — DM-native",
+  "type": "module",
+  "license": "MIT",
+  "author": "Unicity Sphere",
+  "homepage": "https://github.com/unicity-sphere/sphere-cli#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unicity-sphere/sphere-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/unicity-sphere/sphere-cli/issues"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "sphere": "./bin/sphere.mjs",
+    "scli": "./bin/sphere.mjs",
+    "sphere-cli": "./bin/sphere.mjs"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run lint && npm run typecheck && npm run test",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run check && npm run build"
+  },
+  "dependencies": {
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@typescript-eslint/eslint-plugin": "^8.14.0",
+    "@typescript-eslint/parser": "^8.14.0",
+    "eslint": "^9.14.0",
+    "globals": "^17.5.0",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.14.0",
+    "vitest": "^2.1.4"
+  },
+  "keywords": [
+    "sphere",
+    "sphere-sdk",
+    "unicity",
+    "cli",
+    "wallet",
+    "nostr",
+    "p2p",
+    "dm"
+  ]
+}

@@ -1,0 +1,55 @@
+# sphere-cli
+
+The unified CLI for the Sphere SDK and agentic-hosting control — DM-native.
+
+## Status
+
+**Phase 1 scaffold.** Real commands are not wired yet. `sphere --help` shows
+the full command topology from the migration plan so you can see what's coming.
+
+See [`docs/SPHERE-CLI-EXTRACTION-PLAN.md`](https://github.com/unicity-sphere/sphere-sdk/blob/refactor/extract-cli-to-sphere-cli/docs/SPHERE-CLI-EXTRACTION-PLAN.md)
+for the full migration plan (same doc lives in `agentic-hosting` under the
+parallel refactor branch).
+
+## Install
+
+```bash
+npm install -g @unicity-sphere/cli
+```
+
+## Quickstart
+
+```bash
+sphere --help
+sphere --version
+```
+
+Phase 1 provides only scaffolding. Invoking any namespace (e.g. `sphere wallet`)
+prints a pointer to the migration schedule and exits non-zero.
+
+## Development
+
+```bash
+npm ci
+npm run build
+npm test
+npm run check   # lint + typecheck + test
+```
+
+## Design principles
+
+1. **DM-native.** All controller → manager and controller → tenant traffic goes
+   over NIP-17 encrypted Nostr DMs. No HTTP bridge, no test-only fallback.
+2. **Host-agnostic tenants.** `sphere tenant` addresses tenants by their own
+   nametag or pubkey, not by `(host, instance_id)` coordinates. Tenants may
+   migrate between hosts in the future without changing how you address them.
+3. **Sync-by-default CLI semantics.** Every command waits for causally-implied
+   effects (aggregator commit, Nostr relay ack, IPFS upload) before returning.
+   `--skip-<subsystem>` flags and `--timeout <ms>` allow explicit opt-out.
+4. **One binary, many namespaces.** `sphere host`, `sphere wallet`, `sphere
+   swap`, `sphere tenant`, etc. share one config, one identity layer, one
+   relay pool.
+
+## License
+
+MIT — see [`LICENSE`](./LICENSE).

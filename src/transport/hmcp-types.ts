@@ -197,16 +197,37 @@ export function createHmcpRequest(type: HmcpRequestType, payload: Record<string,
 
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
-function hasDangerousKeys(value: unknown, depth = 0): boolean {
-  if (depth > 20 || typeof value !== 'object' || value === null) return false;
+// Use a JSON.parse reviver to detect dangerous keys at parse time, regardless
+// of nesting depth. This avoids the depth-20 cliff of a recursive walk and
+// runs in O(n) with a single parse pass. If a dangerous key is found the
+// entire message is rejected (not silently cleaned).
+function safeParse(data: string): { value: unknown; hadDangerousKeys: boolean } {
+  let hadDangerousKeys = false;
+  const value = JSON.parse(data, (key, val) => {
+    if (DANGEROUS_KEYS.has(key)) { hadDangerousKeys = true; return undefined; }
+    return val;
+  });
+  return { value, hadDangerousKeys };
+}
+
+// Structural check used by host-commands.ts to validate --params arguments.
+export function hasDangerousKeys(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
   for (const key of Object.keys(value as object)) {
     if (DANGEROUS_KEYS.has(key)) return true;
-    if (hasDangerousKeys((value as Record<string, unknown>)[key], depth + 1)) return true;
+    if (hasDangerousKeys((value as Record<string, unknown>)[key])) return true;
   }
   return false;
 }
 
-export const MAX_MESSAGE_SIZE = 64 * 1024; // 64 KiB
+// 64 KiB measured in UTF-8 bytes, not JS string code units (which are UTF-16).
+export const MAX_MESSAGE_SIZE = 64 * 1024;
+
+function byteLength(s: string): number {
+  // Buffer.byteLength is available in Node; fall back to approximate for other runtimes.
+  if (typeof Buffer !== 'undefined') return Buffer.byteLength(s, 'utf8');
+  return new TextEncoder().encode(s).length;
+}
 
 export function isValidHmcpResponse(msg: unknown): msg is HmcpResponse {
   if (typeof msg !== 'object' || msg === null) return false;
@@ -217,18 +238,18 @@ export function isValidHmcpResponse(msg: unknown): msg is HmcpResponse {
     typeof obj['type'] === 'string' &&
     (HMCP_RESPONSE_TYPES as readonly string[]).includes(obj['type'] as string) &&
     typeof obj['payload'] === 'object' &&
-    obj['payload'] !== null &&
-    !hasDangerousKeys(obj)
+    obj['payload'] !== null
   );
 }
 
 export function parseHmcpResponse(data: string): HmcpResponse | null {
-  if (data.length > MAX_MESSAGE_SIZE) return null;
-  let parsed: unknown;
+  if (byteLength(data) > MAX_MESSAGE_SIZE) return null;
+  let result: { value: unknown; hadDangerousKeys: boolean };
   try {
-    parsed = JSON.parse(data);
+    result = safeParse(data);
   } catch {
     return null;
   }
-  return isValidHmcpResponse(parsed) ? parsed : null;
+  if (result.hadDangerousKeys) return null;
+  return isValidHmcpResponse(result.value) ? result.value : null;
 }

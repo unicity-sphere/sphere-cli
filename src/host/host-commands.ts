@@ -27,6 +27,7 @@ import type {
   HmStartReadyPayload,
   HmStopResultPayload,
 } from '../transport/hmcp-types.js';
+import { hasDangerousKeys } from '../transport/hmcp-types.js';
 import { initSphere, resolveManagerAddress } from './sphere-init.js';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -116,6 +117,9 @@ function parseJsonParams(raw: string | undefined): Record<string, unknown> | und
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new Error('--params must be a JSON object.');
   }
+  if (hasDangerousKeys(parsed)) {
+    throw new Error('--params contains forbidden keys (__proto__, constructor, prototype).');
+  }
   return parsed as Record<string, unknown>;
 }
 
@@ -135,8 +139,9 @@ function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
-function writeStderr(msg: string): void {
-  process.stderr.write(msg.endsWith('\n') ? msg : `${msg}\n`);
+function writeStderr(msg: unknown): void {
+  const s = typeof msg === 'string' ? msg : String(msg ?? 'unknown error');
+  process.stderr.write(s.endsWith('\n') ? s : `${s}\n`);
 }
 
 // =============================================================================
@@ -176,11 +181,17 @@ async function runWithTransport(cmd: Command, handler: Handler): Promise<void> {
   } catch (err) {
     handleError(err, json);
   } finally {
+    // transport must be disposed before sphere.destroy so communications
+    // unsubscribe works while the transport layer is still live.
     if (transport) {
-      try { await transport.dispose(); } catch { /* ignore */ }
+      try { await transport.dispose(); } catch (e) {
+        if (process.env['DEBUG']) writeStderr(`sphere-cli: transport.dispose error: ${e}`);
+      }
     }
     if (sphere) {
-      try { await sphere.destroy(); } catch { /* ignore */ }
+      try { await sphere.destroy(); } catch (e) {
+        if (process.env['DEBUG']) writeStderr(`sphere-cli: sphere.destroy error: ${e}`);
+      }
     }
   }
 }

@@ -113,6 +113,14 @@ class DmTransportImpl implements DmTransport {
    */
   private resolvedPubkey: string | null = null;
 
+  /**
+   * Messages that arrived before resolvedPubkey was set are buffered here and
+   * replayed once the pubkey is known. Capped at 32 to bound memory if an
+   * attacker floods DMs before the first send completes.
+   */
+  private readonly earlyMessages: DirectMessage[] = [];
+  private static readonly EARLY_MESSAGE_CAP = 32;
+
   private readonly correlators = new Map<string, Correlator>();
   private readonly unsubscribeDMs: () => void;
   private disposed = false;
@@ -132,8 +140,14 @@ class DmTransportImpl implements DmTransport {
   // ---------------------------------------------------------------------------
 
   private handleIncoming(msg: DirectMessage): void {
-    // Ignore messages until we know the manager's pubkey (i.e., until first send).
-    if (!this.resolvedPubkey) return;
+    if (!this.resolvedPubkey) {
+      // Buffer early messages so a fast manager reply isn't lost while sendDM
+      // is still in-flight. Capped to avoid unbounded memory on DM floods.
+      if (this.earlyMessages.length < DmTransportImpl.EARLY_MESSAGE_CAP) {
+        this.earlyMessages.push(msg);
+      }
+      return;
+    }
     if (normalizeKey(msg.senderPubkey) !== this.resolvedPubkey) return;
 
     const response = parseHmcpResponse(msg.content);
@@ -232,10 +246,13 @@ class DmTransportImpl implements DmTransport {
     this.unsubscribeDMs();
 
     const err = new TransportError('Transport disposed');
-    for (const { cancel } of this.correlators.values()) {
+    // Snapshot before iterating — cancel() calls cleanup() which deletes from
+    // the map. Clearing the snapshot first avoids modifying during iteration.
+    const pending = Array.from(this.correlators.values());
+    this.correlators.clear();
+    for (const { cancel } of pending) {
       cancel(err);
     }
-    this.correlators.clear();
   }
 
   // ---------------------------------------------------------------------------
@@ -246,6 +263,11 @@ class DmTransportImpl implements DmTransport {
     // manager address produce the same pubkey, so concurrent writes are safe.
     if (!this.resolvedPubkey) {
       this.resolvedPubkey = normalizeKey(sent.recipientPubkey);
+      // Replay any DMs that arrived before we knew the manager's pubkey.
+      const pending = this.earlyMessages.splice(0);
+      for (const msg of pending) {
+        this.handleIncoming(msg);
+      }
     }
   }
 }

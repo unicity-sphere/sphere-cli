@@ -164,7 +164,8 @@ export async function main(argv: string[] = process.argv): Promise<number> {
   const program = createCli();
   try {
     await program.parseAsync(argv);
-    return 0;
+    // Honour process.exitCode set by action handlers (e.g. runWithTransport errors).
+    return (typeof process.exitCode === 'number' ? process.exitCode : 0);
   } catch (err) {
     // commander throws CommanderError on --help/--version/parse errors; those are
     // handled internally (output already printed). Re-exit with the right code.

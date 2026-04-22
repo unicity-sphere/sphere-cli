@@ -26,16 +26,16 @@ interface CliConfig {
 function loadConfig(): CliConfig {
   try {
     if (fs.existsSync(CONFIG_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) as Partial<CliConfig>;
+      const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) as Record<string, unknown>;
       return {
-        network: raw.network ?? 'testnet',
-        dataDir: raw.dataDir ?? DEFAULT_DATA_DIR,
-        tokensDir: raw.tokensDir ?? DEFAULT_TOKENS_DIR,
-        currentProfile: raw.currentProfile,
+        network:        typeof raw['network']        === 'string' ? raw['network'] as NetworkType : 'testnet',
+        dataDir:        typeof raw['dataDir']        === 'string' ? raw['dataDir']                : DEFAULT_DATA_DIR,
+        tokensDir:      typeof raw['tokensDir']      === 'string' ? raw['tokensDir']              : DEFAULT_TOKENS_DIR,
+        currentProfile: typeof raw['currentProfile'] === 'string' ? raw['currentProfile']         : undefined,
       };
     }
-  } catch {
-    // Fall through to defaults.
+  } catch (e) {
+    process.stderr.write(`sphere: failed to parse ${CONFIG_FILE}: ${String(e)}. Using defaults.\n`);
   }
   return { network: 'testnet', dataDir: DEFAULT_DATA_DIR, tokensDir: DEFAULT_TOKENS_DIR };
 }

@@ -21,6 +21,7 @@
 
 import { Command } from 'commander';
 import { VERSION } from './version.js';
+import { createHostCommand } from './host/host-commands.js';
 
 // Legacy namespaces that delegate to the sphere-sdk CLI dispatcher.
 // These are wired in phase 2 and replaced command-by-command in phase 4+.
@@ -32,7 +33,6 @@ const LEGACY_NAMESPACES = new Set([
 
 // Phase 4 namespaces — DM-native, not yet implemented.
 const PHASE4_NAMESPACES: Array<[string, string]> = [
-  ['host', 'HMCP: controller → host manager (over DM)'],
   ['tenant', 'ACP: controller → tenant (over DM, host-agnostic)'],
 ];
 
@@ -152,6 +152,9 @@ export function createCli(): Command {
       process.exit(64); // EX_USAGE
     });
   }
+
+  // Phase 4 (live): `sphere host` — HMCP over Sphere DMs.
+  program.addCommand(createHostCommand());
 
   return program;
 }

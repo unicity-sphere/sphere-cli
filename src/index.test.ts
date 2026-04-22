@@ -47,7 +47,7 @@ describe('sphere-cli scaffold', () => {
       }) as never);
 
     try {
-      await main(['node', 'sphere', 'host']);
+      await main(['node', 'sphere', 'tenant']);
     } finally {
       writeSpy.mockRestore();
       exitSpy.mockRestore();

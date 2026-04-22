@@ -1,0 +1,268 @@
+/**
+ * DmTransport — send HMCP-0 requests over Sphere DMs and await correlated responses.
+ *
+ * Usage:
+ *   const transport = createDmTransport(sphere.communications, { managerAddress: '@mymanager' });
+ *   const response  = await transport.sendRequest(createHmcpRequest('hm.list', {}));
+ *   await transport.dispose();
+ *
+ * For commands that emit multiple responses (e.g. hm.spawn → ack + ready/failed):
+ *   await transport.sendRequestStream(request, (response) => {
+ *     process(response);
+ *     return isTerminal(response.type); // return true to stop
+ *   });
+ */
+
+import type { DirectMessage } from '@unicitylabs/sphere-sdk';
+import type { HmcpRequest, HmcpResponse } from './hmcp-types.js';
+import { parseHmcpResponse } from './hmcp-types.js';
+import { TimeoutError, TransportError } from './errors.js';
+
+export type { HmcpRequest, HmcpResponse } from './hmcp-types.js';
+export { createHmcpRequest, HMCP_RESPONSE_TYPES } from './hmcp-types.js';
+export { TimeoutError, AuthError, TransportError } from './errors.js';
+
+// =============================================================================
+// Config / Interface
+// =============================================================================
+
+export interface DmTransportConfig {
+  /**
+   * Address of the host manager: @nametag, DIRECT://hex, or raw 64-char hex pubkey.
+   * Sphere resolves nametags and DIRECT:// internally via sendDM.
+   */
+  managerAddress: string;
+
+  /**
+   * Default timeout for single-response requests (ms). Default: 30 000.
+   */
+  timeoutMs?: number;
+
+  /**
+   * Default timeout for streaming requests, e.g. spawn that waits for container
+   * to become RUNNING. Default: 120 000.
+   */
+  streamTimeoutMs?: number;
+}
+
+/** Narrow slice of Sphere.communications needed by DmTransport — injectable for testing. */
+export interface SphereComms {
+  sendDM(recipient: string, content: string): Promise<{ recipientPubkey: string }>;
+  onDirectMessage(handler: (message: DirectMessage) => void): () => void;
+}
+
+export interface DmTransport {
+  /**
+   * Send a request and return the first correlated response.
+   * Throws TimeoutError if no response arrives within timeoutMs.
+   * Throws TransportError if the send itself fails or the transport is disposed.
+   */
+  sendRequest(request: HmcpRequest, timeoutMs?: number): Promise<HmcpResponse>;
+
+  /**
+   * Send a request and receive all correlated responses until onResponse returns
+   * true (done) or the stream timeout elapses.
+   *
+   * onResponse receives each HmcpResponse in order. Return true to signal done
+   * (cleans up the correlator). Return false to keep listening.
+   *
+   * Throws TimeoutError or TransportError.
+   */
+  sendRequestStream(
+    request: HmcpRequest,
+    onResponse: (response: HmcpResponse) => boolean,
+    timeoutMs?: number,
+  ): Promise<void>;
+
+  /** Release the DM subscription. Any in-flight requests reject with TransportError. */
+  dispose(): Promise<void>;
+}
+
+// =============================================================================
+// Pubkey normalisation
+// =============================================================================
+
+/** Strip 02/03 prefix to get x-only 64-char hex — matches CommunicationsModule._normalizeKey. */
+function normalizeKey(key: string): string {
+  if (key.length === 66 && (key.startsWith('02') || key.startsWith('03'))) {
+    return key.slice(2);
+  }
+  return key;
+}
+
+// =============================================================================
+// Implementation
+// =============================================================================
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_STREAM_TIMEOUT_MS = 120_000;
+
+interface Correlator {
+  handler: (response: HmcpResponse) => void;
+  cancel: (err: Error) => void;
+}
+
+class DmTransportImpl implements DmTransport {
+  private readonly timeoutMs: number;
+  private readonly streamTimeoutMs: number;
+
+  /**
+   * Resolved x-only pubkey of the manager.
+   * Set after the first successful sendDM call and cached for sender auth.
+   * Concurrent first-sends write the same pubkey — safe.
+   */
+  private resolvedPubkey: string | null = null;
+
+  private readonly correlators = new Map<string, Correlator>();
+  private readonly unsubscribeDMs: () => void;
+  private disposed = false;
+
+  constructor(
+    private readonly comms: SphereComms,
+    private readonly managerAddress: string,
+    config: { timeoutMs: number; streamTimeoutMs: number },
+  ) {
+    this.timeoutMs = config.timeoutMs;
+    this.streamTimeoutMs = config.streamTimeoutMs;
+
+    // Subscribe once — route all incoming DMs through the correlator map.
+    this.unsubscribeDMs = comms.onDirectMessage((msg) => this.handleIncoming(msg));
+  }
+
+  // ---------------------------------------------------------------------------
+
+  private handleIncoming(msg: DirectMessage): void {
+    // Ignore messages until we know the manager's pubkey (i.e., until first send).
+    if (!this.resolvedPubkey) return;
+    if (normalizeKey(msg.senderPubkey) !== this.resolvedPubkey) return;
+
+    const response = parseHmcpResponse(msg.content);
+    if (!response) return;
+
+    const correlator = this.correlators.get(response.in_reply_to);
+    correlator?.handler(response);
+  }
+
+  // ---------------------------------------------------------------------------
+
+  async sendRequest(request: HmcpRequest, timeoutMs?: number): Promise<HmcpResponse> {
+    return new Promise<HmcpResponse>((resolve, reject) => {
+      if (this.disposed) {
+        reject(new TransportError('Transport has been disposed'));
+        return;
+      }
+
+      const timeout = timeoutMs ?? this.timeoutMs;
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.correlators.delete(request.msg_id);
+      };
+
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new TimeoutError(`No response for ${request.type} within ${timeout} ms`));
+      }, timeout);
+
+      this.correlators.set(request.msg_id, {
+        handler: (response) => { cleanup(); resolve(response); },
+        cancel: (err)      => { cleanup(); reject(err); },
+      });
+
+      this.send(request).catch((err: unknown) => {
+        cleanup();
+        reject(new TransportError(`Failed to send ${request.type}: ${String((err as Error).message ?? err)}`));
+      });
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+
+  async sendRequestStream(
+    request: HmcpRequest,
+    onResponse: (response: HmcpResponse) => boolean,
+    timeoutMs?: number,
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (this.disposed) {
+        reject(new TransportError('Transport has been disposed'));
+        return;
+      }
+
+      const timeout = timeoutMs ?? this.streamTimeoutMs;
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.correlators.delete(request.msg_id);
+      };
+
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new TimeoutError(`Stream for ${request.type} timed out after ${timeout} ms`));
+      }, timeout);
+
+      this.correlators.set(request.msg_id, {
+        handler: (response) => {
+          let done: boolean;
+          try {
+            done = onResponse(response);
+          } catch (err) {
+            cleanup();
+            reject(err);
+            return;
+          }
+          if (done) { cleanup(); resolve(); }
+          // else: keep correlator — more responses expected
+        },
+        cancel: (err) => { cleanup(); reject(err); },
+      });
+
+      this.send(request).catch((err: unknown) => {
+        cleanup();
+        reject(new TransportError(`Failed to send ${request.type}: ${String((err as Error).message ?? err)}`));
+      });
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.unsubscribeDMs();
+
+    const err = new TransportError('Transport disposed');
+    for (const { cancel } of this.correlators.values()) {
+      cancel(err);
+    }
+    this.correlators.clear();
+  }
+
+  // ---------------------------------------------------------------------------
+
+  private async send(request: HmcpRequest): Promise<void> {
+    const sent = await this.comms.sendDM(this.managerAddress, JSON.stringify(request));
+    // Cache the resolved pubkey on first send. Subsequent sends for the same
+    // manager address produce the same pubkey, so concurrent writes are safe.
+    if (!this.resolvedPubkey) {
+      this.resolvedPubkey = normalizeKey(sent.recipientPubkey);
+    }
+  }
+}
+
+// =============================================================================
+// Factory
+// =============================================================================
+
+/**
+ * Create a DmTransport connected to a specific manager address.
+ *
+ * Subscribes to incoming DMs immediately. The manager's pubkey is resolved
+ * lazily on the first send — no network round-trip at construction.
+ */
+export function createDmTransport(comms: SphereComms, config: DmTransportConfig): DmTransport {
+  return new DmTransportImpl(comms, config.managerAddress, {
+    timeoutMs: config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    streamTimeoutMs: config.streamTimeoutMs ?? DEFAULT_STREAM_TIMEOUT_MS,
+  });
+}

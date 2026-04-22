@@ -15,13 +15,26 @@
  *   sphere daemon      — long-running event listener
  *   sphere config      — CLI configuration (profiles, relays, manager nametag)
  *
- * Phase 1 wires only the scaffold + `--version`. Real commands land in
- * phase 2 (migrate from sphere-sdk/cli/) and phase 4 (migrate from
- * agentic-hosting/src/cli/ + the new DM transport).
+ * Phase 2: legacy sphere-sdk CLI wired under all namespaces.
+ * Phase 4: real DM-native commands replace legacy.
  */
 
 import { Command } from 'commander';
 import { VERSION } from './version.js';
+
+// Legacy namespaces that delegate to the sphere-sdk CLI dispatcher.
+// These are wired in phase 2 and replaced command-by-command in phase 4+.
+const LEGACY_NAMESPACES = new Set([
+  'wallet', 'balance', 'payments', 'dm', 'group', 'market', 'swap',
+  'invoice', 'nametag', 'crypto', 'util', 'faucet', 'daemon', 'config',
+  'completions',
+]);
+
+// Phase 4 namespaces — DM-native, not yet implemented.
+const PHASE4_NAMESPACES: Array<[string, string]> = [
+  ['host', 'HMCP: controller → host manager (over DM)'],
+  ['tenant', 'ACP: controller → tenant (over DM, host-agnostic)'],
+];
 
 export function createCli(): Command {
   const program = new Command();
@@ -31,41 +44,29 @@ export function createCli(): Command {
     .description('The unified CLI for Sphere SDK and agentic-hosting control')
     .version(VERSION, '-v, --version', 'output the version number');
 
-  // Namespace placeholders. Each is a real commander subcommand with a help
-  // stub that tells the user "not yet — see phase N". This lets `sphere --help`
-  // reflect the full topology immediately, so users know what's coming.
-  const namespaces: Array<[string, string, string]> = [
-    ['wallet', 'Wallet lifecycle (init, status, profiles)', 'phase 2'],
-    ['balance', 'L3 token balances + asset info', 'phase 2'],
-    ['payments', 'Send, receive, history', 'phase 2'],
-    ['dm', 'Direct messages (NIP-17) — send, inbox, history', 'phase 2'],
-    ['group', 'Group chat (NIP-29)', 'phase 2'],
-    ['market', 'Post and search trading intents', 'phase 2'],
-    ['swap', 'P2P atomic swap lifecycle', 'phase 2'],
-    ['invoice', 'Invoicing + accounting', 'phase 2'],
-    ['nametag', 'Register and look up nametags', 'phase 2'],
-    ['crypto', 'Key / wallet utility commands', 'phase 2'],
-    ['util', 'Amount conversion, base58 codec', 'phase 2'],
-    ['faucet', 'Testnet token faucet', 'phase 2'],
-    ['daemon', 'Long-running event listener', 'phase 2'],
-    ['host', 'HMCP: controller → host manager (over DM)', 'phase 4'],
-    ['tenant', 'ACP: controller → tenant (over DM, host-agnostic)', 'phase 4'],
-    ['config', 'CLI configuration (profiles, relays, manager)', 'phase 1+'],
-    ['completions', 'Shell completion scripts', 'phase 2'],
-  ];
-
-  for (const [name, description, phase] of namespaces) {
+  // Phase 2: legacy commands — delegate to the sphere-sdk CLI dispatcher.
+  for (const name of LEGACY_NAMESPACES) {
     const sub = program
       .command(name)
-      .description(`${description} [${phase}]`);
+      .description(`${name} commands (legacy bridge — phase 2)`);
 
-    // Catch-all action so `sphere wallet init` (with args) prints a helpful
-    // message until the real command lands. Subcommands within each namespace
-    // come in later phases.
+    sub.allowUnknownOption(true);
+    sub.action(async () => {
+      const { legacyMain } = await import('./legacy/legacy-cli.js');
+      await legacyMain();
+    });
+  }
+
+  // Phase 4 stubs — DM-native commands, not yet implemented.
+  for (const [name, description] of PHASE4_NAMESPACES) {
+    const sub = program
+      .command(name)
+      .description(`${description} [phase 4]`);
+
     sub.allowUnknownOption(true);
     sub.action(() => {
       process.stderr.write(
-        `sphere ${name}: not implemented yet (scheduled for ${phase}). ` +
+        `sphere ${name}: not implemented yet (scheduled for phase 4). ` +
           `See SPHERE-CLI-EXTRACTION-PLAN.md for the migration schedule.\n`,
       );
       process.exit(64); // EX_USAGE

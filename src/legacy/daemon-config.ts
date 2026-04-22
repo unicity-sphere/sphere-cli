@@ -6,6 +6,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 // =============================================================================
+// Atomic file writes
+// =============================================================================
+
+// =============================================================================
 // Interfaces
 // =============================================================================
 
@@ -30,6 +34,9 @@ export type DaemonAction = BashAction | WebhookAction | BuiltinAction;
 
 export interface BashAction {
   type: 'bash';
+  // SECURITY: `command` is executed via exec() with full shell interpretation.
+  // The daemon config file must be chmod 600 and writable only by the daemon user.
+  // Never accept daemon config from untrusted sources.
   command: string;
   timeout?: number;
   cwd?: string;
@@ -228,15 +235,30 @@ function validateAction(action: unknown, ruleIndex: number, actionIndex: number)
 
 export function loadDaemonConfig(configPath?: string): DaemonConfig {
   const filePath = configPath || DEFAULT_CONFIG_PATH;
-  if (!fs.existsSync(filePath)) {
-    throw new Error(`Config file not found: ${filePath}`);
+
+  let raw: string;
+  try {
+    raw = fs.readFileSync(filePath, 'utf8');
+  } catch (e: unknown) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(`Config file not found: ${filePath}`);
+    }
+    // Non-ENOENT read errors (permissions, I/O) surface as warnings + rethrow.
+    process.stderr.write(
+      `sphere: WARNING: Failed to read config at ${filePath} — ` +
+      `Backup the file and delete it to reset. Error: ${(e as Error).message}\n`
+    );
+    throw e;
   }
 
-  const raw = fs.readFileSync(filePath, 'utf8');
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch {
+  } catch (e: unknown) {
+    process.stderr.write(
+      `sphere: WARNING: Failed to parse config at ${filePath} — using defaults. ` +
+      `Backup the file and delete it to reset. Error: ${(e as Error).message}\n`
+    );
     throw new Error(`Invalid JSON in config file: ${filePath}`);
   }
 

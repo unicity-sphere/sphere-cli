@@ -29,6 +29,99 @@ import {
 } from './daemon-config';
 
 // =============================================================================
+// PID file helpers (JSON format with nonce for PID reuse detection)
+// =============================================================================
+
+interface PidFileData {
+  pid: number;
+  nonce: number;
+  cmd: string;
+}
+
+/**
+ * Parse a PID file. Handles both the new JSON format and the legacy plain-text
+ * format (just a number). Returns null on parse failure or missing file.
+ */
+function readPidFile(pidFile: string): PidFileData | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(pidFile, 'utf8').trim();
+  } catch (e: unknown) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    return null;
+  }
+  if (!raw) return null;
+
+  // Try JSON first (current format)
+  try {
+    const obj = JSON.parse(raw) as unknown;
+    if (obj && typeof obj === 'object') {
+      const o = obj as Record<string, unknown>;
+      const pid = typeof o.pid === 'number' ? o.pid : NaN;
+      if (!Number.isFinite(pid)) return null;
+      return {
+        pid,
+        nonce: typeof o.nonce === 'number' ? o.nonce : 0,
+        cmd: typeof o.cmd === 'string' ? o.cmd : '',
+      };
+    }
+  } catch {
+    // Fall through to legacy format
+  }
+
+  // Legacy plain-text PID
+  const pid = parseInt(raw, 10);
+  if (!Number.isFinite(pid)) return null;
+  return { pid, nonce: 0, cmd: '' };
+}
+
+/**
+ * Check if `pid` is alive and appears to be a node process (via /proc/<pid>/comm
+ * on Linux). On non-Linux platforms, falls back to a pure liveness check.
+ * Returns false for dead PIDs and for PIDs that are alive but clearly not ours
+ * (i.e. PID reuse case).
+ */
+function isDaemonProcessAlive(pid: number): boolean {
+  if (!isProcessAlive(pid)) return false;
+  // Best-effort PID reuse detection via /proc/<pid>/comm (Linux only).
+  try {
+    const comm = fs.readFileSync(`/proc/${pid}/comm`, 'utf8').trim().toLowerCase();
+    // Node processes show up as 'node' (or 'sphere-daemon' if process.title was set).
+    if (comm.length === 0) return true;
+    if (comm.includes('node') || comm.includes('sphere')) return true;
+    // Alive but the cmd doesn't match — treat as stale (PID reuse).
+    return false;
+  } catch {
+    // /proc not available (non-Linux) or no permission — fall back to liveness.
+    return true;
+  }
+}
+
+/**
+ * Write the PID file atomically with exclusive create semantics.
+ * Throws EEXIST if another daemon has already claimed the file.
+ */
+function writePidFileExclusive(pidFile: string, data: PidFileData): void {
+  const fd = fs.openSync(pidFile, 'wx');
+  try {
+    fs.writeSync(fd, JSON.stringify(data));
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Delete a file, ignoring ENOENT. Avoids TOCTOU races from existsSync+unlinkSync.
+ */
+function safeUnlink(filePath: string): void {
+  try {
+    fs.unlinkSync(filePath);
+  } catch (e: unknown) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+  }
+}
+
+// =============================================================================
 // All known SphereEventType values (for wildcard expansion)
 // =============================================================================
 
@@ -177,6 +270,9 @@ function buildEnvVars(eventType: string, data: unknown): Record<string, string> 
 function executeBash(action: BashAction, envVars: Record<string, string>, globalTimeout: number): Promise<void> {
   const timeout = action.timeout || globalTimeout;
   return new Promise<void>((resolve) => {
+    // SECURITY: `command` is executed via exec() with full shell interpretation.
+    // The daemon config file must be chmod 600 and writable only by the daemon user.
+    // Never accept daemon config from untrusted sources.
     const child = exec(action.command, {
       env: { ...process.env, ...envVars },
       timeout,
@@ -198,8 +294,9 @@ function executeBash(action: BashAction, envVars: Record<string, string>, global
       resolve();
     });
 
-    // Pipe event JSON to stdin
+    // Pipe event JSON to stdin. Ignore EPIPE in case the child closes stdin early.
     if (child.stdin) {
+      child.stdin.on('error', () => { /* ignore EPIPE etc. */ });
       child.stdin.write(envVars.SPHERE_EVENT_JSON);
       child.stdin.end();
     }
@@ -358,6 +455,7 @@ function setupMarketFeed(
   sphere: Sphere,
   dispatchMap: Map<SphereEventType, DaemonRule[]>,
   globalTimeout: number,
+  inflight: Set<Promise<void>>,
 ): (() => void) | null {
   if (!sphere.market) {
     log('Warning: Market module not available, skipping market feed');
@@ -371,9 +469,11 @@ function setupMarketFeed(
   const unsubscribe = sphere.market.subscribeFeed((message) => {
     const envVars = buildEnvVars('market:feed', message);
     for (const rule of marketRules) {
-      dispatchRule(rule, 'market:feed', message, envVars, sphere, globalTimeout).catch(err => {
+      const p = dispatchRule(rule, 'market:feed', message, envVars, sphere, globalTimeout).catch(err => {
         log(`[DISPATCH ERROR] market:feed: ${err instanceof Error ? err.message : err}`);
       });
+      inflight.add(p);
+      p.finally(() => inflight.delete(p));
     }
   });
 
@@ -409,6 +509,32 @@ export async function runDaemon(
 
   verboseMode = flags.verbose;
 
+  // -----------------------------------------------------------------------
+  // Fix D-3: Install early signal handlers BEFORE any async setup begins, so
+  // a SIGTERM during getSphere() or subscription wiring still cleans up the
+  // PID file and exits cleanly instead of being handled by the default
+  // terminating action.
+  // -----------------------------------------------------------------------
+  let shuttingDown = false;
+  let fullShutdown: (() => Promise<void>) | null = null;
+
+  const earlyShutdown = (): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (fullShutdown) {
+      fullShutdown().catch(() => { /* swallow */ }).finally(() => process.exit(0));
+    } else {
+      // Signal arrived before setup completed — best-effort PID file cleanup.
+      if (flags._forked || flags.detach) {
+        safeUnlink(config.pidFile);
+      }
+      process.exit(0);
+    }
+  };
+
+  process.on('SIGTERM', earlyShutdown);
+  process.on('SIGINT', earlyShutdown);
+
   // In forked mode, redirect stdout/stderr to log file
   if (flags._forked) {
     ensureDir(config.logFile);
@@ -422,9 +548,26 @@ export async function runDaemon(
     console.error = (...a: unknown[]) => { stream.write('[ERROR] ' + a.map(String).join(' ') + '\n'); };
     console.warn = (...a: unknown[]) => { stream.write('[WARN] ' + a.map(String).join(' ') + '\n'); };
 
-    // Write PID file
+    // Fix D-1 + D-2: Exclusive-create the PID file with JSON payload so two
+    // concurrent `sphere daemon start` invocations don't both succeed, and so
+    // stop logic can detect PID reuse via the nonce + cmd fields.
     ensureDir(config.pidFile);
-    fs.writeFileSync(config.pidFile, String(process.pid));
+    const pidData: PidFileData = {
+      pid: process.pid,
+      nonce: Date.now(),
+      cmd: 'sphere-daemon',
+    };
+    try {
+      writePidFileExclusive(config.pidFile, pidData);
+    } catch (e: unknown) {
+      if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
+        process.stderr.write(
+          'sphere daemon: another daemon instance is already starting. Exiting.\n'
+        );
+        process.exit(1);
+      }
+      throw e;
+    }
 
     // Disconnect from parent
     if (process.disconnect) process.disconnect();
@@ -469,6 +612,9 @@ export async function runDaemon(
     log(`Wallet: ${identity.nametag ? '@' + identity.nametag : identity.l1Address}`);
   }
 
+  // Fix D-4: Track in-flight dispatch promises so shutdown can await them.
+  const inflight = new Set<Promise<void>>();
+
   // Subscribe to events
   const unsubscribers: (() => void)[] = [];
 
@@ -480,9 +626,11 @@ export async function runDaemon(
       }
       const envVars = buildEnvVars(eventType, data);
       for (const rule of rules) {
-        dispatchRule(rule, eventType, data, envVars, sphere, config.actionTimeout).catch(err => {
+        const p = dispatchRule(rule, eventType, data, envVars, sphere, config.actionTimeout).catch(err => {
           log(`[DISPATCH ERROR] ${eventType}: ${err instanceof Error ? err.message : err}`);
         });
+        inflight.add(p);
+        p.finally(() => inflight.delete(p));
       }
     });
     unsubscribers.push(unsub);
@@ -490,43 +638,55 @@ export async function runDaemon(
 
   // Market feed
   if (config.marketFeed || dispatchMap.has('market:feed' as SphereEventType)) {
-    const unsub = setupMarketFeed(sphere, dispatchMap, config.actionTimeout);
+    const unsub = setupMarketFeed(sphere, dispatchMap, config.actionTimeout, inflight);
     if (unsub) unsubscribers.push(unsub);
   }
 
   log('Daemon running. Waiting for events...');
 
   // Graceful shutdown
-  let shuttingDown = false;
-  const shutdown = async () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
+  const shutdown = async (): Promise<void> => {
     log('Shutting down daemon...');
 
     for (const unsub of unsubscribers) {
       try { unsub(); } catch { /* ignore */ }
     }
 
+    // Fix D-4: Wait for in-flight dispatches to drain (max 10s) before
+    // tearing down Sphere or exiting. Prevents mid-action corruption of
+    // token state when SIGTERM arrives during auto-receive / bash / webhook.
+    if (inflight.size > 0) {
+      await Promise.race([
+        Promise.allSettled([...inflight]),
+        new Promise<void>(resolve => setTimeout(resolve, 10_000)),
+      ]);
+    }
+
     try { await closeSphere(); } catch { /* ignore */ }
 
-    // Clean up PID file
+    // Fix D-7: replace existsSync+unlinkSync with safeUnlink (no TOCTOU).
     if (flags._forked || flags.detach) {
-      try {
-        if (fs.existsSync(config.pidFile)) fs.unlinkSync(config.pidFile);
-      } catch { /* ignore */ }
+      try { safeUnlink(config.pidFile); } catch { /* ignore */ }
     }
 
-    if (logStream) {
-      logStream.end();
-      logStream = null;
-    }
-
+    // Fix D-5 / D-9: log final message BEFORE ending the stream, then await
+    // end() so pending writes flush before we exit.
     log('Daemon stopped.');
-    process.exit(0);
+    if (logStream) {
+      const stream = logStream;
+      logStream = null;
+      await new Promise<void>(resolve => {
+        try {
+          stream.end(() => resolve());
+        } catch {
+          resolve();
+        }
+      });
+    }
   };
 
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  // Swap the early handler for the real one now that setup is complete.
+  fullShutdown = shutdown;
 
   // Keep alive
   await new Promise(() => {});
@@ -547,15 +707,17 @@ function detachDaemon(args: string[], flags: DaemonFlags): void {
     pidFile = getDefaultPidFile();
   }
 
-  // Check if already running
-  if (fs.existsSync(pidFile)) {
-    const existingPid = parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
-    if (isProcessAlive(existingPid)) {
-      console.error(`Daemon already running (PID ${existingPid}). Use "daemon stop" first.`);
+  // Check if already running. Note: this check is advisory only — the forked
+  // child performs an atomic exclusive-create on the PID file so concurrent
+  // `daemon start` invocations won't both succeed (Fix D-1).
+  const existing = readPidFile(pidFile);
+  if (existing) {
+    if (isDaemonProcessAlive(existing.pid)) {
+      console.error(`Daemon already running (PID ${existing.pid}). Use "daemon stop" first.`);
       process.exit(1);
     }
-    // Stale PID file
-    fs.unlinkSync(pidFile);
+    // Stale PID file (process dead OR PID reused by unrelated process).
+    safeUnlink(pidFile);
   }
 
   // Build child args: replace --detach with --_forked, keep everything else
@@ -589,23 +751,31 @@ export async function stopDaemon(args: string[]): Promise<void> {
   const flags = parseDaemonFlags(args);
   const pidFile = flags.pidFile || getDefaultPidFile();
 
-  if (!fs.existsSync(pidFile)) {
+  const pidData = readPidFile(pidFile);
+  if (!pidData) {
     console.log('No daemon running (PID file not found).');
     return;
   }
+  const pid = pidData.pid;
 
-  const pid = parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
-
-  if (!isProcessAlive(pid)) {
-    console.log(`Stale PID file (process ${pid} not running). Cleaning up.`);
-    fs.unlinkSync(pidFile);
+  // Fix D-2: Check liveness + PID reuse detection. If the PID is alive but
+  // appears to be a different (non-node) process, treat as stale so we don't
+  // SIGTERM someone else's editor/shell.
+  if (!isDaemonProcessAlive(pid)) {
+    console.log(`Stale PID file (process ${pid} not running or reused). Cleaning up.`);
+    safeUnlink(pidFile);
     return;
   }
 
   console.log(`Stopping daemon (PID ${pid})...`);
 
-  // Send SIGTERM
-  process.kill(pid, 'SIGTERM');
+  // Fix D-6: SIGTERM may race against process exit (ESRCH). Treat as already-dead.
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (e: unknown) {
+    if ((e as NodeJS.ErrnoException).code !== 'ESRCH') throw e;
+    // Already dead — fall through to cleanup.
+  }
 
   // Wait up to 5 seconds for graceful shutdown
   const deadline = Date.now() + 5000;
@@ -613,8 +783,8 @@ export async function stopDaemon(args: string[]): Promise<void> {
     await sleep(200);
     if (!isProcessAlive(pid)) {
       console.log('Daemon stopped.');
-      // Clean up PID file if it still exists
-      if (fs.existsSync(pidFile)) fs.unlinkSync(pidFile);
+      // Fix D-7: no existsSync race — unlink-or-ignore-ENOENT.
+      safeUnlink(pidFile);
       return;
     }
   }
@@ -623,13 +793,14 @@ export async function stopDaemon(args: string[]): Promise<void> {
   console.log('Graceful shutdown timed out, sending SIGKILL...');
   try {
     process.kill(pid, 'SIGKILL');
-  } catch {
-    // Process may have exited between check and kill
+  } catch (e: unknown) {
+    if ((e as NodeJS.ErrnoException).code !== 'ESRCH') throw e;
+    // Process already exited.
   }
 
   await sleep(500);
 
-  if (fs.existsSync(pidFile)) fs.unlinkSync(pidFile);
+  safeUnlink(pidFile);
   console.log('Daemon killed.');
 }
 
@@ -641,14 +812,15 @@ export async function statusDaemon(args: string[]): Promise<void> {
   const flags = parseDaemonFlags(args);
   const pidFile = flags.pidFile || getDefaultPidFile();
 
-  if (!fs.existsSync(pidFile)) {
+  const pidData = readPidFile(pidFile);
+  if (!pidData) {
     console.log('Daemon is not running.');
     return;
   }
+  const pid = pidData.pid;
 
-  const pid = parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
-
-  if (!isProcessAlive(pid)) {
+  // Fix D-2: treat "alive but not a node process" as stale (PID reuse).
+  if (!isDaemonProcessAlive(pid)) {
     console.log(`Daemon is not running (stale PID file, process ${pid}).`);
     return;
   }

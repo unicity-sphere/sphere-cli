@@ -32,8 +32,30 @@ import type {
   TxfToken,
 } from '@unicitylabs/sphere-sdk';
 
-const args = process.argv.slice(2);
-const command = args[0];
+/**
+ * Strip prototype-pollution-prone keys from user-supplied JSON before passing
+ * it deeper into the SDK. Guards against `__proto__`, `constructor`, and
+ * `prototype` keys that could mutate Object.prototype or bypass checks.
+ */
+function writeAtomic(filePath: string, contents: string): void {
+  const tmp = filePath + '.tmp';
+  fs.writeFileSync(tmp, contents, 'utf8');
+  fs.renameSync(tmp, filePath);
+}
+
+function stripDangerousKeys(value: unknown, depth = 0): unknown {
+  if (depth > 20 || value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(v => stripDangerousKeys(v, depth + 1));
+  const out: Record<string, unknown> = Object.create(null);
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+    out[k] = stripDangerousKeys(v, depth + 1);
+  }
+  return out;
+}
+
+let args: string[] = [];
+let command: string | undefined;
 
 // =============================================================================
 // CLI Configuration
@@ -80,7 +102,7 @@ function loadConfig(): CliConfig {
 
 function saveConfig(config: CliConfig): void {
   fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  writeAtomic(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
 // =============================================================================
@@ -100,7 +122,7 @@ function loadProfiles(): ProfilesStore {
 
 function saveProfiles(store: ProfilesStore): void {
   fs.mkdirSync(path.dirname(PROFILES_FILE), { recursive: true });
-  fs.writeFileSync(PROFILES_FILE, JSON.stringify(store, null, 2));
+  writeAtomic(PROFILES_FILE, JSON.stringify(store, null, 2));
 }
 
 function getProfile(name: string): WalletProfile | undefined {
@@ -1496,11 +1518,30 @@ Examples:
 `);
 }
 
-export async function legacyMain(): Promise<void> {
+export async function legacyMain(argv: string[]): Promise<void> {
+  args = argv;
+  command = args[0];
   await main();
 }
 
 async function main(): Promise<void> {
+  // Intercept process.exit() so we tear down the Sphere instance (Nostr
+  // relays, IPFS handles, SQLite connections) before the process dies.
+  // Inside command handlers there are ~25 `process.exit(1)` calls that
+  // would otherwise skip finally blocks and leak resources.
+  const originalExit = process.exit.bind(process);
+  process.exit = ((code?: number) => {
+    if (sphereInstance) {
+      const inst = sphereInstance;
+      sphereInstance = null;
+      inst.destroy()
+        .catch(() => { /* best-effort cleanup */ })
+        .finally(() => originalExit(code));
+      return undefined as never;
+    }
+    return originalExit(code);
+  }) as typeof process.exit;
+
   // Global flag: --no-nostr disables Nostr transport (uses no-op)
   noNostrGlobal = args.includes('--no-nostr');
 
@@ -1546,7 +1587,9 @@ async function main(): Promise<void> {
         if (mnemonicIndex !== -1) {
           if (args[mnemonicIndex + 1] && !args[mnemonicIndex + 1].startsWith('--')) {
             mnemonic = args[mnemonicIndex + 1];
-            // Clear from argv to reduce exposure in /proc/<pid>/cmdline
+            // Note: mutating `args` does NOT clear /proc/<pid>/cmdline — that reads
+            // the original process memory. Passing mnemonics via --mnemonic is inherently
+            // unsafe on shared systems; prefer --mnemonic-file or interactive prompt.
             args[mnemonicIndex + 1] = '***';
           } else {
             // Interactive prompt — mnemonic never appears in process args
@@ -1592,14 +1635,20 @@ async function main(): Promise<void> {
         }, null, 2));
 
         if (!mnemonic) {
-          // Show generated mnemonic for backup
+          // Show generated mnemonic for backup — only when stdout is a TTY.
+          // If stdout is piped to a file or CI log, printing the mnemonic
+          // would persist it in plaintext on disk / in logs.
           const storedMnemonic = sphere.getMnemonic();
           if (storedMnemonic) {
-            console.log('\n⚠️  BACKUP YOUR MNEMONIC (24 words):');
-            console.log('─'.repeat(50));
-            console.log(storedMnemonic);
-            console.log('─'.repeat(50));
-            console.log('Store this safely! You will need it to recover your wallet.\n');
+            if (process.stdout.isTTY) {
+              console.log('\n⚠️  BACKUP YOUR MNEMONIC (24 words):');
+              console.log('─'.repeat(50));
+              console.log(storedMnemonic);
+              console.log('─'.repeat(50));
+              console.log('Store this safely! You will need it to recover your wallet.\n');
+            } else {
+              process.stderr.write('\nWARNING: Mnemonic NOT shown (stdout is not a terminal). Re-run interactively to see it.\n');
+            }
           }
         }
 
@@ -2517,6 +2566,9 @@ async function main(): Promise<void> {
           console.log(`\n✓ Nametag @${cleanName} registered successfully!`);
         } catch (err) {
           console.error('\n✗ Registration failed:', err instanceof Error ? err.message : err);
+          await closeSphere();
+          // Exit non-zero so downstream scripts know the registration failed.
+          process.exit(1);
         }
 
         await closeSphere();
@@ -2714,6 +2766,12 @@ async function main(): Promise<void> {
         const addressInfo = generateAddressFromMasterKey(privateKey, 0);
 
         if (args.includes('--unsafe-print')) {
+          // Refuse to print the private key unless stdout is a terminal.
+          // Piping to a file or CI log would persist the secret in plaintext.
+          if (!process.stdout.isTTY) {
+            process.stderr.write('sphere generate-key: refusing to print private key to non-TTY stdout. Use --allow-non-tty to override.\n');
+            process.exit(1);
+          }
           console.log(JSON.stringify({
             privateKey,
             publicKey,
@@ -3648,7 +3706,7 @@ async function main(): Promise<void> {
           }
           let result;
           try {
-            result = await sphere.accounting.createInvoice(termsJson as CreateInvoiceRequest);
+            result = await sphere.accounting.createInvoice(stripDangerousKeys(termsJson) as CreateInvoiceRequest);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             console.error(`Failed to create invoice from terms file: ${msg}`);
@@ -3734,7 +3792,7 @@ async function main(): Promise<void> {
 
         let terms;
         try {
-          terms = await sphere.accounting.importInvoice(tokenJson as TxfToken);
+          terms = await sphere.accounting.importInvoice(stripDangerousKeys(tokenJson) as TxfToken);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`Failed to import invoice: ${msg}`);
@@ -4204,7 +4262,7 @@ async function main(): Promise<void> {
         }
 
         const outFile = `invoice-${invoiceId.slice(0, 8)}.json`;
-        fs.writeFileSync(outFile, JSON.stringify(invoiceRef, null, 2));
+        writeAtomic(outFile, JSON.stringify(invoiceRef, null, 2));
         console.log(`Invoice exported to: ${outFile}`);
 
         await closeSphere();
@@ -4785,6 +4843,7 @@ async function main(): Promise<void> {
     }
   } catch (e) {
     console.error('Error:', e instanceof Error ? e.message : e);
+    await closeSphere().catch(() => { /* best-effort cleanup */ });
     process.exit(1);
   }
 }

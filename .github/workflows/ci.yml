@@ -37,8 +37,15 @@ jobs:
           cache: npm
 
       - name: Clone sphere-sdk sibling
+        # Pin to the CLI-extraction branch (refactor/extract-cli-to-sphere-cli).
+        # This branch contains the commit `bc07e89 feat(cli-extraction)` which
+        # promoted CLI-consumed types (CreateInvoiceRequest, PayInvoiceParams,
+        # encrypt/decrypt helpers, etc.) to the public module surface. Those
+        # exports have not yet landed on `main` or in any published npm
+        # version. Switch to `main` once the branch merges upstream.
         run: |
-          git clone --depth 1 https://github.com/unicity-sphere/sphere-sdk.git ../../sphere-sdk
+          git clone --depth 1 --branch refactor/extract-cli-to-sphere-cli \
+            https://github.com/unicity-sphere/sphere-sdk.git ../../sphere-sdk
 
       - name: "Build sphere-sdk (required for file: dependency to resolve types)"
         run: |

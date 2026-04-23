@@ -56,7 +56,14 @@ function buildLegacyArgv(namespace: string): string[] {
 
   switch (namespace) {
     // These namespaces directly match legacy top-level commands — keep namespace as command
-    case 'wallet':      return ['wallet',      ...tail];
+    // wallet: most subcommands (list, use, create, current, delete) are 'wallet <sub>';
+    // but 'wallet init' + 'wallet status' are legacy top-level commands, remapped here.
+    case 'wallet': {
+      const [sub, ...rest] = tail;
+      if (sub === 'init')   return ['init',   ...rest];  // legacy top-level `init`
+      if (sub === 'status') return ['status', ...rest];  // legacy top-level `status`
+      return ['wallet', ...tail];
+    }
     case 'balance':     return ['balance',     ...tail];
     case 'daemon':      return ['daemon',      ...tail];
     case 'config':      return ['config',      ...tail];

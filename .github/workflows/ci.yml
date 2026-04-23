@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+# sphere-cli consumes @unicitylabs/sphere-sdk via `file:../../sphere-sdk`
+# because the CLI-extraction commit in sphere-sdk (which promoted types
+# like CreateInvoiceRequest, PayInvoiceParams to the public exports)
+# landed AFTER the sphere-sdk v0.7.0 npm release. Until a new sphere-sdk
+# version is published, CI clones the sibling repo into the expected
+# `../../sphere-sdk` location and builds it in-place so the `file:`
+# dependency resolves correctly.
+#
+# Swap to an npm-published version once sphere-sdk v0.7.1+ ships.
+
 jobs:
   lint-typecheck-test:
     name: lint + typecheck + test
@@ -15,16 +25,33 @@ jobs:
         node-version: [20.x, 22.x]
     steps:
       - uses: actions/checkout@v4
+        # Default path: $GITHUB_WORKSPACE/
+        # = /home/runner/work/sphere-cli/sphere-cli/
+        # package.json's `file:../../sphere-sdk` resolves from there to
+        # /home/runner/work/sphere-sdk/ — that's where we clone below.
+
       - name: Use Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+
+      - name: Clone sphere-sdk sibling
+        run: |
+          git clone --depth 1 https://github.com/unicity-sphere/sphere-sdk.git ../../sphere-sdk
+
+      - name: "Build sphere-sdk (required for file: dependency to resolve types)"
+        run: |
+          cd ../../sphere-sdk
+          npm ci
+          npm run build
+
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
       - run: npm run test
       - run: npm run build
+
       - name: Verify bin shim is executable
         run: |
           chmod +x bin/sphere.mjs

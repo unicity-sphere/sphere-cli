@@ -4,17 +4,17 @@
  * Flow:
  *   1. Initialize a single testnet wallet.
  *   2. Extract its directAddress from the `wallet init` JSON output.
- *   3. Send a DM from the wallet to itself (`sphere dm send DIRECT://<self> <msg>`).
- *   4. Re-run `sphere dm inbox` and assert the message appears.
+ *   3. Send a DM from the wallet to itself with a unique nonce.
+ *   4. Poll `sphere dm inbox` until the nonce appears or we time out.
  *
  * This exercises:
  *   - Aggregator trustbase fetch  (Sphere.init)
  *   - IPFS identity publish       (createNodeProviders.tokenSync.ipfs)
- *   - Nostr relay connect + NIP-17 encrypted publish + subscription
+ *   - Nostr relay connect + NIP-17 encrypted publish + subscription + decrypt
  *
  * Self-DM avoids coordinating two parallel wallet lifecycles and keeps the
  * test deterministic — the receiver is also the sender, so we don't depend
- * on two separate relay subscriptions.
+ * on two separate relay subscriptions staying alive simultaneously.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -26,9 +26,15 @@ import {
   type SphereEnv,
 } from './helpers.js';
 
+// NOTE: preflight.integration.test.ts reports which public endpoints are
+// reachable — it does not gate these tests (vitest evaluates skipIf at
+// registration time, before preflight's beforeAll runs). Infra outages
+// surface with stderr diagnostics below.
+
 describe.skipIf(integrationSkip)('sphere-cli integration — DM round-trip (real Nostr)', () => {
   let env: SphereEnv;
   let directAddress: string | null = null;
+  let nonce: string | null = null;
 
   beforeAll(async () => {
     env = createSphereEnv('dm');
@@ -47,11 +53,11 @@ describe.skipIf(integrationSkip)('sphere-cli integration — DM round-trip (real
     directAddress = match[1]!;
   }, 180_000);
 
-  afterAll(() => { destroySphereEnv(env); });
+  afterAll(() => { if (env) destroySphereEnv(env); });
 
-  it('sends a self-DM via the public Nostr relay (send succeeds)', () => {
+  it('sends a self-DM via the public Nostr relay', () => {
     expect(directAddress).toBeTruthy();
-    const nonce = `sphere-cli-it-${Date.now().toString(36)}`;
+    nonce = `sphere-cli-it-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const r = runSphere(
       env,
       ['dm', 'send', directAddress!, `integration test ${nonce}`],
@@ -64,23 +70,52 @@ describe.skipIf(integrationSkip)('sphere-cli integration — DM round-trip (real
     }
 
     expect(r.status).toBe(0);
-    // Legacy dm command prints "✓ Message sent to <recipient>" on success.
+    // Legacy dm command prints "✓ Message sent to <recipient>" + "ID:" on success.
     expect(r.stdout).toMatch(/Message sent|ID:/i);
   }, 90_000);
 
-  it('`sphere dm inbox` returns without error (self-DM may not appear in same run)', () => {
-    // Nostr relay propagation + NIP-17 gift-wrap decryption can take several
-    // seconds. This test asserts inbox retrieval works end-to-end against the
-    // real relay; assertion of the self-DM's content would be flaky and is
-    // left out intentionally. The DM was exercised by the previous test.
-    const r = runSphere(env, ['dm', 'inbox'], { timeoutMs: 60_000 });
+  it('self-DM reaches the inbox (round-trip verified via nonce)', async () => {
+    expect(directAddress).toBeTruthy();
+    expect(nonce, 'previous test must have sent the DM before we can poll for it').toBeTruthy();
 
-    if (r.status !== 0) {
-      // eslint-disable-next-line no-console
-      console.error('dm inbox failed', { status: r.status, stdout: r.stdout, stderr: r.stderr });
+    // Poll the inbox — NIP-17 gift-wrap decryption on the receiving side
+    // is eventually-consistent. 20 tries × 3s each = 60s max wait, well
+    // under the test-level 90s budget.
+    const MAX_ATTEMPTS = 20;
+    const POLL_INTERVAL_MS = 3_000;
+
+    let delivered = false;
+    let lastStdout = '';
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+      const r = runSphere(env, ['dm', 'inbox'], { timeoutMs: 30_000 });
+      if (r.status !== 0) {
+        // eslint-disable-next-line no-console
+        console.error('dm inbox failed', { attempt: i, status: r.status, stderr: r.stderr });
+        break;
+      }
+      lastStdout = r.stdout;
+      // Inbox renders the last message preview; our nonce is unique enough
+      // that any occurrence means the gift-wrap landed and decrypted.
+      if (lastStdout.includes(nonce!)) {
+        delivered = true;
+        break;
+      }
+      if (i < MAX_ATTEMPTS - 1) {
+        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      }
     }
 
-    expect(r.status).toBe(0);
-    expect(r.stdout.toLowerCase()).toMatch(/inbox|conversation|no conversations/);
+    // If delivery didn't land within the budget, surface stdout to help
+    // triage whether this is relay latency, our own subscription, or a
+    // real regression in sendDM. Prefer a skip-on-infra over a flaky fail.
+    if (!delivered) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        'self-DM did not reach inbox within budget — likely relay propagation ' +
+          `latency, not a regression. Nonce: ${nonce}. Last inbox stdout:\n${lastStdout}`,
+      );
+    }
+
+    expect(delivered).toBe(true);
   }, 90_000);
 });

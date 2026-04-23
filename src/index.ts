@@ -50,10 +50,15 @@ const PHASE4_NAMESPACES: Array<[string, string]> = [
  *   - `dm`, `group`, `market`, `swap`, `invoice` prefix the subcommand with
  *     `<namespace>-` (e.g. `sphere swap propose` → `swap-propose`).
  */
-function buildLegacyArgv(namespace: string): string[] {
-  // tail = everything after: node sphere <namespace>
-  const tail = process.argv.slice(3);
-
+/**
+ * Translate a commander namespace + tail into the argv shape that the
+ * legacy sphere-sdk CLI switch/case dispatcher expects.
+ *
+ * Exported (with the `tail` parameter explicit) so that the dispatch table
+ * can be unit-tested without spawning processes or mocking `process.argv`.
+ * The live path passes `process.argv.slice(3)` from the commander action.
+ */
+export function buildLegacyArgv(namespace: string, tail: string[] = process.argv.slice(3)): string[] {
   switch (namespace) {
     // These namespaces directly match legacy top-level commands — keep namespace as command
     // wallet: most subcommands (list, use, create, current, delete) are 'wallet <sub>';

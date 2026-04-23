@@ -18,12 +18,10 @@ import {
   type SphereEnv,
 } from './helpers.js';
 
-// NOTE: preflight.integration.test.ts runs alongside this file and reports
-// which public endpoints are reachable. It does not gate these tests —
-// vitest evaluates skipIf at registration time before preflight's beforeAll
-// runs. On infra outages, these tests fail with stderr diagnostics; grep
-// for "aggregator is reachable" in the suite output to distinguish infra
-// from real regressions.
+// NOTE: 00-preflight.integration.test.ts runs first (filename sort) and
+// reports which public endpoints are reachable. It does not gate these
+// tests — it's purely a diagnostic signal so operators can distinguish
+// infra outages from code regressions at a glance.
 
 describe.skipIf(integrationSkip)('sphere-cli integration — wallet init (real testnet)', () => {
   let env: SphereEnv;

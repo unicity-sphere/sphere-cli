@@ -56,9 +56,15 @@ async function probeTls(wssUrl: string): Promise<boolean> {
     const done = (ok: boolean) => {
       if (settled) return;
       settled = true;
+      clearTimeout(hardTimeout);
       try { socket.destroy(); } catch { /* ignore */ }
       resolve(ok);
     };
+    // Outer hard timeout — bounds DNS resolution and TCP SYN-drop paths
+    // that tls.connect's own `timeout` option does not cover (socket-level
+    // timeout only applies once the socket is writable, not during DNS
+    // lookup or initial connect on a restricted network).
+    const hardTimeout = setTimeout(() => done(false), PROBE_TIMEOUT_MS);
     const socket = tlsConnect({
       host: u.hostname,
       port,

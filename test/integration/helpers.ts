@@ -13,7 +13,7 @@ import {
   statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
@@ -54,12 +54,15 @@ export interface SphereEnv {
  * SIGKILL / CI watchdog between `mkdtempSync` and `destroySphereEnv` would
  * otherwise leak a testnet wallet's mnemonic + private key under `/tmp`
  * indefinitely. Scans `/tmp` at module load and removes any entry matching
- * the prefix whose mtime is > 1 hour old (the grace window covers concurrent
- * in-flight runs on shared CI).
+ * the prefix whose mtime is > 24 hours old — generous enough that a long
+ * `vitest --watch` debug session (paused at a breakpoint) or a legit hour-
+ * long concurrent run cannot have its dir swept mid-flight. Stale crashes
+ * are almost always noticed same-day, so 24h is enough to keep /tmp tidy
+ * without racing active tests.
  */
 function sweepStaleTmpDirs(): void {
   const root = tmpdir();
-  const cutoffMs = Date.now() - 60 * 60 * 1000;
+  const cutoffMs = Date.now() - 24 * 60 * 60 * 1000;
   let entries: string[];
   try {
     entries = readdirSync(root);
@@ -95,17 +98,14 @@ function shredAllActive(): void {
 
 // Install cleanup handlers exactly once at module load. `exit` catches
 // normal termination; `SIGINT`/`SIGTERM` catch Ctrl-C and CI watchdog
-// kills; `uncaughtException`/`unhandledRejection` catch test-framework
-// explosions that bypass `afterAll`.
+// kills. We intentionally do NOT install uncaughtException/unhandledRejection
+// handlers here: vitest's own error reporting relies on those channels to
+// produce a failed-test JSON report, and an extra handler calling
+// process.exit(1) would truncate that output. The `exit` handler below
+// still runs on vitest's natural shutdown and shreds any lingering envs.
 process.once('exit', shredAllActive);
 process.once('SIGINT', () => { shredAllActive(); process.exit(130); });
 process.once('SIGTERM', () => { shredAllActive(); process.exit(143); });
-process.once('uncaughtException', (err) => {
-  shredAllActive();
-  // eslint-disable-next-line no-console
-  console.error('uncaughtException in integration tests:', err);
-  process.exit(1);
-});
 
 /**
  * Create an isolated sphere-cli profile rooted in a fresh 0700 tmp directory.
@@ -195,7 +195,3 @@ export const PUBLIC_TESTNET = {
  * Allows CI to opt out via `SKIP_INTEGRATION=1`.
  */
 export const integrationSkip = process.env['SKIP_INTEGRATION'] === '1';
-
-// `dirname` is used in places below; alias to silence unused-import if
-// tsup tree-shakes it inconsistently.
-void dirname;

@@ -26,10 +26,12 @@ import {
   type SphereEnv,
 } from './helpers.js';
 
-// NOTE: preflight.integration.test.ts reports which public endpoints are
-// reachable — it does not gate these tests (vitest evaluates skipIf at
-// registration time, before preflight's beforeAll runs). Infra outages
-// surface with stderr diagnostics below.
+// NOTE: 00-preflight.integration.test.ts runs first (filename sort) and
+// reports which public endpoints are reachable. It does not gate these
+// tests — it's purely a diagnostic signal so operators can distinguish
+// infra outages from code regressions at a glance. Infra outages surface
+// with stderr diagnostics from the tests below in addition to the
+// preflight failures.
 
 describe.skipIf(integrationSkip)('sphere-cli integration — DM round-trip (real Nostr)', () => {
   let env: SphereEnv;
@@ -79,10 +81,14 @@ describe.skipIf(integrationSkip)('sphere-cli integration — DM round-trip (real
     expect(nonce, 'previous test must have sent the DM before we can poll for it').toBeTruthy();
 
     // Poll the inbox — NIP-17 gift-wrap decryption on the receiving side
-    // is eventually-consistent. 20 tries × 3s each = 60s max wait, well
-    // under the test-level 90s budget.
-    const MAX_ATTEMPTS = 20;
-    const POLL_INTERVAL_MS = 3_000;
+    // is eventually-consistent. Budget analysis: each `sphere dm inbox`
+    // spawns a fresh CLI that re-runs Sphere.init() (trustbase fetch,
+    // Nostr connect, subscribe) — empirically 1–4s per call. With
+    // MAX_ATTEMPTS=10 and POLL_INTERVAL_MS=2000 the worst case is
+    // ~60s (10×4s spawn + 9×2s sleep), comfortably under the 180s test
+    // budget below.
+    const MAX_ATTEMPTS = 10;
+    const POLL_INTERVAL_MS = 2_000;
 
     let delivered = false;
     let lastStdout = '';
@@ -117,5 +123,5 @@ describe.skipIf(integrationSkip)('sphere-cli integration — DM round-trip (real
     }
 
     expect(delivered).toBe(true);
-  }, 90_000);
+  }, 180_000);
 });

@@ -10,15 +10,10 @@ describe('sphere-cli scaffold', () => {
 
   it('--version prints the VERSION constant', () => {
     const program = createCli();
-    // commander's version() wires a flag that writes to stdout and exits.
-    // Rather than intercept process.exit, verify the version metadata.
     const opts = program.opts();
     expect(typeof opts).toBe('object');
-    // version is on the program, not in opts; commander attaches it privately.
-    // We verify via the public API: the help text includes VERSION.
     const help = program.helpInformation();
     expect(VERSION).toBeTruthy();
-    // Help text should include "Usage: sphere"
     expect(help).toContain('Usage: sphere');
   });
 
@@ -35,8 +30,7 @@ describe('sphere-cli scaffold', () => {
     }
   });
 
-  it('invoking an unimplemented namespace prints "not implemented yet" and exits non-zero', async () => {
-    // Capture stderr writes + intercept process.exit so the test runner survives.
+  it('invoking a phase-4 namespace prints "not implemented yet" and exits 64', async () => {
     const stderrCalls: string[] = [];
     const writeSpy = vi
       .spyOn(process.stderr, 'write')
@@ -49,12 +43,11 @@ describe('sphere-cli scaffold', () => {
       .spyOn(process, 'exit')
       .mockImplementation(((code?: number) => {
         exitCode = code;
-        // Throw to short-circuit the namespace action; main()'s catch will swallow it.
         throw new Error('__mock_exit__');
       }) as never);
 
     try {
-      await main(['node', 'sphere', 'wallet']);
+      await main(['node', 'sphere', 'tenant']);
     } finally {
       writeSpy.mockRestore();
       exitSpy.mockRestore();
@@ -63,13 +56,18 @@ describe('sphere-cli scaffold', () => {
     expect(exitCode).toBe(64);
     const joined = stderrCalls.join('');
     expect(joined).toContain('not implemented yet');
-    expect(joined).toContain('phase 2');
+    expect(joined).toContain('phase 4');
   });
 
-  it('help namespaces show the phase annotations', () => {
+  it('help shows phase 4 annotation for DM-native namespaces', () => {
     const program = createCli();
     const help = program.helpInformation();
-    expect(help).toContain('[phase 2]');
     expect(help).toContain('[phase 4]');
+  });
+
+  it('help shows legacy bridge annotation for phase 2 namespaces', () => {
+    const program = createCli();
+    const help = program.helpInformation();
+    expect(help).toContain('legacy bridge');
   });
 });

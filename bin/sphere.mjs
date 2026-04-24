@@ -16,15 +16,24 @@ const srcEntry = resolve(__dirname, '../src/index.ts');
 if (existsSync(distEntry)) {
   const mod = await import(distEntry);
   const code = await mod.main(process.argv);
-  if (code !== 0) process.exit(code);
+  // Always exit explicitly so open handles (Nostr sockets, timers) don't keep
+  // the process alive after the command finishes. Daemon commands manage their
+  // own keep-alive via event loop references and never return from main().
+  process.exit(code);
 } else if (existsSync(srcEntry)) {
-  // Dev mode: delegate to tsx (must be installed).
+  // Dev mode: resolve tsx from local node_modules to avoid PATH injection.
   const { spawn } = await import('node:child_process');
-  const child = spawn('npx', ['tsx', srcEntry, ...process.argv.slice(2)], {
+  const tsxBin = resolve(__dirname, '../node_modules/.bin/tsx');
+  const tsxEntry = existsSync(tsxBin) ? tsxBin : 'npx tsx';
+  const [cmd, ...cmdArgs] = tsxEntry.includes(' ')
+    ? ['npx', 'tsx']
+    : [tsxBin];
+  const child = spawn(cmd, [...cmdArgs, srcEntry, ...process.argv.slice(2)], {
     stdio: 'inherit',
   });
-  child.on('exit', (code) => process.exit(code ?? 0));
+  // Use 'close' (not 'exit') so all child stdio flushes before we exit.
+  child.on('close', (code) => process.exit(code ?? 0));
 } else {
-  console.error('sphere: no entry found. Did you run `npm run build`?');
+  process.stderr.write('sphere: no entry found. Did you run `npm run build`?\n');
   process.exit(1);
 }

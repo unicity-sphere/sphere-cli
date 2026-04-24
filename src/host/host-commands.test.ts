@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { Command } from 'commander';
+import type { Command } from 'commander';
 import {
   parseEnvPairs,
   parseJsonParams,

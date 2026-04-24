@@ -53,8 +53,21 @@ sphere host spawn --manager @myhostmanager --template tpl-1 mybot
 npm ci
 npm run build
 npm test
-npm run check   # lint + typecheck + test
+npm run check             # lint + typecheck + unit tests
+npm run test:integration  # end-to-end tests against real public testnet
 ```
+
+### Integration tests
+
+The `test/integration/` suite exercises the built CLI against real public
+infrastructure:
+
+- Nostr relay  — `wss://nostr-relay.testnet.unicity.network`
+- Aggregator   — `https://goggregator-test.unicity.network`
+- IPFS gateway — `https://unicity-ipfs1.dyndns.org`
+
+Each test creates a throwaway wallet in `/tmp` so runs are fully isolated and
+never touch real funds. Skip with `SKIP_INTEGRATION=1` when offline.
 
 ## Design principles
 

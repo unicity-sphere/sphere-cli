@@ -1,0 +1,72 @@
+name: Integration tests (nightly)
+
+# Runs the real-testnet integration suite on a nightly schedule. Excluded
+# from the default push/PR CI because these tests:
+#   - hit public Nostr relay, aggregator, and IPFS endpoints (shared infra,
+#     not our own — we don't want to hammer them on every push)
+#   - take minutes to run (wallet bootstrap + real DM round-trips)
+#   - can flake on transient relay/aggregator hiccups
+#
+# Triggers:
+#   - schedule: 03:07 UTC nightly (odd minute to avoid the :00 traffic spike)
+#   - workflow_dispatch: manual trigger from the Actions tab for on-demand runs
+#
+# Failures surface in the Actions tab but do NOT block PR merges.
+
+on:
+  schedule:
+    # 03:07 UTC every day
+    - cron: '7 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  integration:
+    name: integration (testnet)
+    runs-on: ubuntu-latest
+    # Single Node version — integration tests are slow and exercise the SDK,
+    # not Node-version-specific behaviour. Unit-test matrix stays in ci.yml.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      # See ci.yml for the rationale behind the sibling-clone workaround.
+      # Kept identical here so a nightly run is hermetic w.r.t. ci.yml state.
+      - name: Clone sphere-sdk sibling
+        run: |
+          git clone --depth 1 --branch refactor/extract-cli-to-sphere-cli \
+            https://github.com/unicity-sphere/sphere-sdk.git ../../sphere-sdk
+
+      - name: Build sphere-sdk (required for file: dependency to resolve types)
+        run: |
+          cd ../../sphere-sdk
+          npm ci
+          npm run build
+
+      - run: npm ci
+
+      # The integration script builds the CLI itself (test:integration =
+      # `npm run build && vitest run --config vitest.integration.config.ts`),
+      # so no explicit build step here.
+      - name: Run integration tests
+        run: npm run test:integration
+        # Total suite ~5 min worst case; 20 min is generous headroom for
+        # a slow testnet day without leaving a hung job indefinitely.
+        timeout-minutes: 20
+
+      # Upload the tmp wallet dirs + logs on failure so a flake is debuggable
+      # without re-running. Path covers the vitest test-timeout stderr spew
+      # plus anything the integration helpers leave in os.tmpdir().
+      - name: Collect logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs-${{ github.run_id }}
+          path: |
+            /tmp/sphere-cli-it-*/
+          retention-days: 7
+          if-no-files-found: ignore

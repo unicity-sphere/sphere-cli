@@ -4,12 +4,28 @@ The unified CLI for the Sphere SDK and agentic-hosting control — DM-native.
 
 ## Status
 
-**Phase 1 scaffold.** Real commands are not wired yet. `sphere --help` shows
-the full command topology from the migration plan so you can see what's coming.
+**Phase 2 — legacy bridge + live host commands.** The full wallet / balance /
+payments / dm / market / swap / invoice / nametag / crypto / util / faucet /
+daemon / config / completions surface is wired via the legacy sphere-sdk
+dispatcher. The DM-native `sphere host` namespace (HMCP-0 over Sphere DMs) is
+live and production-ready. Phase 4 (`sphere tenant` — ACP over DMs) remains
+stubbed and exits with a pointer to the migration schedule.
 
 See [`docs/SPHERE-CLI-EXTRACTION-PLAN.md`](https://github.com/unicity-sphere/sphere-sdk/blob/refactor/extract-cli-to-sphere-cli/docs/SPHERE-CLI-EXTRACTION-PLAN.md)
 for the full migration plan (same doc lives in `agentic-hosting` under the
 parallel refactor branch).
+
+### What works today
+
+| Namespace | Status | Notes |
+|---|---|---|
+| `sphere wallet` | legacy bridge | list, use, create, current, delete, init, status |
+| `sphere balance` / `payments` / `dm` / `group` | legacy bridge | |
+| `sphere market` / `swap` / `invoice` | legacy bridge | |
+| `sphere nametag` / `crypto` / `util` / `faucet` | legacy bridge | |
+| `sphere daemon` / `config` / `completions` | legacy bridge | |
+| `sphere host` | **DM-native (live)** | HMCP-0: spawn, list, stop, start, inspect, remove, pause, resume, help, cmd |
+| `sphere tenant` | Phase 4 (stub) | Exits with scheduled message |
 
 ## Install
 
@@ -22,10 +38,14 @@ npm install -g @unicity-sphere/cli
 ```bash
 sphere --help
 sphere --version
-```
 
-Phase 1 provides only scaffolding. Invoking any namespace (e.g. `sphere wallet`)
-prints a pointer to the migration schedule and exits non-zero.
+# Legacy bridge example
+sphere wallet init --network testnet
+
+# DM-native host example
+sphere host list --manager @myhostmanager
+sphere host spawn --manager @myhostmanager --template tpl-1 mybot
+```
 
 ## Development
 

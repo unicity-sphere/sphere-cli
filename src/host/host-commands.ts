@@ -548,8 +548,12 @@ export function createHostCommand(): Command {
     .description('Spawn a new tenant instance from a template')
     .requiredOption('--template <id>', 'Template ID to instantiate')
     .option('--nametag <n>', 'Nametag to register for the tenant')
+    // Note: single-arg form (no ellipsis) + argParser accumulator.
+    // The variadic form `<KEY=VAL...>` greedily consumes every subsequent
+    // non-flag token — including the positional `<name>` that follows. Users
+    // repeat `--env FOO=1 --env BAR=2` to pass multiple pairs.
     .addOption(
-      new Option('--env <KEY=VAL...>', 'Environment variable pairs')
+      new Option('--env <KEY=VAL>', 'Environment variable pair (repeat for multiple)')
         .argParser((value: string, previous: string[] | undefined) =>
           previous ? [...previous, value] : [value]) as Option,
     )

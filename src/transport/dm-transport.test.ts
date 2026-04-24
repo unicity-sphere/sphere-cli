@@ -329,4 +329,24 @@ describe('DmTransport', () => {
     await expect(transport.sendRequest(request)).rejects.toThrow(TransportError);
     await expect(transport.sendRequestStream(request, () => true)).rejects.toThrow(TransportError);
   });
+
+  // --------------------------------------------------------------------------
+  // Send-side MAX_MESSAGE_SIZE cap
+  // --------------------------------------------------------------------------
+
+  it('rejects send with TransportError when serialized request exceeds MAX_MESSAGE_SIZE', async () => {
+    const { comms } = buildMockComms();
+    const transport = createDmTransport(comms, { managerAddress: '@manager', timeoutMs: 5_000 });
+
+    // Construct a request whose serialized form exceeds 64 KiB.
+    // MAX_MESSAGE_SIZE = 65_536 bytes; envelope overhead is ~100 bytes, so a
+    // 70k-char string puts us solidly over.
+    const huge = 'x'.repeat(70_000);
+    const request = createHmcpRequest('hm.command', { command: 'big', payload: huge });
+
+    await expect(transport.sendRequest(request)).rejects.toThrow(/exceeds MAX_MESSAGE_SIZE/);
+    expect((comms.sendDM as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0);
+
+    await transport.dispose();
+  });
 });

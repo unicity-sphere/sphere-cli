@@ -15,7 +15,7 @@
 
 import type { DirectMessage } from '@unicitylabs/sphere-sdk';
 import type { HmcpRequest, HmcpResponse } from './hmcp-types.js';
-import { parseHmcpResponse } from './hmcp-types.js';
+import { parseHmcpResponse, byteLength, MAX_MESSAGE_SIZE } from './hmcp-types.js';
 import { TimeoutError, TransportError } from './errors.js';
 
 export type { HmcpRequest, HmcpResponse } from './hmcp-types.js';
@@ -140,11 +140,28 @@ class DmTransportImpl implements DmTransport {
   // ---------------------------------------------------------------------------
 
   private handleIncoming(msg: DirectMessage): void {
+    // Race guard: a DM can arrive between `this.disposed = true` and
+    // `this.unsubscribeDMs()` returning in dispose(). Short-circuit so a
+    // late-arriving message cannot touch a disposed transport.
+    if (this.disposed) return;
+
+    // Early size cap — a malformed relay delivering a 10 MB DM never enters
+    // the early-message buffer. parseHmcpResponse also enforces this on the
+    // post-pubkey-resolution path, but catching it here saves memory when
+    // the buffer is in use.
+    if (byteLength(msg.content) > MAX_MESSAGE_SIZE) return;
+
     if (!this.resolvedPubkey) {
       // Buffer early messages so a fast manager reply isn't lost while sendDM
       // is still in-flight. Capped to avoid unbounded memory on DM floods.
       if (this.earlyMessages.length < DmTransportImpl.EARLY_MESSAGE_CAP) {
         this.earlyMessages.push(msg);
+      } else if (process.env['DEBUG']) {
+        // Cap hit: one DEBUG line per overflow so a legitimate chatty manager
+        // during the handshake window is diagnosable. Silent drop otherwise.
+        process.stderr.write(
+          `dm-transport: early-message buffer full (cap=${DmTransportImpl.EARLY_MESSAGE_CAP}), dropping DM\n`,
+        );
       }
       return;
     }
@@ -258,7 +275,18 @@ class DmTransportImpl implements DmTransport {
   // ---------------------------------------------------------------------------
 
   private async send(request: HmcpRequest): Promise<void> {
-    const sent = await this.comms.sendDM(this.managerAddress, JSON.stringify(request));
+    // Send-side size cap — symmetric with the receive-side MAX_MESSAGE_SIZE
+    // check in parseHmcpResponse. Prevents a local caller (e.g. `sphere host
+    // cmd --params '<huge JSON>'`) from handing a 10 MB payload to the relay
+    // and getting an opaque TransportError in response. Fail fast with a
+    // clear size-limit message before hitting the transport.
+    const serialized = JSON.stringify(request);
+    if (byteLength(serialized) > MAX_MESSAGE_SIZE) {
+      throw new TransportError(
+        `Request too large: ${byteLength(serialized)} bytes exceeds MAX_MESSAGE_SIZE (${MAX_MESSAGE_SIZE})`,
+      );
+    }
+    const sent = await this.comms.sendDM(this.managerAddress, serialized);
     // Cache the resolved pubkey on first send. Subsequent sends for the same
     // manager address produce the same pubkey, so concurrent writes are safe.
     if (!this.resolvedPubkey) {

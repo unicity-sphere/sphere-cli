@@ -197,25 +197,55 @@ export function createHmcpRequest(type: HmcpRequestType, payload: Record<string,
 
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
-// Use a JSON.parse reviver to detect dangerous keys at parse time, regardless
-// of nesting depth. This avoids the depth-20 cliff of a recursive walk and
-// runs in O(n) with a single parse pass. If a dangerous key is found the
-// entire message is rejected (not silently cleaned).
+/**
+ * Use a JSON.parse reviver to detect dangerous keys at parse time, regardless
+ * of nesting depth. This avoids the depth-20 cliff of a recursive walk and
+ * runs in O(n) with a single parse pass. If a dangerous key is found the
+ * entire message is rejected (not silently cleaned) — we set `value` to null
+ * so downstream mishandling cannot accidentally use a half-stripped object.
+ */
 function safeParse(data: string): { value: unknown; hadDangerousKeys: boolean } {
   let hadDangerousKeys = false;
   const value = JSON.parse(data, (key, val) => {
     if (DANGEROUS_KEYS.has(key)) { hadDangerousKeys = true; return undefined; }
     return val;
   });
-  return { value, hadDangerousKeys };
+  // Reject-not-sanitize: if any dangerous key was seen, null the output so a
+  // caller that forgets to check `hadDangerousKeys` cannot accidentally use
+  // a partially-scrubbed object. parseHmcpResponse also short-circuits on
+  // the flag, but defense-in-depth costs nothing.
+  return hadDangerousKeys ? { value: null, hadDangerousKeys } : { value, hadDangerousKeys };
 }
 
-// Structural check used by host-commands.ts to validate --params arguments.
+/**
+ * Structural check used by host-commands.ts to validate --params arguments.
+ *
+ * Iterative, bounded walk — originally recursive which was vulnerable to a
+ * stack-overflow self-DoS on pathological 10k-deep JSON from `--params`. The
+ * CLI parses --params with regular JSON.parse (not our safeParse reviver) so
+ * this guard IS the primary defense for the local command-line path.
+ */
+const MAX_PARAMS_DEPTH = 64;
+
 export function hasDangerousKeys(value: unknown): boolean {
-  if (typeof value !== 'object' || value === null) return false;
-  for (const key of Object.keys(value as object)) {
-    if (DANGEROUS_KEYS.has(key)) return true;
-    if (hasDangerousKeys((value as Record<string, unknown>)[key])) return true;
+  // Explicit stack instead of recursion: `{ value, depth }` frames. The depth
+  // cap guards against deeply-nested attacker input; 64 is comfortably deeper
+  // than any realistic hand-written --params payload while bounded enough to
+  // prevent a stack-allocation DoS via the interpreter itself.
+  const stack: Array<{ v: unknown; d: number }> = [{ v: value, d: 0 }];
+  while (stack.length > 0) {
+    const { v, d } = stack.pop()!;
+    if (d > MAX_PARAMS_DEPTH) return true;  // too deep to inspect — conservative reject
+    if (typeof v !== 'object' || v === null) continue;
+    if (Array.isArray(v)) {
+      for (const item of v) stack.push({ v: item, d: d + 1 });
+      continue;
+    }
+    const obj = v as Record<string, unknown>;
+    for (const key of Object.keys(obj)) {
+      if (DANGEROUS_KEYS.has(key)) return true;
+      stack.push({ v: obj[key], d: d + 1 });
+    }
   }
   return false;
 }
@@ -223,7 +253,7 @@ export function hasDangerousKeys(value: unknown): boolean {
 // 64 KiB measured in UTF-8 bytes, not JS string code units (which are UTF-16).
 export const MAX_MESSAGE_SIZE = 64 * 1024;
 
-function byteLength(s: string): number {
+export function byteLength(s: string): number {
   // Buffer.byteLength is available in Node; fall back to approximate for other runtimes.
   if (typeof Buffer !== 'undefined') return Buffer.byteLength(s, 'utf8');
   return new TextEncoder().encode(s).length;

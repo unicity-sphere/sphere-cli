@@ -132,6 +132,9 @@ export function createCli(): Command {
     sub.allowUnknownOption(true);
     sub.action(async () => {
       const legacyArgv = buildLegacyArgv(name);
+      // Dynamic import keeps the legacy ~40-file dispatcher out of the hot
+      // start path for phase-4 DM-native commands (`sphere host …`, etc.)
+      // that don't need it. Paid once on first legacy invocation per process.
       const { legacyMain } = await import('./legacy/legacy-cli.js');
       await legacyMain(legacyArgv);
     });

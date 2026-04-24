@@ -12,6 +12,11 @@ import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 import type { NetworkType } from '@unicitylabs/sphere-sdk';
 
+// All paths are CWD-relative by design — matches legacy-cli behaviour so the
+// same wallet is visible whether invoked via `sphere wallet …` (legacy) or
+// `sphere host …` (this namespace). Callers that need a fixed wallet location
+// should chdir before invocation or set `dataDir` in config.json to an absolute
+// path.
 const CONFIG_FILE = './.sphere-cli/config.json';
 const DEFAULT_DATA_DIR = './.sphere-cli';
 const DEFAULT_TOKENS_DIR = './.sphere-cli/tokens';

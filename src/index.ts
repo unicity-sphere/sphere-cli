@@ -161,10 +161,16 @@ export function createCli(): Command {
 
 /** Parse argv and execute. Returns the exit code. */
 export async function main(argv: string[] = process.argv): Promise<number> {
+  // Reset exit code at entry — action handlers set `process.exitCode = 1`
+  // on error, and that value is process-wide. Without this reset, a
+  // prior invocation (or test) that left a non-zero exit code would
+  // cause a subsequent successful main() to return non-zero. Repeated
+  // in-process invocations are rare in production (bin/sphere.mjs runs
+  // main() exactly once per process) but are the default in vitest.
+  process.exitCode = 0;
   const program = createCli();
   try {
     await program.parseAsync(argv);
-    // Honour process.exitCode set by action handlers (e.g. runWithTransport errors).
     return (typeof process.exitCode === 'number' ? process.exitCode : 0);
   } catch (err) {
     // commander throws CommanderError on --help/--version/parse errors; those are
@@ -176,9 +182,19 @@ export async function main(argv: string[] = process.argv): Promise<number> {
       }
       return ce.exitCode ?? 1;
     }
-    // Sanitize: never echo raw error messages (may contain mnemonics or keys)
+    // Error-prefix hygiene: downstream writers (writeStderr in host-commands)
+    // already prefix `sphere host: ` for their own errors. Parse/unexpected
+    // errors that reach here fall under `sphere:` for generality.
+    //
+    // Defense-in-depth redaction: the CLI should NEVER surface messages
+    // containing secret material in the first place, so this regex is
+    // expected to never match in practice. It narrowly targets BIP-39-shape
+    // lowercase word sequences of length 12-24 and does not match stack
+    // traces or camelCase/snake_case tokens. If it ever fires, the stderr
+    // format includes `[REDACTED]` which an operator can grep to identify
+    // a genuine message-sanitisation failure.
     const raw = err instanceof Error ? err.message : String(err);
-    const safe = raw.replace(/\b([a-z]+\s+){11,23}[a-z]+\b/gi, '[REDACTED]');
+    const safe = raw.replace(/\b(?:[a-z]{3,8}\s+){11,23}[a-z]{3,8}\b/gi, '[REDACTED]');
     process.stderr.write(`sphere: ${safe}\n`);
     return 1;
   }

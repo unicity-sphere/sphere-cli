@@ -5,7 +5,14 @@ import globals from 'globals';
 
 export default tseslint.config(
   {
-    ignores: ['dist/**', 'node_modules/**', 'coverage/**', '**/*.d.ts'],
+    ignores: [
+      'dist/**',
+      'node_modules/**',
+      'coverage/**',
+      '**/*.d.ts',
+      // Agent-worktree scratch directories from Claude Code — not source.
+      '.claude/**',
+    ],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,

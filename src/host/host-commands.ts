@@ -32,6 +32,14 @@ import { initSphere, resolveManagerAddress } from './sphere-init.js';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+/**
+ * Transport-layer timeout headroom past a caller-supplied per-command
+ * timeout. The tenant's command handler honours `--cmd-timeout`; we need
+ * the transport to wait at least that long PLUS round-trip for the reply
+ * to travel back. 10 s covers relay RTT under typical public-relay load.
+ */
+const TRANSPORT_HEADROOM_MS = 10_000;
+
 // =============================================================================
 // Option types
 // =============================================================================
@@ -66,17 +74,11 @@ interface CmdOpts extends NameOrIdOpts {
 // =============================================================================
 
 function parseGlobalOpts(cmd: Command): GlobalOpts {
-  // Merge options from this command and its parents — commander keeps them local.
-  const merged: GlobalOpts = {};
-  let current: Command | null = cmd;
-  while (current) {
-    const opts = current.opts<GlobalOpts>();
-    if (opts.manager !== undefined && merged.manager === undefined) merged.manager = opts.manager;
-    if (opts.json !== undefined && merged.json === undefined) merged.json = opts.json;
-    if (opts.timeout !== undefined && merged.timeout === undefined) merged.timeout = opts.timeout;
-    current = current.parent;
-  }
-  return merged;
+  // Commander 12's optsWithGlobals() walks the parent chain and merges
+  // — replaces an earlier hand-rolled walker. Kept as a named helper so
+  // call sites still read well and we have a single swap point for
+  // future option additions.
+  return cmd.optsWithGlobals<GlobalOpts>();
 }
 
 function parseTimeout(raw: string | undefined, fallback: number): number {
@@ -135,13 +137,88 @@ function errorPayload(res: HmcpResponse): HmErrorPayload {
   return res.payload as unknown as HmErrorPayload;
 }
 
+// =============================================================================
+// Per-type payload guards
+// =============================================================================
+//
+// The HMCP envelope is validated by isValidHmcpResponse (hmcp-types.ts), but
+// the payload shape is not — a misbehaving manager could send any fields. The
+// guards below do a minimal structural check before the handler reads fields,
+// so a protocol drift produces a clear error instead of "undefined" surfacing
+// in a printed string. They intentionally check only the fields the handler
+// uses, not every documented field.
+
+function isHmSpawnAckPayload(p: unknown): p is HmSpawnAckPayload {
+  return isPlainObject(p)
+    && typeof p['instance_id'] === 'string'
+    && typeof p['state'] === 'string';
+}
+function isHmSpawnReadyPayload(p: unknown): p is HmSpawnReadyPayload {
+  return isPlainObject(p)
+    && typeof p['tenant_direct_address'] === 'string';
+}
+function isHmSpawnFailedPayload(p: unknown): p is HmSpawnFailedPayload {
+  return isPlainObject(p) && typeof p['reason'] === 'string';
+}
+function isHmStartAckPayload(p: unknown): p is HmStartAckPayload {
+  return isHmSpawnAckPayload(p) as unknown as boolean;
+}
+function isHmStartReadyPayload(p: unknown): p is HmStartReadyPayload {
+  return isHmSpawnReadyPayload(p) as unknown as boolean;
+}
+function isHmStartFailedPayload(p: unknown): p is HmStartFailedPayload {
+  return isHmSpawnFailedPayload(p) as unknown as boolean;
+}
+function isHmStopResultPayload(p: unknown): p is HmStopResultPayload {
+  return isPlainObject(p)
+    && typeof p['instance_name'] === 'string'
+    && typeof p['instance_id'] === 'string';
+}
+function isHmInspectResultPayload(p: unknown): p is HmInspectResultPayload {
+  return isPlainObject(p) && typeof p['instance_id'] === 'string';
+}
+function isHmListResultPayload(p: unknown): p is HmListResultPayload {
+  return isPlainObject(p) && Array.isArray(p['instances']);
+}
+function isHmHelpResultPayload(p: unknown): p is HmHelpResultPayload {
+  return isPlainObject(p)
+    && Array.isArray(p['commands'])
+    && typeof p['version'] === 'string';
+}
+function isHmCommandResultPayload(p: unknown): p is HmCommandResultPayload {
+  return isPlainObject(p) && p['result'] !== undefined;
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/** Emit a "manager sent a malformed payload" error. Sets exitCode=1. */
+function onProtocolError(type: string, json: boolean): void {
+  if (json) {
+    writeStderr(`Protocol error: received ${type} with malformed payload`);
+  } else {
+    writeStderr(`sphere host: manager returned malformed ${type} payload`);
+  }
+  process.exitCode = 1;
+}
+
 function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+/**
+ * Write an error line to stderr with a consistent `sphere host: ` prefix.
+ * Callers pass the bare message; this helper owns the formatting so user-
+ * facing output is uniform across every failure path (transport error,
+ * timeout, protocol error, hm.error response, parse failure, etc.).
+ */
 function writeStderr(msg: unknown): void {
   const s = typeof msg === 'string' ? msg : String(msg ?? 'unknown error');
-  process.stderr.write(s.endsWith('\n') ? s : `${s}\n`);
+  const prefixed = s.startsWith('sphere host:') || s.startsWith('sphere:')
+    ? s
+    : `sphere host: ${s}`;
+  process.stderr.write(prefixed.endsWith('\n') ? prefixed : `${prefixed}\n`);
 }
 
 // =============================================================================
@@ -221,27 +298,39 @@ function handleHmError(res: HmcpResponse, json: boolean): void {
 }
 
 // =============================================================================
-// Subcommand handlers
+// Streaming lifecycle helper (spawn / start / resume)
 // =============================================================================
+//
+// spawn, start and resume share the same shape: send request → stream of ack
+// + (ready | failed | error) → terminal response. Originally each handler
+// rebuilt the collection + iteration loop; this helper gives one correct
+// implementation and lets each caller plug in its own human-readable
+// formatters for ack/ready/failed.
 
-async function handleSpawn(cmd: Command, name: string, sOpts: SpawnOpts): Promise<void> {
-  const env = parseEnvPairs(sOpts.env);
+interface StreamingLifecycleHandlers {
+  readonly ackType: string;
+  readonly readyTypes: readonly string[];
+  readonly failedType: string;
+  readonly formatAck: (res: HmcpResponse) => void;
+  readonly formatReady: (res: HmcpResponse) => void;
+  readonly formatFailed: (res: HmcpResponse) => void;
+}
+
+async function runStreamingLifecycle(
+  cmd: Command,
+  type: HmcpRequestType,
+  payload: Record<string, unknown>,
+  h: StreamingLifecycleHandlers,
+): Promise<void> {
   await runWithTransport(cmd, async ({ transport, json }) => {
-    const payload: Record<string, unknown> = {
-      template_id: sOpts.template,
-      instance_name: name,
-    };
-    if (sOpts.nametag) payload['nametag'] = sOpts.nametag;
-    if (env) payload['env'] = env;
-
-    const req = createHmcpRequest('hm.spawn', payload);
+    const req = createHmcpRequest(type, payload);
 
     const collected: HmcpResponse[] = [];
     await transport.sendRequestStream(req, (res) => {
       collected.push(res);
       return (
-        res.type === 'hm.spawn_ready' ||
-        res.type === 'hm.spawn_failed' ||
+        h.readyTypes.includes(res.type) ||
+        res.type === h.failedType ||
         res.type === 'hm.error'
       );
     });
@@ -249,28 +338,57 @@ async function handleSpawn(cmd: Command, name: string, sOpts: SpawnOpts): Promis
     if (json) {
       printJson(collected);
       const last = collected[collected.length - 1];
-      if (last && (last.type === 'hm.spawn_failed' || last.type === 'hm.error')) {
+      if (last && (last.type === h.failedType || last.type === 'hm.error')) {
         process.exitCode = 1;
       }
       return;
     }
 
     for (const res of collected) {
-      if (res.type === 'hm.spawn_ack') {
-        const p = res.payload as unknown as HmSpawnAckPayload;
-        writeStderr(`Accepted: ${p.instance_id} (${p.state})`);
-      } else if (res.type === 'hm.spawn_ready') {
-        const p = res.payload as unknown as HmSpawnReadyPayload;
-        const nt = p.tenant_nametag ?? '(no nametag)';
-        process.stdout.write(`Container ready: ${nt} (${p.tenant_direct_address})\n`);
-      } else if (res.type === 'hm.spawn_failed') {
-        const p = res.payload as unknown as HmSpawnFailedPayload;
-        writeStderr(`Failed: ${p.reason}`);
+      if (res.type === h.ackType) {
+        h.formatAck(res);
+      } else if (h.readyTypes.includes(res.type)) {
+        h.formatReady(res);
+      } else if (res.type === h.failedType) {
+        h.formatFailed(res);
         process.exitCode = 1;
       } else if (isErrorResponse(res)) {
         handleHmError(res, json);
       }
     }
+  });
+}
+
+// =============================================================================
+// Subcommand handlers
+// =============================================================================
+
+async function handleSpawn(cmd: Command, name: string, sOpts: SpawnOpts): Promise<void> {
+  const env = parseEnvPairs(sOpts.env);
+  const payload: Record<string, unknown> = {
+    template_id: sOpts.template,
+    instance_name: name,
+  };
+  if (sOpts.nametag) payload['nametag'] = sOpts.nametag;
+  if (env) payload['env'] = env;
+
+  await runStreamingLifecycle(cmd, 'hm.spawn', payload, {
+    ackType: 'hm.spawn_ack',
+    readyTypes: ['hm.spawn_ready'],
+    failedType: 'hm.spawn_failed',
+    formatAck: (res) => {
+      if (!isHmSpawnAckPayload(res.payload)) return onProtocolError(res.type, false);
+      writeStderr(`Accepted: ${res.payload.instance_id} (${res.payload.state})`);
+    },
+    formatReady: (res) => {
+      if (!isHmSpawnReadyPayload(res.payload)) return onProtocolError(res.type, false);
+      const nt = res.payload.tenant_nametag ?? '(no nametag)';
+      process.stdout.write(`Container ready: ${nt} (${res.payload.tenant_direct_address})\n`);
+    },
+    formatFailed: (res) => {
+      if (!isHmSpawnFailedPayload(res.payload)) return onProtocolError(res.type, false);
+      writeStderr(`Failed: ${res.payload.reason}`);
+    },
   });
 }
 
@@ -292,8 +410,11 @@ async function handleList(cmd: Command, lOpts: ListOpts): Promise<void> {
       return;
     }
 
-    const p = res.payload as unknown as HmListResultPayload;
-    printInstanceTable(p.instances);
+    if (!isHmListResultPayload(res.payload)) {
+      onProtocolError(res.type, json);
+      return;
+    }
+    printInstanceTable(res.payload.instances);
   });
 }
 
@@ -342,56 +463,36 @@ async function handleSimple(
 
 async function handleStop(cmd: Command, nameOrId: string, opts: NameOrIdOpts): Promise<void> {
   await handleSimple(cmd, 'hm.stop', nameOrId, opts, (res) => {
-    const p = res.payload as unknown as HmStopResultPayload;
-    process.stdout.write(`Stopped: ${p.instance_name} (${p.instance_id})\n`);
+    if (!isHmStopResultPayload(res.payload)) return onProtocolError(res.type, false);
+    process.stdout.write(`Stopped: ${res.payload.instance_name} (${res.payload.instance_id})\n`);
   });
 }
 
 async function handleStart(cmd: Command, nameOrId: string, opts: NameOrIdOpts): Promise<void> {
-  await runWithTransport(cmd, async ({ transport, json }) => {
-    const req = createHmcpRequest('hm.start', targetPayload(nameOrId, opts));
-
-    const collected: HmcpResponse[] = [];
-    await transport.sendRequestStream(req, (res) => {
-      collected.push(res);
-      return (
-        res.type === 'hm.start_ready' ||
-        res.type === 'hm.start_failed' ||
-        res.type === 'hm.error'
-      );
-    });
-
-    if (json) {
-      printJson(collected);
-      const last = collected[collected.length - 1];
-      if (last && (last.type === 'hm.start_failed' || last.type === 'hm.error')) {
-        process.exitCode = 1;
-      }
-      return;
-    }
-
-    for (const res of collected) {
-      if (res.type === 'hm.start_ack') {
-        const p = res.payload as unknown as HmStartAckPayload;
-        writeStderr(`Accepted: ${p.instance_id} (${p.state})`);
-      } else if (res.type === 'hm.start_ready') {
-        const p = res.payload as unknown as HmStartReadyPayload;
-        const nt = p.tenant_nametag ?? '(no nametag)';
-        process.stdout.write(`Container ready: ${nt} (${p.tenant_direct_address})\n`);
-      } else if (res.type === 'hm.start_failed') {
-        const p = res.payload as unknown as HmStartFailedPayload;
-        writeStderr(`Failed: ${p.reason}`);
-        process.exitCode = 1;
-      } else if (isErrorResponse(res)) {
-        handleHmError(res, json);
-      }
-    }
+  await runStreamingLifecycle(cmd, 'hm.start', targetPayload(nameOrId, opts), {
+    ackType: 'hm.start_ack',
+    readyTypes: ['hm.start_ready'],
+    failedType: 'hm.start_failed',
+    formatAck: (res) => {
+      if (!isHmStartAckPayload(res.payload)) return onProtocolError(res.type, false);
+      writeStderr(`Accepted: ${res.payload.instance_id} (${res.payload.state})`);
+    },
+    formatReady: (res) => {
+      if (!isHmStartReadyPayload(res.payload)) return onProtocolError(res.type, false);
+      const nt = res.payload.tenant_nametag ?? '(no nametag)';
+      process.stdout.write(`Container ready: ${nt} (${res.payload.tenant_direct_address})\n`);
+    },
+    formatFailed: (res) => {
+      if (!isHmStartFailedPayload(res.payload)) return onProtocolError(res.type, false);
+      writeStderr(`Failed: ${res.payload.reason}`);
+    },
   });
 }
 
 async function handleInspect(cmd: Command, nameOrId: string, opts: NameOrIdOpts): Promise<void> {
   await handleSimple(cmd, 'hm.inspect', nameOrId, opts, (res) => {
-    const p = res.payload as unknown as HmInspectResultPayload;
+    if (!isHmInspectResultPayload(res.payload)) return onProtocolError(res.type, false);
+    const p = res.payload;
     const rows: Array<[string, string]> = [
       ['instance_id',          p.instance_id],
       ['instance_name',        p.instance_name],
@@ -439,8 +540,10 @@ async function handleCmd(
       ...(cmdTimeoutMs ? { timeout_ms: cmdTimeoutMs } : {}),
     };
 
-    // If cmdTimeout is set, give the transport a bit more headroom than the tenant timeout.
-    const txTimeout = cmdTimeoutMs ? cmdTimeoutMs + 5_000 : timeoutMs;
+    // If cmdTimeout is set, give the transport TRANSPORT_HEADROOM_MS past the
+    // tenant's own execution timer so the reply has time to travel back over
+    // the relay before we give up.
+    const txTimeout = cmdTimeoutMs ? cmdTimeoutMs + TRANSPORT_HEADROOM_MS : timeoutMs;
     const req = createHmcpRequest('hm.command', payload as unknown as Record<string, unknown>);
     const res = await transport.sendRequest(req, txTimeout);
 
@@ -454,8 +557,11 @@ async function handleCmd(
       return;
     }
 
-    const p = res.payload as unknown as HmCommandResultPayload;
-    printJson(p.result);
+    if (!isHmCommandResultPayload(res.payload)) {
+      onProtocolError(res.type, json);
+      return;
+    }
+    printJson(res.payload.result);
   });
 }
 
@@ -474,41 +580,24 @@ async function handlePause(cmd: Command, nameOrId: string, opts: NameOrIdOpts): 
 }
 
 async function handleResume(cmd: Command, nameOrId: string, opts: NameOrIdOpts): Promise<void> {
-  await runWithTransport(cmd, async ({ transport, json }) => {
-    const req = createHmcpRequest('hm.resume', targetPayload(nameOrId, opts));
-
-    const collected: HmcpResponse[] = [];
-    await transport.sendRequestStream(req, (res) => {
-      collected.push(res);
-      return (
-        res.type === 'hm.resume_ready' ||
-        res.type === 'hm.resume_failed' ||
-        res.type === 'hm.resume_result' ||
-        res.type === 'hm.error'
-      );
-    });
-
-    if (json) {
-      printJson(collected);
-      const last = collected[collected.length - 1];
-      if (last && (last.type === 'hm.resume_failed' || last.type === 'hm.error')) {
-        process.exitCode = 1;
-      }
-      return;
-    }
-
-    for (const res of collected) {
-      if (res.type === 'hm.resume_ready' || res.type === 'hm.resume_result') {
-        const p = res.payload as { instance_name?: string; instance_id?: string };
-        process.stdout.write(`Ready: ${p.instance_name ?? p.instance_id ?? nameOrId}\n`);
-      } else if (res.type === 'hm.resume_failed') {
-        const p = res.payload as unknown as { reason?: string };
-        writeStderr(`Failed: ${p.reason ?? 'resume failed'}`);
-        process.exitCode = 1;
-      } else if (isErrorResponse(res)) {
-        handleHmError(res, json);
-      }
-    }
+  // resume has no distinct ack type; the tenant emits ready/result directly.
+  await runStreamingLifecycle(cmd, 'hm.resume', targetPayload(nameOrId, opts), {
+    ackType: '__no_ack__',
+    readyTypes: ['hm.resume_ready', 'hm.resume_result'],
+    failedType: 'hm.resume_failed',
+    formatAck: () => { /* no ack for resume */ },
+    formatReady: (res) => {
+      const p = isPlainObject(res.payload) ? res.payload : {};
+      const label = (typeof p['instance_name'] === 'string' && p['instance_name'])
+        || (typeof p['instance_id'] === 'string' && p['instance_id'])
+        || nameOrId;
+      process.stdout.write(`Ready: ${label}\n`);
+    },
+    formatFailed: (res) => {
+      const p = isPlainObject(res.payload) ? res.payload : {};
+      const reason = typeof p['reason'] === 'string' ? p['reason'] : 'resume failed';
+      writeStderr(`Failed: ${reason}`);
+    },
   });
 }
 
@@ -524,10 +613,13 @@ async function handleHelp(cmd: Command): Promise<void> {
       printJson(res);
       return;
     }
-    const p = res.payload as unknown as HmHelpResultPayload;
-    process.stdout.write(`HMCP version: ${p.version}\nCommands:\n`);
-    for (const c of p.commands) {
-      process.stdout.write(`  ${c}\n`);
+    if (!isHmHelpResultPayload(res.payload)) {
+      onProtocolError(res.type, json);
+      return;
+    }
+    process.stdout.write(`HMCP version: ${res.payload.version}\nCommands:\n`);
+    for (const c of res.payload.commands) {
+      process.stdout.write(`  ${String(c)}\n`);
     }
   });
 }
@@ -542,6 +634,15 @@ export function createHostCommand(): Command {
     .option('--manager <address>', 'Host manager address (@nametag, DIRECT://hex, or hex pubkey)')
     .option('--json', 'Output raw JSON response')
     .option('--timeout <ms>', 'Override default request timeout (ms)', String(DEFAULT_TIMEOUT_MS));
+
+  // Render the shared options in every subcommand's --help so discovery
+  // doesn't require scrolling up to `sphere host --help`. Commander
+  // forwards the values automatically; this just makes them visible.
+  const inheritedHelp =
+    'Inherited options:\n' +
+    '  --manager <address>  Host manager address (@nametag, DIRECT://hex, or hex pubkey)\n' +
+    '  --json               Output raw JSON response\n' +
+    '  --timeout <ms>       Override default request timeout (ms)';
 
   host
     .command('spawn <name>')
@@ -633,6 +734,13 @@ export function createHostCommand(): Command {
     .action(async function (this: Command) {
       await handleHelp(this);
     });
+
+  // Attach the shared-options help text to every subcommand. Iterating after
+  // construction keeps the subcommand definitions above small and ensures
+  // any newly-added subcommand automatically inherits the help surface.
+  for (const sub of host.commands) {
+    sub.addHelpText('after', `\n${inheritedHelp}`);
+  }
 
   return host;
 }

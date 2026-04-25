@@ -25,6 +25,7 @@ parallel refactor branch).
 | `sphere nametag` / `crypto` / `util` / `faucet` | legacy bridge | |
 | `sphere daemon` / `config` / `completions` | legacy bridge | |
 | `sphere host` | **DM-native (live)** | HMCP-0: spawn, list, stop, start, inspect, remove, pause, resume, help, cmd |
+| `sphere trader` | **DM-native (live)** | ACP-0: create-intent, cancel-intent, list-intents, list-deals, portfolio, set-strategy, status. Mirrors canonical [`trader-ctl`](https://github.com/vrogojin/trader-service) |
 | `sphere tenant` | Phase 4 (stub) | Exits with scheduled message |
 
 ## Install
@@ -45,6 +46,13 @@ sphere wallet init --network testnet
 # DM-native host example
 sphere host list --manager @myhostmanager
 sphere host spawn --manager @myhostmanager --template tpl-1 mybot
+
+# DM-native trader example (talks directly to a running trader tenant)
+sphere trader status --tenant @trader-alice
+sphere trader create-intent --tenant @trader-alice \
+  --direction sell --base UCT --quote USDC \
+  --rate-min 95 --rate-max 100 --volume-min 10 --volume-total 100
+sphere trader list-deals --tenant @trader-alice --state active
 ```
 
 ## Development

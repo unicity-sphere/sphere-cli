@@ -23,7 +23,7 @@ describe('sphere-cli scaffold', () => {
     const expectedNamespaces = [
       'wallet', 'balance', 'payments', 'dm', 'group', 'market', 'swap',
       'invoice', 'nametag', 'crypto', 'util', 'faucet', 'daemon',
-      'host', 'tenant', 'config', 'completions',
+      'host', 'tenant', 'trader', 'config', 'completions',
     ];
     for (const ns of expectedNamespaces) {
       expect(help).toContain(ns);

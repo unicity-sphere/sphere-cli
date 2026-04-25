@@ -22,6 +22,7 @@
 import { Command } from 'commander';
 import { VERSION } from './version.js';
 import { createHostCommand } from './host/host-commands.js';
+import { createTraderCommand } from './trader/trader-commands.js';
 
 // Legacy namespaces that delegate to the sphere-sdk CLI dispatcher.
 // These are wired in phase 2 and replaced command-by-command in phase 4+.
@@ -170,6 +171,12 @@ export function createCli(): Command {
 
   // Phase 4 (live): `sphere host` — HMCP over Sphere DMs.
   program.addCommand(createHostCommand());
+
+  // Phase 4 (live): `sphere trader` — ACP over Sphere DMs.
+  // Mirrors the canonical `trader-ctl` tool from vrogojin/trader-service.
+  // Operators with the canonical tool installed can use either; sphere-cli
+  // ships this for convenience parity with `sphere host`.
+  program.addCommand(createTraderCommand());
 
   return program;
 }

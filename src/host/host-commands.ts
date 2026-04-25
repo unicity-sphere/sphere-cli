@@ -81,13 +81,25 @@ function parseGlobalOpts(cmd: Command): GlobalOpts {
   return cmd.optsWithGlobals<GlobalOpts>();
 }
 
+// Floor used by tenant-side hm.command dispatcher (agentic-hosting
+// command-registry.ts MIN_TIMEOUT_MS). Pre-flighting at the CLI surface
+// avoids the confusing two-hop error path: CLI → manager → tenant rejects
+// with `invalid_params`. Keep aligned with agentic-hosting's constant.
+const MIN_TIMEOUT_MS = 100;
+
 function parseTimeout(raw: string | undefined, fallback: number): number {
   if (!raw) return fallback;
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0) {
     throw new Error(`Invalid timeout: ${raw}`);
   }
-  return Math.floor(n);
+  const floored = Math.floor(n);
+  if (floored < MIN_TIMEOUT_MS) {
+    throw new Error(
+      `Invalid timeout: ${raw} (minimum ${MIN_TIMEOUT_MS}ms — values below this are rejected by the tenant dispatcher)`,
+    );
+  }
+  return floored;
 }
 
 function parseEnvPairs(pairs: readonly string[] | undefined): Record<string, string> | undefined {

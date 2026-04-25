@@ -113,6 +113,24 @@ describe('parseTimeout', () => {
     expect(() => parseTimeout('abc', 5000)).toThrow(/Invalid timeout/);
     expect(() => parseTimeout('Infinity', 5000)).toThrow(/Invalid timeout/);
   });
+
+  // The tenant-side hm.command dispatcher (agentic-hosting
+  // command-registry.ts) now rejects timeout_ms < 100 with
+  // `invalid_params`. Pre-flight at the CLI surface so the operator
+  // gets a clear local error instead of a confusing two-hop reply.
+  it('rejects values below MIN_TIMEOUT_MS=100ms', () => {
+    expect(() => parseTimeout('99', 5000)).toThrow(/minimum 100ms/);
+    expect(() => parseTimeout('50', 5000)).toThrow(/minimum 100ms/);
+    expect(() => parseTimeout('1', 5000)).toThrow(/minimum 100ms/);
+    // Decimal that floors below the floor still rejected.
+    expect(() => parseTimeout('99.9', 5000)).toThrow(/minimum 100ms/);
+  });
+
+  it('accepts values at and above MIN_TIMEOUT_MS=100ms', () => {
+    expect(parseTimeout('100', 5000)).toBe(100);
+    expect(parseTimeout('100.5', 5000)).toBe(100);  // floor stays at 100
+    expect(parseTimeout('30000', 5000)).toBe(30000);
+  });
 });
 
 describe('targetPayload', () => {

@@ -38,6 +38,13 @@ import type { TxfToken } from '@unicitylabs/sphere-sdk';
 // signatures on `Sphere.prototype.accounting` so the types stay synced
 // to whatever the SDK exposes — no manual mirroring required, and a
 // future SDK signature change surfaces here as a typecheck error.
+//
+// QoL note: these aliases are STRUCTURALLY EQUIVALENT to the SDK's
+// named interfaces (`interface CreateInvoiceRequest` etc.) but TS
+// error messages at call sites will display the structural expansion
+// rather than the SDK's name. If the SDK ever re-exports the named
+// types at the package root, prefer importing them directly to
+// restore the named-type error messages.
 type SphereAccounting = NonNullable<Sphere['accounting']>;
 type CreateInvoiceRequest = Parameters<SphereAccounting['createInvoice']>[0];
 type InvoiceRequestedAsset = NonNullable<CreateInvoiceRequest['targets']>[number]['assets'][number];

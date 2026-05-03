@@ -41,7 +41,7 @@ interface CreateIntentOpts {
   rateMin: string;
   rateMax: string;
   volumeMin: string;
-  volumeTotal: string;
+  volumeMax: string;
   expiryMs?: string;
 }
 
@@ -218,7 +218,7 @@ async function handleCreateIntent(cmd: Command, opts: CreateIntentOpts): Promise
       rate_min: opts.rateMin,
       rate_max: opts.rateMax,
       volume_min: opts.volumeMin,
-      volume_total: opts.volumeTotal,
+      volume_max: opts.volumeMax,
     };
     if (opts.expiryMs !== undefined) {
       const n = Number.parseInt(opts.expiryMs, 10);
@@ -227,7 +227,16 @@ async function handleCreateIntent(cmd: Command, opts: CreateIntentOpts): Promise
         process.exitCode = 1;
         return;
       }
-      params['expiry_ms'] = n;
+      // Trader's ACP CREATE_INTENT param is `expiry_sec` (validated as
+      // a finite number ≤ 7 days). Sending `expiry_ms` produces an
+      // INVALID_PARAM rejection. The CLI flag stays in milliseconds
+      // for ergonomic consistency with other timeout flags; we
+      // convert at the wire boundary.
+      // Floor to avoid emitting a non-integer second value if the
+      // caller passes a sub-1000ms expiry (which would round to 0
+      // and then fail the trader's positive-int check below — that's
+      // the right behaviour: sub-second expiries make no sense).
+      params['expiry_sec'] = Math.floor(n / 1000);
     }
     const response = await transport.sendCommand('CREATE_INTENT', params);
     emitResult(json, response);
@@ -287,12 +296,16 @@ async function handlePortfolio(cmd: Command): Promise<void> {
   });
 }
 
-async function handleStatus(cmd: Command): Promise<void> {
-  await runWithTransport(cmd, async ({ transport, json }) => {
-    const response = await transport.sendCommand('STATUS', {});
-    emitResult(json, response);
-  });
-}
+// `sphere trader status` was previously wired to send STATUS over ACP
+// directly to the trader. STATUS is a SYSTEM-scoped command per the
+// Unicity architecture (system commands like STATUS, SHUTDOWN_GRACEFUL,
+// SET_LOG_LEVEL, EXEC route through the tenant's host manager via HMCP,
+// not direct controller→tenant ACP). The trader correctly rejects
+// direct STATUS calls with UNAUTHORIZED. The subcommand has been
+// removed from the CLI tree below; controllers should use
+// `sphere host inspect <instance>` (HMCP) to probe trader liveness, or
+// rely on `sphere trader portfolio`/`list-intents` succeeding as an
+// implicit liveness signal.
 
 async function handleSetStrategy(cmd: Command, opts: SetStrategyOpts): Promise<void> {
   await runWithTransport(cmd, async ({ transport, json }) => {
@@ -346,7 +359,7 @@ export function createTraderCommand(): Command {
     .requiredOption('--rate-min <bigint>', 'Minimum acceptable rate (string-encoded bigint)')
     .requiredOption('--rate-max <bigint>', 'Maximum acceptable rate (string-encoded bigint)')
     .requiredOption('--volume-min <bigint>', 'Minimum volume per match')
-    .requiredOption('--volume-total <bigint>', 'Total intent volume')
+    .requiredOption('--volume-max <bigint>', 'Total intent volume')
     .option('--expiry-ms <ms>', 'Expiry duration in milliseconds (default: 24h)')
     .action(async function (this: Command, opts: CreateIntentOpts) {
       await handleCreateIntent(this, opts);
@@ -385,12 +398,9 @@ export function createTraderCommand(): Command {
       await handlePortfolio(this);
     });
 
-  trader
-    .command('status')
-    .description('Show STATUS — uptime + adapter info')
-    .action(async function (this: Command) {
-      await handleStatus(this);
-    });
+  // `status` removed — STATUS is system-scoped and routes through the
+  // host manager. See the comment on the deleted handleStatus above.
+  // Use `sphere host inspect <instance>` for trader liveness probes.
 
   trader
     .command('set-strategy')

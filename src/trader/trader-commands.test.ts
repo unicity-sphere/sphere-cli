@@ -78,9 +78,12 @@ describe('resolveTenantAddress', () => {
 });
 
 describe('createTraderCommand', () => {
-  it('exposes all 7 expected subcommands', () => {
+  it('exposes the 6 controller-scoped trader subcommands', () => {
     const trader = createTraderCommand();
     const names = trader.commands.map((c) => c.name()).sort();
+    // No `status` here: STATUS is system-scoped per Unicity
+    // architecture and routes through the host manager via HMCP.
+    // Use `sphere host inspect <instance>` for trader liveness.
     expect(names).toEqual([
       'cancel-intent',
       'create-intent',
@@ -88,7 +91,6 @@ describe('createTraderCommand', () => {
       'list-intents',
       'portfolio',
       'set-strategy',
-      'status',
     ]);
   });
 
@@ -120,7 +122,7 @@ describe('createTraderCommand', () => {
     const optionFlags = cmd!.options.map((o) => o.long);
     expect(optionFlags).toEqual(expect.arrayContaining([
       '--direction', '--base', '--quote', '--rate-min', '--rate-max',
-      '--volume-min', '--volume-total', '--expiry-ms',
+      '--volume-min', '--volume-max', '--expiry-ms',
     ]));
   });
 

@@ -250,6 +250,27 @@ describe('buildCreateIntentParams (wire shape)', () => {
     }
   });
 
+  it('documents parseInt prefix-truncation behavior on scientific notation', () => {
+    // parseInt('1e6', 10) returns 1 (parses '1', stops at 'e').
+    // The user wanted 1_000_000 ms (≈1000s ≈ 16.7m) but got the
+    // truncated value 1, then our < 1000ms guard fires and rejects.
+    // Counterintuitive but at least the value is REJECTED rather
+    // than silently misused. This test pins the surprising
+    // behavior so a future strict-parse refactor (e.g., using
+    // `Number(s)` which rejects 'e' in this context) is tracked
+    // as a deliberate change rather than an accidental drift.
+    //
+    // FIXME: harden numeric parsing across this file with a
+    // strict-positive-int helper. Same pattern affects --limit,
+    // --max-concurrent, --timeout. Out of scope for this PR.
+    const result = buildCreateIntentParams({ ...baseOpts, expiryMs: '1e6' });
+    expect('error' in result).toBe(true);
+    if (!('error' in result)) return;
+    // The error message reports the parsed value (1), not the
+    // user's original input (1e6) — that's the surprising part.
+    expect(result.error).toMatch(/got 1\b/);
+  });
+
   it('rejects invalid direction', () => {
     const result = buildCreateIntentParams({ ...baseOpts, direction: 'sideways' });
     expect('error' in result).toBe(true);

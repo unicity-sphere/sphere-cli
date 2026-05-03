@@ -45,6 +45,10 @@ import type { TxfToken } from '@unicitylabs/sphere-sdk';
 // rather than the SDK's name. If the SDK ever re-exports the named
 // types at the package root, prefer importing them directly to
 // restore the named-type error messages.
+//
+// TODO: open a sphere-sdk issue requesting AccountingModule's
+// Invoice* interfaces be re-exported at the package root. Until
+// then this `Parameters<>` extraction is the maintainable path.
 type SphereAccounting = NonNullable<Sphere['accounting']>;
 type CreateInvoiceRequest = Parameters<SphereAccounting['createInvoice']>[0];
 type InvoiceRequestedAsset = NonNullable<CreateInvoiceRequest['targets']>[number]['assets'][number];

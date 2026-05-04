@@ -506,7 +506,7 @@ export function createTraderCommand(): Command {
     .description('Withdraw a token from the trader to an external address (ACP WITHDRAW_TOKEN)')
     .requiredOption('--asset <symbol>', 'Asset symbol (e.g. UCT, USDU) or hex coin id')
     .requiredOption('--amount <bigint>', 'Amount to withdraw in smallest units (string-encoded bigint, must be > 0)')
-    .requiredOption('--to-address <address>', 'Destination address: @nametag, DIRECT://hex, or 64-char hex pubkey')
+    .requiredOption('--to-address <address>', 'Destination address: @nametag (lowercase alphanumeric + _/-, 1-30 chars), DIRECT://<64-80 hex>, or PROXY://<64-80 hex>')
     .action(async function (this: Command, opts: WithdrawOpts) {
       await handleWithdraw(this, opts);
     });

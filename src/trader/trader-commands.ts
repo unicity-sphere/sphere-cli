@@ -369,11 +369,16 @@ export function buildWithdrawParams(
   if (!opts.toAddress || opts.toAddress.trim() === '') {
     return { error: '--to-address is required' };
   }
+  // Trim before forwarding so a leading/trailing space in the operator's
+  // input doesn't reach the wire (where the trader's address regex
+  // would reject it as INVALID_PARAM with a remote-side error rather
+  // than a local CLI message). The empty-after-trim cases were already
+  // caught above; this pass just normalizes content of valid inputs.
   return {
     params: {
-      asset: opts.asset,
+      asset: opts.asset.trim(),
       amount: opts.amount,
-      to_address: opts.toAddress,
+      to_address: opts.toAddress.trim(),
     },
   };
 }

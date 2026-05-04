@@ -7,14 +7,20 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
-import { encrypt, decrypt } from '@unicitylabs/sphere-sdk';
+// `encrypt`, `decrypt`, `hexToWIF`, `generatePrivateKey`, and
+// `generateAddressFromMasterKey` are no longer top-level exports of
+// @unicitylabs/sphere-sdk — they live in the L1 (alpha-chain) namespace
+// as of the latest SDK refactor. Destructuring at module load preserves
+// the existing call-site shape so the diff is contained to this block.
+// Other helpers (parseWalletText, isValidPrivateKey, etc.) are still
+// top-level exports.
+import { L1 } from '@unicitylabs/sphere-sdk';
+const { encrypt, decrypt, hexToWIF, generatePrivateKey, generateAddressFromMasterKey } = L1;
 import { parseWalletText, isTextWalletEncrypted, parseAndDecryptWalletText } from '@unicitylabs/sphere-sdk';
 import { parseWalletDat, isSQLiteDatabase, isWalletDatEncrypted } from '@unicitylabs/sphere-sdk';
 import { isValidPrivateKey, base58Encode, base58Decode } from '@unicitylabs/sphere-sdk';
-import { hexToWIF, generatePrivateKey } from '@unicitylabs/sphere-sdk';
 import { toSmallestUnit, toHumanReadable, formatAmount } from '@unicitylabs/sphere-sdk';
 import { getPublicKey } from '@unicitylabs/sphere-sdk';
-import { generateAddressFromMasterKey } from '@unicitylabs/sphere-sdk';
 import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 import { TokenRegistry } from '@unicitylabs/sphere-sdk';
@@ -23,14 +29,32 @@ import { tokenToTxf } from '@unicitylabs/sphere-sdk';
 import type { NetworkType } from '@unicitylabs/sphere-sdk';
 import type { TransportProvider } from '@unicitylabs/sphere-sdk';
 import type { ProviderStatus } from '@unicitylabs/sphere-sdk';
-import type {
-  CreateInvoiceRequest,
-  InvoiceRequestedAsset,
-  GetInvoicesOptions,
-  PayInvoiceParams,
-  ReturnPaymentParams,
-  TxfToken,
-} from '@unicitylabs/sphere-sdk';
+import type { TxfToken } from '@unicitylabs/sphere-sdk';
+
+// CreateInvoiceRequest, InvoiceRequestedAsset, GetInvoicesOptions,
+// PayInvoiceParams, ReturnPaymentParams are declared inside the SDK's
+// AccountingModule but are not re-exported at the package root in the
+// current SDK build. Extract them structurally from the public method
+// signatures on `Sphere.prototype.accounting` so the types stay synced
+// to whatever the SDK exposes — no manual mirroring required, and a
+// future SDK signature change surfaces here as a typecheck error.
+//
+// QoL note: these aliases are STRUCTURALLY EQUIVALENT to the SDK's
+// named interfaces (`interface CreateInvoiceRequest` etc.) but TS
+// error messages at call sites will display the structural expansion
+// rather than the SDK's name. If the SDK ever re-exports the named
+// types at the package root, prefer importing them directly to
+// restore the named-type error messages.
+//
+// TODO: open a sphere-sdk issue requesting AccountingModule's
+// Invoice* interfaces be re-exported at the package root. Until
+// then this `Parameters<>` extraction is the maintainable path.
+type SphereAccounting = NonNullable<Sphere['accounting']>;
+type CreateInvoiceRequest = Parameters<SphereAccounting['createInvoice']>[0];
+type InvoiceRequestedAsset = NonNullable<CreateInvoiceRequest['targets']>[number]['assets'][number];
+type GetInvoicesOptions = NonNullable<Parameters<SphereAccounting['getInvoices']>[0]>;
+type PayInvoiceParams = Parameters<SphereAccounting['payInvoice']>[1];
+type ReturnPaymentParams = Parameters<SphereAccounting['returnInvoicePayment']>[1];
 
 /**
  * Strip prototype-pollution-prone keys from user-supplied JSON before passing

@@ -41,7 +41,7 @@ interface CreateIntentOpts {
   rateMin: string;
   rateMax: string;
   volumeMin: string;
-  volumeTotal: string;
+  volumeMax: string;
   expiryMs?: string;
 }
 
@@ -204,32 +204,68 @@ function emitResult(json: boolean, response: AcpResultPayload | AcpErrorPayload)
 // Subcommand handlers
 // =============================================================================
 
+/**
+ * Build the wire payload for CREATE_INTENT from CLI options. Pure
+ * function so it's unit-testable without a Sphere/DM stack.
+ *
+ * Returns `{ params }` on success or `{ error }` with a human-
+ * readable message the caller can write to stderr. Validation here
+ * mirrors the trader-side ACP validation
+ * (trader-service/src/trader/trader-command-handler.ts:331-342) so
+ * the operator gets a clear diagnostic at the CLI layer instead of
+ * an opaque INVALID_PARAM from a remote service.
+ */
+export function buildCreateIntentParams(
+  opts: CreateIntentOpts,
+): { readonly params: Record<string, unknown> } | { readonly error: string } {
+  if (opts.direction !== 'buy' && opts.direction !== 'sell') {
+    return { error: '--direction must be "buy" or "sell"' };
+  }
+  const params: Record<string, unknown> = {
+    direction: opts.direction,
+    base_asset: opts.base,
+    quote_asset: opts.quote,
+    rate_min: opts.rateMin,
+    rate_max: opts.rateMax,
+    volume_min: opts.volumeMin,
+    volume_max: opts.volumeMax,
+  };
+  if (opts.expiryMs !== undefined) {
+    const n = Number.parseInt(opts.expiryMs, 10);
+    if (!Number.isFinite(n) || n <= 0) {
+      return { error: `--expiry-ms must be a positive integer (got "${opts.expiryMs}")` };
+    }
+    // Trader's ACP CREATE_INTENT param is `expiry_sec` (validated
+    // as a finite positive integer ≤ 7 days). The CLI flag stays
+    // in milliseconds for ergonomic consistency with other timeout
+    // flags; we convert at the wire boundary via floor(ms/1000).
+    if (n < 1000) {
+      // Sub-second expiries make no sense for trade intents and
+      // floor(ms/1000) would map them to 0, which the trader
+      // rejects with an unhelpful INVALID_PARAM. Catch here.
+      return { error: `--expiry-ms must be at least 1000 (1 second); got ${n}` };
+    }
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    if (n > sevenDaysMs) {
+      // 7-day cap matches the trader's own validation. Catch it
+      // here too so the operator gets the right diagnostic without
+      // a network round-trip.
+      return { error: `--expiry-ms must not exceed 7 days (${sevenDaysMs}ms); got ${n}` };
+    }
+    params['expiry_sec'] = Math.floor(n / 1000);
+  }
+  return { params };
+}
+
 async function handleCreateIntent(cmd: Command, opts: CreateIntentOpts): Promise<void> {
   await runWithTransport(cmd, async ({ transport, json }) => {
-    if (opts.direction !== 'buy' && opts.direction !== 'sell') {
-      writeStderr('--direction must be "buy" or "sell"');
+    const built = buildCreateIntentParams(opts);
+    if ('error' in built) {
+      writeStderr(built.error);
       process.exitCode = 1;
       return;
     }
-    const params: Record<string, unknown> = {
-      direction: opts.direction,
-      base_asset: opts.base,
-      quote_asset: opts.quote,
-      rate_min: opts.rateMin,
-      rate_max: opts.rateMax,
-      volume_min: opts.volumeMin,
-      volume_total: opts.volumeTotal,
-    };
-    if (opts.expiryMs !== undefined) {
-      const n = Number.parseInt(opts.expiryMs, 10);
-      if (!Number.isFinite(n) || n <= 0) {
-        writeStderr(`--expiry-ms must be a positive integer (got "${opts.expiryMs}")`);
-        process.exitCode = 1;
-        return;
-      }
-      params['expiry_ms'] = n;
-    }
-    const response = await transport.sendCommand('CREATE_INTENT', params);
+    const response = await transport.sendCommand('CREATE_INTENT', built.params);
     emitResult(json, response);
   });
 }
@@ -287,12 +323,16 @@ async function handlePortfolio(cmd: Command): Promise<void> {
   });
 }
 
-async function handleStatus(cmd: Command): Promise<void> {
-  await runWithTransport(cmd, async ({ transport, json }) => {
-    const response = await transport.sendCommand('STATUS', {});
-    emitResult(json, response);
-  });
-}
+// `sphere trader status` was previously wired to send STATUS over ACP
+// directly to the trader. STATUS is a SYSTEM-scoped command per the
+// Unicity architecture (system commands like STATUS, SHUTDOWN_GRACEFUL,
+// SET_LOG_LEVEL, EXEC route through the tenant's host manager via HMCP,
+// not direct controller→tenant ACP). The trader correctly rejects
+// direct STATUS calls with UNAUTHORIZED. The subcommand has been
+// removed from the CLI tree below; controllers should use
+// `sphere host inspect <instance>` (HMCP) to probe trader liveness, or
+// rely on `sphere trader portfolio`/`list-intents` succeeding as an
+// implicit liveness signal.
 
 async function handleSetStrategy(cmd: Command, opts: SetStrategyOpts): Promise<void> {
   await runWithTransport(cmd, async ({ transport, json }) => {
@@ -346,7 +386,7 @@ export function createTraderCommand(): Command {
     .requiredOption('--rate-min <bigint>', 'Minimum acceptable rate (string-encoded bigint)')
     .requiredOption('--rate-max <bigint>', 'Maximum acceptable rate (string-encoded bigint)')
     .requiredOption('--volume-min <bigint>', 'Minimum volume per match')
-    .requiredOption('--volume-total <bigint>', 'Total intent volume')
+    .requiredOption('--volume-max <bigint>', 'Total intent volume')
     .option('--expiry-ms <ms>', 'Expiry duration in milliseconds (default: 24h)')
     .action(async function (this: Command, opts: CreateIntentOpts) {
       await handleCreateIntent(this, opts);
@@ -385,12 +425,9 @@ export function createTraderCommand(): Command {
       await handlePortfolio(this);
     });
 
-  trader
-    .command('status')
-    .description('Show STATUS — uptime + adapter info')
-    .action(async function (this: Command) {
-      await handleStatus(this);
-    });
+  // `status` removed — STATUS is system-scoped and routes through the
+  // host manager. See the comment on the deleted handleStatus above.
+  // Use `sphere host inspect <instance>` for trader liveness probes.
 
   trader
     .command('set-strategy')
@@ -412,3 +449,5 @@ export function createTraderCommand(): Command {
 
 // Exported for unit tests.
 export { parseTimeout };
+// `buildCreateIntentParams` is also exported via its `export function`
+// declaration above; named here for discoverability alongside parseTimeout.

@@ -11,6 +11,7 @@ import {
   resolveTenantAddress,
   createTraderCommand,
   buildCreateIntentParams,
+  buildWithdrawParams,
 } from './trader-commands.js';
 
 describe('parseTimeout (trader)', () => {
@@ -79,7 +80,7 @@ describe('resolveTenantAddress', () => {
 });
 
 describe('createTraderCommand', () => {
-  it('exposes the 6 controller-scoped trader subcommands', () => {
+  it('exposes the 7 controller-scoped trader subcommands', () => {
     const trader = createTraderCommand();
     const names = trader.commands.map((c) => c.name()).sort();
     // No `status` here: STATUS is system-scoped per Unicity
@@ -92,6 +93,7 @@ describe('createTraderCommand', () => {
       'list-intents',
       'portfolio',
       'set-strategy',
+      'withdraw',
     ]);
   });
 
@@ -285,5 +287,75 @@ describe('buildCreateIntentParams (wire shape)', () => {
     // Must preserve the exact string — coercion to Number would lose
     // precision and bigint serialization differs across SDKs.
     expect(result.params['volume_max']).toBe(huge);
+  });
+});
+
+describe('buildWithdrawParams (wire shape)', () => {
+  const baseOpts = {
+    asset: 'UCT',
+    amount: '1000',
+    toAddress: '@alice',
+  };
+
+  it('emits asset / amount / to_address (snake_case wire fields)', () => {
+    const result = buildWithdrawParams(baseOpts);
+    if ('error' in result) throw new Error(result.error);
+    expect(result.params['asset']).toBe('UCT');
+    expect(result.params['amount']).toBe('1000');
+    expect(result.params['to_address']).toBe('@alice');
+    expect(result.params).not.toHaveProperty('toAddress');
+  });
+
+  it('preserves bigint-string amount verbatim (no coercion to Number)', () => {
+    const huge = '99999999999999999999999999';
+    const result = buildWithdrawParams({ ...baseOpts, amount: huge });
+    if ('error' in result) throw new Error(result.error);
+    expect(result.params['amount']).toBe(huge);
+  });
+
+  it('rejects empty asset', () => {
+    const result = buildWithdrawParams({ ...baseOpts, asset: '' });
+    expect('error' in result).toBe(true);
+    if (!('error' in result)) return;
+    expect(result.error).toMatch(/asset is required/);
+  });
+
+  it('rejects whitespace-only asset', () => {
+    const result = buildWithdrawParams({ ...baseOpts, asset: '   ' });
+    expect('error' in result).toBe(true);
+  });
+
+  it('rejects empty amount', () => {
+    const result = buildWithdrawParams({ ...baseOpts, amount: '' });
+    expect('error' in result).toBe(true);
+    if (!('error' in result)) return;
+    expect(result.error).toMatch(/amount is required/);
+  });
+
+  it('rejects zero, negative, decimal, scientific notation, leading-zero amounts', () => {
+    for (const bad of ['0', '-100', '1.5', '1e6', '01000', 'abc']) {
+      const r = buildWithdrawParams({ ...baseOpts, amount: bad });
+      expect('error' in r, `expected error for amount="${bad}"`).toBe(true);
+    }
+  });
+
+  it('rejects empty to-address', () => {
+    const result = buildWithdrawParams({ ...baseOpts, toAddress: '' });
+    expect('error' in result).toBe(true);
+    if (!('error' in result)) return;
+    expect(result.error).toMatch(/to-address is required/);
+  });
+
+  it('accepts all three address forms (@nametag, DIRECT://hex, raw hex)', () => {
+    for (const addr of [
+      '@alice',
+      'DIRECT://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+      '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    ]) {
+      const r = buildWithdrawParams({ ...baseOpts, toAddress: addr });
+      expect('error' in r, `expected accept for to-address="${addr}"`).toBe(false);
+      if ('error' in r) continue;
+      expect(r.params['to_address']).toBe(addr);
+    }
   });
 });

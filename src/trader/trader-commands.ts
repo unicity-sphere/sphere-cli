@@ -65,6 +65,12 @@ interface SetStrategyOpts {
   trustedEscrows?: string;
 }
 
+interface WithdrawOpts {
+  asset: string;
+  amount: string;
+  toAddress: string;
+}
+
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -334,6 +340,57 @@ async function handlePortfolio(cmd: Command): Promise<void> {
 // rely on `sphere trader portfolio`/`list-intents` succeeding as an
 // implicit liveness signal.
 
+/**
+ * Build the wire payload for WITHDRAW_TOKEN. Pure function for unit-testing.
+ *
+ * Validation here mirrors the trader-side handler in
+ * trader-service/src/trader/trader-command-handler.ts:633: asset must be
+ * non-empty, amount must be a positive bigint string, to_address must
+ * be a valid address. The trader re-validates everything; we catch
+ * the trivial cases at the CLI layer for a faster local error path.
+ */
+export function buildWithdrawParams(
+  opts: WithdrawOpts,
+): { readonly params: Record<string, unknown> } | { readonly error: string } {
+  if (!opts.asset || opts.asset.trim() === '') {
+    return { error: '--asset is required (e.g. UCT, USDU, or hex coin id)' };
+  }
+  if (!opts.amount) {
+    return { error: '--amount is required (positive integer in smallest units)' };
+  }
+  // Strict positive-integer parse — reject `1e6`-style scientific
+  // notation, leading zeros, signs, decimals. The trader uses
+  // safeParseBigint which is similarly strict.
+  if (!/^[1-9]\d*$/.test(opts.amount)) {
+    return {
+      error: `--amount must be a positive integer in smallest units (got "${opts.amount}")`,
+    };
+  }
+  if (!opts.toAddress || opts.toAddress.trim() === '') {
+    return { error: '--to-address is required' };
+  }
+  return {
+    params: {
+      asset: opts.asset,
+      amount: opts.amount,
+      to_address: opts.toAddress,
+    },
+  };
+}
+
+async function handleWithdraw(cmd: Command, opts: WithdrawOpts): Promise<void> {
+  await runWithTransport(cmd, async ({ transport, json }) => {
+    const built = buildWithdrawParams(opts);
+    if ('error' in built) {
+      writeStderr(built.error);
+      process.exitCode = 1;
+      return;
+    }
+    const response = await transport.sendCommand('WITHDRAW_TOKEN', built.params);
+    emitResult(json, response);
+  });
+}
+
 async function handleSetStrategy(cmd: Command, opts: SetStrategyOpts): Promise<void> {
   await runWithTransport(cmd, async ({ transport, json }) => {
     const params: Record<string, unknown> = {};
@@ -437,6 +494,16 @@ export function createTraderCommand(): Command {
     .option('--trusted-escrows <list>', 'Comma-separated escrow addresses (overwrites)')
     .action(async function (this: Command, opts: SetStrategyOpts) {
       await handleSetStrategy(this, opts);
+    });
+
+  trader
+    .command('withdraw')
+    .description('Withdraw a token from the trader to an external address (ACP WITHDRAW_TOKEN)')
+    .requiredOption('--asset <symbol>', 'Asset symbol (e.g. UCT, USDU) or hex coin id')
+    .requiredOption('--amount <bigint>', 'Amount to withdraw in smallest units (string-encoded bigint, must be > 0)')
+    .requiredOption('--to-address <address>', 'Destination address: @nametag, DIRECT://hex, or 64-char hex pubkey')
+    .action(async function (this: Command, opts: WithdrawOpts) {
+      await handleWithdraw(this, opts);
     });
 
   // Attach the shared-options help text to every subcommand.

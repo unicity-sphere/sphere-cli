@@ -19,6 +19,19 @@ on:
     - cron: '7 3 * * *'
   workflow_dispatch:
 
+# Read-only repo access — this workflow only clones, builds, and tests.
+# No pushes, no release writes, no PR comments. Principle of least privilege.
+permissions:
+  contents: read
+
+# Serialize integration runs: if a manual workflow_dispatch fires during the
+# 03:07 UTC cron window, queue it behind the scheduled run instead of
+# double-hammering public testnet infra. cancel-in-progress=false because we
+# want both runs to complete — the second provides a fresh signal.
+concurrency:
+  group: integration-nightly
+  cancel-in-progress: false
+
 jobs:
   integration:
     name: integration (testnet)
@@ -34,14 +47,21 @@ jobs:
           node-version: 22.x
           cache: npm
 
-      # See ci.yml for the rationale behind the sibling-clone workaround.
-      # Kept identical here so a nightly run is hermetic w.r.t. ci.yml state.
       - name: Clone sphere-sdk sibling
+        # Pin to a specific commit SHA (not a branch name) for supply-chain
+        # integrity — a branch pointer can be force-pushed or rebased,
+        # silently changing the code CI builds against. Kept in sync with
+        # ci.yml so both workflows build against the same sphere-sdk tree.
+        #
+        # Bump this SHA when a new sphere-sdk commit is required; remove
+        # this whole workaround once sphere-sdk publishes v0.7.1+ to npm.
+        env:
+          SPHERE_SDK_SHA: 86468103ac25271b96a338f64349dd0eb472689f
         run: |
-          git clone --depth 1 --branch refactor/extract-cli-to-sphere-cli \
-            https://github.com/unicity-sphere/sphere-sdk.git ../../sphere-sdk
+          git clone https://github.com/unicity-sphere/sphere-sdk.git ../../sphere-sdk
+          git -C ../../sphere-sdk checkout --detach "$SPHERE_SDK_SHA"
 
-      - name: Build sphere-sdk (required for file: dependency to resolve types)
+      - name: "Build sphere-sdk (required for file: dependency to resolve types)"
         run: |
           cd ../../sphere-sdk
           npm ci
@@ -58,15 +78,11 @@ jobs:
         # a slow testnet day without leaving a hung job indefinitely.
         timeout-minutes: 20
 
-      # Upload the tmp wallet dirs + logs on failure so a flake is debuggable
-      # without re-running. Path covers the vitest test-timeout stderr spew
-      # plus anything the integration helpers leave in os.tmpdir().
-      - name: Collect logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: integration-logs-${{ github.run_id }}
-          path: |
-            /tmp/sphere-cli-it-*/
-          retention-days: 7
-          if-no-files-found: ignore
+      # NOTE: intentionally NO artifact upload of /tmp/sphere-cli-it-*/. Those
+      # dirs hold secp256k1 wallet material (testnet mnemonics + private keys)
+      # created by the integration helpers. Even though the keys are throwaway
+      # and hold no funds, harvesting them into 7-day GitHub Actions artifacts
+      # is poor hygiene: the helpers (test/integration/helpers.ts) explicitly
+      # shred them on exit/SIGINT/SIGTERM for the same reason. For nightly
+      # failure triage, the vitest stderr in the job log is sufficient; re-run
+      # locally via `npm run test:integration` if deeper investigation needed.

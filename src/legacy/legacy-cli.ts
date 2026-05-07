@@ -1662,16 +1662,33 @@ async function main(): Promise<void> {
           // Show generated mnemonic for backup — only when stdout is a TTY.
           // If stdout is piped to a file or CI log, printing the mnemonic
           // would persist it in plaintext on disk / in logs.
+          //
+          // Override for automation (e2e harnesses): the test runner that
+          // owns the wallet directory wants the mnemonic captured for
+          // recovery scripts (pointer-N2, profile-token-persistence,
+          // etc.). When `SPHERE_ALLOW_MNEMONIC_NON_TTY=1` is set, emit
+          // the 24-word phrase to stdout despite the non-TTY context.
+          // The env var name is verbose by design — this is a footgun
+          // for production users; tests opt in explicitly.
           const storedMnemonic = sphere.getMnemonic();
           if (storedMnemonic) {
+            const allowNonTty = process.env['SPHERE_ALLOW_MNEMONIC_NON_TTY'] === '1';
             if (process.stdout.isTTY) {
               console.log('\n⚠️  BACKUP YOUR MNEMONIC (24 words):');
               console.log('─'.repeat(50));
               console.log(storedMnemonic);
               console.log('─'.repeat(50));
               console.log('Store this safely! You will need it to recover your wallet.\n');
+            } else if (allowNonTty) {
+              // Emit on stdout as a single line so the e2e helpers'
+              // grep `\b[a-z]+( [a-z]+){23}\b` matches it cleanly.
+              console.log(storedMnemonic);
+              process.stderr.write(
+                '\nNOTE: mnemonic emitted to stdout (SPHERE_ALLOW_MNEMONIC_NON_TTY=1).\n',
+              );
             } else {
               process.stderr.write('\nWARNING: Mnemonic NOT shown (stdout is not a terminal). Re-run interactively to see it.\n');
+              process.stderr.write('         Set SPHERE_ALLOW_MNEMONIC_NON_TTY=1 to override (e2e harnesses only).\n');
             }
           }
         }

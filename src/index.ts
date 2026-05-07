@@ -23,6 +23,7 @@ import { Command } from 'commander';
 import { VERSION } from './version.js';
 import { createHostCommand } from './host/host-commands.js';
 import { createTraderCommand } from './trader/trader-commands.js';
+import { createPointerCommand } from './pointer/pointer-commands.js';
 
 // Legacy namespaces that delegate to the sphere-sdk CLI dispatcher.
 // These are wired in phase 2 and replaced command-by-command in phase 4+.
@@ -30,6 +31,12 @@ const LEGACY_NAMESPACES = new Set([
   'wallet', 'balance', 'payments', 'dm', 'group', 'market', 'swap',
   'invoice', 'nametag', 'crypto', 'util', 'faucet', 'daemon', 'config',
   'completions',
+  // Top-level legacy aliases — kept as bare commands (not under a
+  // namespace) so existing tooling that drives `sphere init …` /
+  // `sphere status` / `sphere clear` continues to work after the
+  // sphere-sdk → @unicity-sphere/cli extraction. `wallet init` / `wallet
+  // status` map to the same legacy backing case via buildLegacyArgv.
+  'init', 'status', 'clear',
 ]);
 
 // Phase 4 namespaces — DM-native, not yet implemented.
@@ -74,6 +81,14 @@ export function buildLegacyArgv(namespace: string, tail: string[] = process.argv
     case 'daemon':      return ['daemon',      ...tail];
     case 'config':      return ['config',      ...tail];
     case 'completions': return ['completions', ...tail];
+
+    // Top-level legacy aliases — keep the legacy command name as
+    // argv[0]. Tests that drive `sphere init --profile`, `sphere
+    // status`, `sphere clear` predate the namespace split; these
+    // shims keep the wire shape intact.
+    case 'init':   return ['init',   ...tail];
+    case 'status': return ['status', ...tail];
+    case 'clear':  return ['clear',  ...tail];
 
     // faucet → legacy 'topup'
     case 'faucet': return ['topup', ...tail];
@@ -177,6 +192,15 @@ export function createCli(): Command {
   // Operators with the canonical tool installed can use either; sphere-cli
   // ships this for convenience parity with `sphere host`.
   program.addCommand(createTraderCommand());
+
+  // `sphere pointer` — aggregator-pointer-layer status / flush / recover.
+  // Native command (not a legacy bridge): the pointer layer was never
+  // exposed by the in-tree sphere-sdk CLI, so there is no legacy
+  // dispatch to delegate to. Implemented directly against the SDK's
+  // ProfilePointerLayer methods. Profile-mode wallets only — legacy
+  // file-mode wallets have no pointer layer; the commands exit with
+  // a clear diagnostic in that case.
+  program.addCommand(createPointerCommand());
 
   return program;
 }

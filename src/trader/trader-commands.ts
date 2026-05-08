@@ -43,6 +43,13 @@ interface CreateIntentOpts {
   volumeMin: string;
   volumeMax: string;
   expiryMs?: string;
+  /**
+   * Pubkey, DIRECT://hex, or PROXY://hex of the escrow the trader will
+   * route the swap through. Optional — when omitted the trader picks
+   * the default ('any' wildcard / first trusted_escrow). Tests and
+   * production callers that depend on a specific escrow MUST set this.
+   */
+  escrowAddress?: string;
 }
 
 interface CancelIntentOpts {
@@ -254,6 +261,13 @@ export function buildCreateIntentParams(
     }
     params['expiry_sec'] = Math.floor(n / 1000);
   }
+  if (opts.escrowAddress !== undefined) {
+    const trimmed = opts.escrowAddress.trim();
+    if (trimmed === '') {
+      return { error: '--escrow-address must be non-empty when provided' };
+    }
+    params['escrow_address'] = trimmed;
+  }
   return { params };
 }
 
@@ -388,6 +402,7 @@ export function createTraderCommand(): Command {
     .requiredOption('--volume-min <bigint>', 'Minimum volume per match')
     .requiredOption('--volume-max <bigint>', 'Total intent volume')
     .option('--expiry-ms <ms>', 'Expiry duration in milliseconds (default: 24h)')
+    .option('--escrow-address <address>', 'Escrow agent address (pubkey | DIRECT://hex | PROXY://hex). Defaults to "any" wildcard if omitted.')
     .action(async function (this: Command, opts: CreateIntentOpts) {
       await handleCreateIntent(this, opts);
     });

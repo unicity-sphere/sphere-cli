@@ -155,11 +155,24 @@ export function createCli(): Command {
   for (const name of LEGACY_NAMESPACES) {
     const sub = program
       .command(name)
-      .description(`${name} commands (legacy bridge — phase 2)`);
+      .description(`${name} commands (legacy bridge — phase 2)`)
+      // Disable Commander's built-in `--help` / `-h` so help args
+      // fall through to our action(). The legacy CLI has its own
+      // COMMAND_HELP dispatcher (legacy-cli.ts) that emits detailed
+      // flag tables; without this opt-out, Commander prints a generic
+      // "<name> commands (legacy bridge — phase 2)" stub and the
+      // legacy code never sees the help request.
+      .helpOption(false);
 
     sub.allowUnknownOption(true);
     sub.action(async () => {
-      const legacyArgv = buildLegacyArgv(name);
+      // Detect a help request and route to the legacy CLI's
+      // `help <command>` form (which prints COMMAND_HELP[name] —
+      // detailed Usage / flags / examples / notes). For non-help
+      // calls, route to the standard switch/case via buildLegacyArgv.
+      const tail = process.argv.slice(3);
+      const wantsHelp = tail.includes('--help') || tail.includes('-h');
+      const legacyArgv = wantsHelp ? ['help', name] : buildLegacyArgv(name);
       // Dynamic import keeps the legacy ~40-file dispatcher out of the hot
       // start path for phase-4 DM-native commands (`sphere host …`, etc.)
       // that don't need it. Paid once on first legacy invocation per process.
@@ -192,6 +205,29 @@ export function createCli(): Command {
   // Operators with the canonical tool installed can use either; sphere-cli
   // ships this for convenience parity with `sphere host`.
   program.addCommand(createTraderCommand());
+
+  // Custom `help <command>` — route to the legacy CLI's COMMAND_HELP
+  // dispatcher when the target is a legacy bridge name. Commander's
+  // built-in help command otherwise prints just the bridge stub line
+  // ("<name> commands (legacy bridge — phase 2)"), losing the
+  // detailed Usage/flags/examples/notes the legacy CLI produces.
+  program
+    .command('help [target]')
+    .description('display detailed help for a command')
+    .allowUnknownOption(true)
+    .action(async (target: string | undefined) => {
+      if (!target) {
+        program.outputHelp();
+        return;
+      }
+      if (LEGACY_NAMESPACES.has(target)) {
+        const { legacyMain } = await import('./legacy/legacy-cli.js');
+        await legacyMain(['help', target]);
+        return;
+      }
+      // For native commands (host, trader, pointer) re-emit Commander's help.
+      program.outputHelp();
+    });
 
   // `sphere pointer` — aggregator-pointer-layer status / flush / recover.
   // Native command (not a legacy bridge): the pointer layer was never

@@ -223,6 +223,18 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
   if (sphereInstance) return sphereInstance;
 
   const config = loadConfig();
+
+  // Optional Nostr-relay override (mirrors host/sphere-init.ts).
+  // Used by trader-service's local-infra e2e harness so `wallet init`
+  // and the rest of the legacy CLI talk to the same Docker-hosted relay
+  // the spawned tenants and host-manager use.
+  const relayOverride = (() => {
+    const raw = process.env['UNICITY_NOSTR_RELAYS'] ?? process.env['SPHERE_NOSTR_RELAYS'];
+    if (!raw) return undefined;
+    const relays = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    return relays.length > 0 ? relays : undefined;
+  })();
+
   const providers = createNodeProviders({
     network: config.network,
     dataDir: config.dataDir,
@@ -230,6 +242,7 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     tokenSync: { ipfs: { enabled: true } },
     market: true,
     groupChat: true,
+    ...(relayOverride ? { transport: { relays: relayOverride } } : {}),
   });
 
   const initProviders = noNostrGlobal

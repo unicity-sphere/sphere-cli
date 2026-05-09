@@ -48,10 +48,24 @@ function loadConfig(): CliConfig {
 export async function initSphere(): Promise<Sphere> {
   const config = loadConfig();
 
+  // Optional Nostr-relay override. Set `UNICITY_NOSTR_RELAYS` (or
+  // `SPHERE_NOSTR_RELAYS` as a fallback) to a comma-separated list of
+  // WebSocket URLs to replace the network preset's relays. Used by the
+  // trader-service local-infra e2e harness so `sphere host spawn`,
+  // `sphere trader create-intent`, etc., target the same Docker-hosted
+  // relay the spawned tenants and the host-manager are using.
+  const relayOverride = (() => {
+    const raw = process.env['UNICITY_NOSTR_RELAYS'] ?? process.env['SPHERE_NOSTR_RELAYS'];
+    if (!raw) return undefined;
+    const relays = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    return relays.length > 0 ? relays : undefined;
+  })();
+
   const providers = createNodeProviders({
     network: config.network,
     dataDir: config.dataDir,
     tokensDir: config.tokensDir,
+    ...(relayOverride ? { transport: { relays: relayOverride } } : {}),
   });
 
   const exists = await Sphere.exists(providers.storage);

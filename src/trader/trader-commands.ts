@@ -72,6 +72,12 @@ interface SetStrategyOpts {
   trustedEscrows?: string;
 }
 
+interface WithdrawOpts {
+  asset?: string;
+  amount?: string;
+  toAddress?: string;
+}
+
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -348,6 +354,48 @@ async function handlePortfolio(cmd: Command): Promise<void> {
 // rely on `sphere trader portfolio`/`list-intents` succeeding as an
 // implicit liveness signal.
 
+async function handleWithdraw(cmd: Command, opts: WithdrawOpts): Promise<void> {
+  await runWithTransport(cmd, async ({ transport, json }) => {
+    if (opts.asset === undefined || opts.asset.trim() === '') {
+      writeStderr('withdraw: --asset is required');
+      process.exitCode = 1;
+      return;
+    }
+    if (opts.amount === undefined || opts.amount.trim() === '') {
+      writeStderr('withdraw: --amount is required');
+      process.exitCode = 1;
+      return;
+    }
+    // Reject non-positive / non-integer amounts up-front so the CLI gives
+    // a clear error before the trader returns its own validation rejection.
+    let parsedAmount: bigint;
+    try {
+      parsedAmount = BigInt(opts.amount.trim());
+    } catch {
+      writeStderr(`withdraw: --amount must be a positive integer (got "${opts.amount}")`);
+      process.exitCode = 1;
+      return;
+    }
+    if (parsedAmount <= 0n) {
+      writeStderr(`withdraw: --amount must be > 0 (got "${opts.amount}")`);
+      process.exitCode = 1;
+      return;
+    }
+    if (opts.toAddress === undefined || opts.toAddress.trim() === '') {
+      writeStderr('withdraw: --to-address is required');
+      process.exitCode = 1;
+      return;
+    }
+    const params = {
+      asset: opts.asset.trim(),
+      amount: parsedAmount.toString(),
+      to_address: opts.toAddress.trim(),
+    };
+    const response = await transport.sendCommand('WITHDRAW_TOKEN', params);
+    emitResult(json, response);
+  });
+}
+
 async function handleSetStrategy(cmd: Command, opts: SetStrategyOpts): Promise<void> {
   await runWithTransport(cmd, async ({ transport, json }) => {
     const params: Record<string, unknown> = {};
@@ -452,6 +500,16 @@ export function createTraderCommand(): Command {
     .option('--trusted-escrows <list>', 'Comma-separated escrow addresses (overwrites)')
     .action(async function (this: Command, opts: SetStrategyOpts) {
       await handleSetStrategy(this, opts);
+    });
+
+  trader
+    .command('withdraw')
+    .description('Withdraw tokens from the trader to an external address')
+    .option('--asset <symbol>', 'Asset symbol (e.g. UCT, USDU)')
+    .option('--amount <n>', 'Amount in smallest units (positive integer)')
+    .option('--to-address <addr>', 'Recipient (@nametag, DIRECT://hex, or hex pubkey)')
+    .action(async function (this: Command, opts: WithdrawOpts) {
+      await handleWithdraw(this, opts);
     });
 
   // Attach the shared-options help text to every subcommand.

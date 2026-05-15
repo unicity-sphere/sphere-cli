@@ -3778,8 +3778,15 @@ async function main(): Promise<void> {
               console.error(`Invalid amount "${parsed.amount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
               process.exit(1);
             }
-            const { coinId: resolvedCoinId } = resolveCoin(parsed.coin);
-            assets.push({ coin: [resolvedCoinId, parsed.amount] });
+            // AccountingModule.createInvoice validates coinId as
+            // /^[A-Za-z0-9]+$/ with length ≤20 — i.e. it expects the
+            // human-readable symbol (UCT, USDU, ...), NOT the 64-char
+            // hex token-type id that `payments.send` uses. resolveCoin
+            // is still useful to fail fast on unknown symbols (it
+            // exits non-zero before invoice mint), but we hand the
+            // SYMBOL through to the SDK.
+            const { symbol: resolvedSymbol } = resolveCoin(parsed.coin);
+            assets.push({ coin: [resolvedSymbol, parsed.amount] });
           } else if (nftId) {
             assets.push({ nft: { tokenId: nftId } });
           }
@@ -4103,7 +4110,11 @@ async function main(): Promise<void> {
         if (assetIdx3 !== -1 && args[assetIdx3 + 1]) {
           const parsed = parseAssetArg(args[assetIdx3 + 1]);
           returnAmount = parsed.amount;
-          returnCoinId = resolveCoin(parsed.coin).coinId;
+          // Same SDK convention as invoice-create — the AccountingModule's
+          // ReturnPaymentParams.coinId is the symbol (UCT, USDU, ...), not
+          // the 64-char hex. resolveCoin still validates that the symbol
+          // is known to the TokenRegistry.
+          returnCoinId = resolveCoin(parsed.coin).symbol;
         } else {
           console.error('--asset "<amount> <coin>" is required for invoice-return');
           process.exit(1);

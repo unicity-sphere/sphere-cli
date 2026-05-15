@@ -25,9 +25,34 @@ import { join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 
 /**
- * Image pin — defaults to `escrow:local-uxf`, the locally-built image
- * against the uxf integration/all-fixes sphere-sdk. Build instructions:
+ * Image pin — defaults to `ghcr.io/vrogojin/agentic-hosting/escrow:v0.2`,
+ * published 2026-05-16 against the uxf `integration/all-fixes` HEAD
+ * (commit 3a575cd02ff7ab2fc5b2b8696fd8fdfd614779ff). Publicly pullable;
+ * digest `sha256:311903b6f98b33a63791bf79db6522a66d118588ba56fcf6e56654ed6670ebac`.
  *
+ * Composition (vs v0.1):
+ *   - escrow-service: master + `fix/conservative-payout-mode` HEAD
+ *     (4 commits ahead of v0.1: conservative payout transferMode,
+ *     UNICITY_NOSTR_RELAYS env override, deliverDepositInvoice
+ *     instrumentation, BUG-001 docstring cleanup)
+ *   - sphere-sdk: uxf integration/all-fixes @3a575cd, including:
+ *       * PR #105 (UXF Inter-Wallet Transfer Protocol)
+ *       * PR #115 (swap/accounting race-condition fixes from live e2e)
+ *       * PR #119 (verifyPayout OVER_COVERAGE rejection)
+ *       * PR #128 (getTokenIdsForInvoice on deps facade)
+ *       * PR #146/147/149/152 (UXF dispatcher work)
+ *       * All payments/* faucet-flow regression fixes
+ *
+ * v0.1 (`ghcr.io/vrogojin/agentic-hosting/escrow:v0.1`, 2026-04-25)
+ * is STALE — it predates everything in the list above and causes
+ * protocol-level mismatches against current sphere-sdk wallets. The
+ * trader-service harness still pins v0.1 as of 2026-05-16; that
+ * coordination is tracked separately.
+ *
+ * Override via `SPHERE_CLI_ESCROW_IMAGE=<tag>` env var to test against
+ * a different escrow tag — e.g. a locally-built dev image:
+ *
+ *   # Build a local image against current source trees:
  *   mkdir /tmp/escrow-uxf-build && cd /tmp/escrow-uxf-build
  *   rsync -a --exclude=node_modules --exclude=dist --exclude=.git \
  *     /home/vrogojin/escrow-service/ ./escrow-service/
@@ -35,20 +60,10 @@ import { randomBytes, randomUUID } from 'node:crypto';
  *     --exclude=tests --exclude=.claude --exclude=docs --exclude=examples \
  *     /home/vrogojin/uxf/ ./sphere-sdk/
  *   docker build -f escrow-service/Dockerfile -t escrow:local-uxf .
- *
- * Override via `SPHERE_CLI_ESCROW_IMAGE=<tag>` env var if you want to
- * test against a different escrow tag — e.g. the published v0.1 (stale
- * vs integration/all-fixes — see issue #156 follow-up notes), or a
- * future v0.2 once the agentic-hosting team publishes it.
- *
- * The trader-service harness pins `ghcr.io/vrogojin/agentic-hosting/escrow:v0.1`,
- * but that image was built 2026-04-25 against an older sphere-sdk that
- * predates the UXF inter-wallet protocol (PR #105), swap race-condition
- * fixes (PR #115), verifyPayout OVER_COVERAGE (PR #119), and getTokenIdsForInvoice
- * exposure (PR #128). Running the latest sphere-cli wallet against that
- * image causes protocol-level mismatches.
+ *   SPHERE_CLI_ESCROW_IMAGE=escrow:local-uxf E2E_RUN_SWAP=1 npm run test:integration
  */
-export const ESCROW_IMAGE = process.env['SPHERE_CLI_ESCROW_IMAGE'] ?? 'escrow:local-uxf';
+export const ESCROW_IMAGE =
+  process.env['SPHERE_CLI_ESCROW_IMAGE'] ?? 'ghcr.io/vrogojin/agentic-hosting/escrow:v0.2';
 
 const DEFAULT_READY_TIMEOUT_MS = 120_000;
 

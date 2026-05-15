@@ -51,6 +51,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import {
   createSphereEnv,
   destroySphereEnv,
@@ -258,5 +259,59 @@ describe.skipIf(integrationSkip)(
       // populated from the imported mnemonic.
       expect(existsSync(join(env.home, '.sphere-cli', 'wallet.json'))).toBe(true);
     }, 180_000);
+  },
+);
+
+describe.skipIf(integrationSkip)(
+  'sphere-cli integration — init --nametag combined flow (real testnet)',
+  () => {
+    // Pins the init-time nametag registration. This is a combined flow:
+    // `init --nametag X` runs Sphere.init({ nametag: X }) which both
+    // creates the wallet AND mints the nametag in one shot. The legacy
+    // CLI's `init` case (~line 1640) propagates `nametag` into the
+    // getSphere() options bag; the SDK's Sphere.init then calls
+    // registerNametag() on success.
+    //
+    // Standalone `nametag register` is already covered in
+    // cli-nametag.integration.test.ts. This test ADDS coverage of the
+    // combined flow because the two paths fail differently:
+    //   - register-after-init: wallet exists; failure rolls back nothing.
+    //   - init --nametag: failure mid-mint leaves wallet+nametag in a
+    //     potentially inconsistent state (wallet stored, nametag
+    //     unregistered locally). Sphere.init handles this defensively;
+    //     we pin the happy path here.
+    let env: SphereEnv;
+    const nametag = `it_${randomBytes(4).toString('hex')}`;
+
+    beforeAll(() => { env = createSphereEnv('init-nametag-combined'); });
+    afterAll(() => { if (env) destroySphereEnv(env); });
+
+    it(`\`sphere init --nametag ${nametag}\` mints the nametag during wallet creation`, () => {
+      const r = runSphere(
+        env,
+        ['init', '--network', 'testnet', '--nametag', nametag],
+        { timeoutMs: 240_000 },
+      );
+      if (r.status !== 0) {
+        console.error('init --nametag failed', { stdout: r.stdout, stderr: r.stderr });
+      }
+      expect(r.status).toBe(0);
+      // The identity block (~line 1654) must include the registered
+      // nametag in the JSON output. If init succeeds but nametag mint
+      // fails silently, the field would be null/absent here.
+      expect(r.stdout).toMatch(new RegExp(`"nametag":\\s*"${nametag}"`));
+      // The wallet directory now exists on disk.
+      expect(existsSync(join(env.home, '.sphere-cli', 'wallet.json'))).toBe(true);
+    }, 300_000);
+
+    it('`sphere nametag my` reports the registered nametag after init --nametag', () => {
+      // Re-verify via a different code path: read the nametag via the
+      // dedicated query command. If `init --nametag` registered the
+      // mint on-chain but didn't persist the binding locally, this
+      // would show "No nametag registered" instead of the value.
+      const r = runSphere(env, ['nametag', 'my'], { timeoutMs: 60_000 });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain(nametag);
+    }, 90_000);
   },
 );

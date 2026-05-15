@@ -304,17 +304,26 @@ describe('sphere-cli — util behaviour (offline)', () => {
   });
 
   it('`sphere crypto decrypt <blob> <wrong-pw>` does NOT yield the original plaintext', () => {
-    // CryptoJS AES-CBC has no built-in HMAC, so the CLI exits 0 on a
-    // wrong password — the cipher just produces garbled bytes and the
-    // handler doesn't validate them. (This is a known shortcoming of
-    // the underlying crypto envelope; pinning it here documents the
-    // current behaviour rather than asserting an impossible exit code.)
+    // CLI DEFECT (documented here; not blocking this test):
+    //   The current decrypt handler exits 0 on a wrong password — the
+    //   underlying CryptoJS AES-CBC envelope has no HMAC, so a bad key
+    //   produces garbled bytes that the handler doesn't validate. A
+    //   proper implementation (AES-GCM or HMAC-then-encrypt) would
+    //   return non-zero on authenticator failure.
     //
-    // Load-bearing pin: the decrypted output MUST NOT match the
-    // original plaintext. If a regression ever leaks the key derivation
-    // (e.g. uses a constant IV), a wrong-password decrypt could happen
-    // to coincide with the original plaintext for specific inputs —
-    // this assert catches that pathological case.
+    //   TODO(security): replace the AES-CBC envelope with an
+    //   authenticated mode (AES-GCM via Node `crypto.createCipheriv`)
+    //   and switch this assertion to `expect(dec.status).not.toBe(0)`.
+    //   That change should be a SEPARATE PR with a backwards-compat
+    //   shim that keeps `decrypt` accepting both envelopes for a
+    //   transition window.
+    //
+    // What this test pins TODAY:
+    //   The decrypted output MUST NOT match the original plaintext.
+    //   If a regression ever leaks the key derivation (e.g. uses a
+    //   constant IV), a wrong-password decrypt could happen to
+    //   coincide with the original plaintext for specific inputs —
+    //   this assert catches that pathological case.
     const plaintext = 'integration-test-only-secret';
     const enc = runSphere(env, ['crypto', 'encrypt', plaintext, 'real-password']);
     const ciphertext = enc.stdout.trim();

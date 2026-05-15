@@ -19,7 +19,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -116,12 +116,19 @@ async function realSecp256k1Pubkey(): Promise<string> {
  * Materialize a host-side wallet directory (data + tokens subdirs) for
  * the escrow's bind mount. The escrow's `Sphere.init` generates the
  * actual keypair inside the container on first boot.
+ *
+ * Permissions: locked to owner-only (0700) immediately after creation.
+ * POSIX mkdtemp(3) creates with mode 0700 already; the explicit chmod
+ * is paranoia for non-POSIX platforms (Windows) where Node's emulation
+ * may inherit DACLs from the parent. Matches the hardening pattern in
+ * `helpers.ts:createSphereEnv`.
  */
 function materializeWalletDir(label: string): string {
   const safeLabel = label.replace(/[^a-zA-Z0-9-_]/g, '-').slice(0, 24);
   const root = mkdtempSync(join(tmpdir(), `sphere-cli-swap-${safeLabel}-`));
-  mkdirSync(join(root, 'wallet'), { recursive: true });
-  mkdirSync(join(root, 'tokens'), { recursive: true });
+  chmodSync(root, 0o700);
+  mkdirSync(join(root, 'wallet'), { recursive: true, mode: 0o700 });
+  mkdirSync(join(root, 'tokens'), { recursive: true, mode: 0o700 });
   return root;
 }
 
@@ -163,16 +170,30 @@ export async function bootEscrow(opts: EscrowBootOptions): Promise<EscrowHandle>
 
     // 3. Compose the `docker run` argv. The agentic-hosting escrow image
     // expects the ACP boot envelope + Sphere runtime config.
+    //
+    // Relay env var name: the escrow's acp-adapter reads
+    // `UNICITY_NOSTR_RELAYS` (with `SPHERE_NOSTR_RELAYS` as fallback).
+    // Earlier drafts used `UNICITY_RELAYS` which the escrow silently
+    // ignored — the container then fell back to network-default relays.
+    // That worked accidentally only because the e2e suite already
+    // targets the public testnet relay; pointing this helper at a local
+    // Nostr relay would have failed silently.
+    //
+    // Manager direct address: must be a `DIRECT://...` form, not a raw
+    // pubkey hex. The current escrow code only checks that the env var
+    // is non-empty, but a future routing change would dereference it as
+    // a transport address — synthesize a syntactically correct
+    // placeholder so a future protocol update doesn't silently degrade.
     const env: Record<string, string> = {
       UNICITY_MANAGER_PUBKEY: managerPubkey,
-      UNICITY_MANAGER_DIRECT_ADDRESS: managerPubkey,
+      UNICITY_MANAGER_DIRECT_ADDRESS: `DIRECT://${managerPubkey}`,
       UNICITY_CONTROLLER_PUBKEY: controllerPubkey,
       UNICITY_BOOT_TOKEN: randomUUID(),
       UNICITY_INSTANCE_ID: instanceId,
       UNICITY_INSTANCE_NAME: containerName,
       UNICITY_TEMPLATE_ID: 'escrow',
       UNICITY_NETWORK: network,
-      UNICITY_RELAYS: opts.relayUrl,
+      UNICITY_NOSTR_RELAYS: opts.relayUrl,
       UNICITY_DATA_DIR: '/data/wallet',
       UNICITY_TOKENS_DIR: '/data/tokens',
       LOG_LEVEL: 'info',
@@ -183,8 +204,8 @@ export async function bootEscrow(opts: EscrowBootOptions): Promise<EscrowHandle>
       '--name', containerName,
       // Detached host-gateway extra-host: allows the container to reach
       // the host via host.docker.internal regardless of the bridge IP.
-      // We pass the gateway-IP form via UNICITY_RELAYS anyway, but this
-      // covers the host.docker.internal fallback path.
+      // We pass the gateway-IP form via UNICITY_NOSTR_RELAYS anyway, but
+      // this covers the host.docker.internal fallback path.
       '--add-host', 'host.docker.internal:host-gateway',
       '-v', `${walletDir}/wallet:/data/wallet`,
       '-v', `${walletDir}/tokens:/data/tokens`,

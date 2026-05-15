@@ -295,6 +295,24 @@ describe.skipIf(integrationSkip || !RUN_SWAP_E2E)(
       ).toBe(false);
     }, 240_000);
 
+    // ── Full deposit-settlement tier (opt-in) ──────────────────────────
+    // Known fragile. Observed failure mode: bob's `swap accept --deposit
+    // --no-wait` returns once the deposit is *submitted*, but the
+    // on-chain transfer to the escrow's deposit invoice may not complete
+    // before alice's 300s status budget elapses. The escrow only
+    // concludes the swap once BOTH parties have deposited, so settlement
+    // stalls at "depositing" on alice's side.
+    //
+    // Likely fix paths (left for a future PR):
+    //   1. Lengthen the polling budget (300s → 600s).
+    //   2. Drive both parties' deposits explicitly + await each one's
+    //      `swap:deposit_confirmed` event before polling for completion.
+    //   3. Restructure: alice deposits FIRST (with --no-wait), then bob
+    //      runs full accept + deposit + wait.
+    //
+    // Gated behind `E2E_RUN_SWAP_FULL=1` so the default e2e tier (ping
+    // + propose/list/cancel) stays green. Run this tier only when you
+    // have time + a stable testnet to debug it.
     describe.skipIf(!RUN_SWAP_FULL)(
       'full deposit settlement (E2E_RUN_SWAP_FULL=1)',
       () => {

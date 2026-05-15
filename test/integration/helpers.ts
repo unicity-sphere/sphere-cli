@@ -103,9 +103,19 @@ function shredAllActive(): void {
 // produce a failed-test JSON report, and an extra handler calling
 // process.exit(1) would truncate that output. The `exit` handler below
 // still runs on vitest's natural shutdown and shreds any lingering envs.
-process.once('exit', shredAllActive);
-process.once('SIGINT', () => { shredAllActive(); process.exit(130); });
-process.once('SIGTERM', () => { shredAllActive(); process.exit(143); });
+//
+// Guard against double-registration: vitest may evaluate this module
+// more than once per worker (test-file isolation + module cache).
+// Without the guard, three handlers per file × N files trips Node's
+// default MaxListeners=10 warning. The flag lives on a global symbol
+// so it survives any per-import scope.
+const HANDLERS_REGISTERED = Symbol.for('sphere-cli-it-helpers-handlers-registered');
+if (!(globalThis as Record<symbol, unknown>)[HANDLERS_REGISTERED]) {
+  (globalThis as Record<symbol, unknown>)[HANDLERS_REGISTERED] = true;
+  process.once('exit', shredAllActive);
+  process.once('SIGINT', () => { shredAllActive(); process.exit(130); });
+  process.once('SIGTERM', () => { shredAllActive(); process.exit(143); });
+}
 
 /**
  * Options for `createSphereEnv`.

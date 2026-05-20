@@ -12,7 +12,7 @@
  * Gates:
  *   - `SKIP_INTEGRATION=1`  — skip all integration tests (CI fast tier).
  *   - `E2E_RUN_SWAP=1`      — opt in to this suite. Default skipped because:
- *       * needs Docker + escrow image (`ghcr.io/vrogojin/agentic-hosting/escrow:v0.1`)
+ *       * needs Docker + escrow image (`ghcr.io/vrogojin/agentic-hosting/escrow:v0.3`)
  *       * faucet round-trips consume testnet tokens
  *       * full setup takes 3-6 minutes
  *
@@ -296,27 +296,68 @@ describe.skipIf(integrationSkip || !RUN_SWAP_E2E)(
     }, 240_000);
 
     // ── Full deposit-settlement tier (opt-in) ──────────────────────────
-    // Known fragile. Observed failure mode: bob's `swap accept --deposit
-    // --no-wait` returns once the deposit is *submitted*, but the
-    // on-chain transfer to the escrow's deposit invoice may not complete
-    // before alice's 300s status budget elapses. The escrow only
-    // concludes the swap once BOTH parties have deposited, so settlement
-    // stalls at "depositing" on alice's side.
+    // #163 item 1 — investigation history (2026-05-20) → resolved
+    // upstream in escrow:v0.3 (2026-05-21).
     //
-    // Likely fix paths (left for a future PR):
-    //   1. Lengthen the polling budget (300s → 600s).
-    //   2. Drive both parties' deposits explicitly + await each one's
-    //      `swap:deposit_confirmed` event before polling for completion.
-    //   3. Restructure: alice deposits FIRST (with --no-wait), then bob
-    //      runs full accept + deposit + wait.
+    // What we tried in #163 item 1:
     //
-    // Gated behind `E2E_RUN_SWAP_FULL=1` so the default e2e tier (ping
-    // + propose/list/cancel) stays green. Run this tier only when you
-    // have time + a stable testnet to debug it.
+    //   (a) Parallel deposits via Promise.all + runSphereAsync. Failed
+    //       against escrow:v0.2: both deposits arriving simultaneously
+    //       triggered `[PerTokenMutex] bounded-hold ... manifest CID
+    //       rewrite CAS failure: cas-mismatch` on the escrow's OWN
+    //       wallet manifest. Swap stuck at `PARTIAL_DEPOSIT` →
+    //       `invoice:covered with unconfirmed deposits — waiting for
+    //       aggregator confirmation`.
+    //
+    //   (b) Sequential deposits (bob `accept --deposit --no-wait` then
+    //       alice `swap deposit`) + wait-for-announced poll + extended
+    //       budget 300s → 600s. ALSO failed against v0.2 with the same
+    //       cas-mismatch pattern — deposits arriving ~50s apart still
+    //       triggered the failure. Sequential vs parallel was a
+    //       red-herring; the bug was structural, not a timing race.
+    //
+    // Root cause (filed as unicity-sphere/sphere-sdk#195, fixed in
+    // PR #196): two bugs in the recipient finalization worker —
+    //   - A placeholder manifest entry pre-seeded in the poll callback
+    //     violated the §5.5 step 5 CAS contract on every inbound
+    //     deposit (the "cas-mismatch" the operator dashboard
+    //     surfaced).
+    //   - The recipient dispositionWriter VALID branch never emitted
+    //     `transfer:confirmed`, so AccountingModule never re-fired
+    //     `invoice:covered` with `confirmed: true` — the signal the
+    //     escrow swap orchestrator gates on.
+    //
+    // Resolved by bumping the default escrow image to v0.3 (which
+    // bundles sphere-sdk PR #196). Verified end-to-end on 2026-05-21:
+    //
+    //   SPHERE_CLI_ESCROW_IMAGE=ghcr.io/vrogojin/agentic-hosting/escrow:v0.3 \
+    //   E2E_RUN_SWAP=1 E2E_RUN_SWAP_FULL=1 \
+    //   npm run test:integration -- test/integration/cli-swap-e2e.integration.test.ts
+    //
+    //   → all 3 tests pass; full settlement reaches `completed` in 131s.
+    //
+    // What this PR keeps (independently useful even now that the
+    // upstream bug is fixed):
+    //   - Wait-for-announced poll loop. Prevents alice's `swap deposit`
+    //     from racing its own 60s event-wait against escrow's
+    //     invoice-delivery DM propagation. Orthogonal to the CAS bug.
+    //   - Sequential deposit ordering (bob `accept --deposit --no-wait`
+    //     then alice `swap deposit`). Cleaner test invariant than
+    //     parallel-with-Promise.all.
+    //   - Budget 300s → 600s + outer timeout 600s → 900s. Comfortable
+    //     margin for slow testnet days; well above the observed ~130s
+    //     completion time on a healthy testnet.
+    //
+    // Still gated behind `E2E_RUN_SWAP_FULL=1` because faucet round-
+    // trips + full settlement take ~5 minutes of wall-clock per run
+    // and consume real testnet tokens. The default `E2E_RUN_SWAP=1`
+    // tier (ping + propose/list/cancel) is enough to catch regressions
+    // in the namespace-bridge → SwapModule → Nostr-DM glue without
+    // paying that cost on every CI run.
     describe.skipIf(!RUN_SWAP_FULL)(
       'full deposit settlement (E2E_RUN_SWAP_FULL=1)',
       () => {
-        it('alice proposes, bob accepts + deposits, alice deposits, both reach completed', async () => {
+        it('alice proposes, bob accept+deposits, alice deposits, swap reaches completed', async () => {
           // Use fresh amounts so this scenario is independent of the
           // cancelled one above (re-uses faucet-funded balances).
           const propose = runSphere(
@@ -335,8 +376,8 @@ describe.skipIf(integrationSkip || !RUN_SWAP_E2E)(
           expect(idMatch).toBeTruthy();
           const swapId = idMatch![1]!;
 
-          // bob accepts with --deposit (announces + deposits) but
-          // --no-wait so we can drive alice's deposit in parallel.
+          // Step 1: bob accepts WITH --deposit --no-wait (asynchronously
+          // submits bob's deposit; returns once submission is queued).
           const accept = runSphere(
             bob!.env,
             ['swap', 'accept', swapId, '--deposit', '--no-wait'],
@@ -347,9 +388,41 @@ describe.skipIf(integrationSkip || !RUN_SWAP_E2E)(
           }
           expect(accept.status).toBe(0);
 
-          // alice deposits. swap-deposit waits for swap:announced if
-          // still in `proposed`/`accepted` state (up to 120s for the
-          // proposed→announced transition).
+          // Step 2: poll alice's local view until `announced` (or
+          // beyond). Escrow's invoice-delivery DM may take 30s+ to
+          // propagate; this poll prevents alice's `swap deposit`
+          // command from racing its own internal 60s event-wait.
+          const announceDeadline = Date.now() + 180_000;
+          let announcedOk = false;
+          let lastSeenPreDeposit: string | null = null;
+          while (Date.now() < announceDeadline) {
+            const statusCheck = runSphere(alice!.env, ['swap', 'status', swapId], {
+              timeoutMs: 60_000,
+            });
+            if (statusCheck.status === 0) {
+              const m = statusCheck.stdout.match(/"progress":\s*"([a-z_]+)"/i);
+              lastSeenPreDeposit = m?.[1] ?? lastSeenPreDeposit;
+              if (m && [
+                'announced', 'depositing', 'awaiting_counter',
+                'concluding', 'completed',
+              ].includes(m[1]!)) {
+                announcedOk = true;
+                break;
+              }
+            }
+            await new Promise((r) => setTimeout(r, 3_000));
+          }
+          expect(
+            announcedOk,
+            `swap did not reach 'announced' within 180s (last seen: ${lastSeenPreDeposit})`,
+          ).toBe(true);
+
+          // Step 3: alice deposits (blocks on submission). Sequential
+          // wrt bob's deposit — by the time alice's submission lands
+          // at the escrow, bob's is well past its CAS-contention
+          // window. (Note: this command BLOCKS only on submission, not
+          // on aggregator confirmation; the polling loop below handles
+          // the wait for actual on-chain confirmation.)
           const deposit = runSphere(alice!.env, ['swap', 'deposit', swapId], {
             timeoutMs: 240_000,
           });
@@ -358,13 +431,15 @@ describe.skipIf(integrationSkip || !RUN_SWAP_E2E)(
           }
           expect(deposit.status).toBe(0);
 
-          // Poll status until completed or timeout. Settlement involves:
-          //   - escrow detects both deposits     → swap:deposits_covered
-          //   - escrow constructs payouts        → swap:payout_received
+          // Step 4: poll alice's status for `completed`. Settlement
+          // pipeline (post both deposits):
+          //   - escrow sees both deposits → state PARTIAL_DEPOSIT → COVERED
+          //   - escrow waits for aggregator confirmation of both
+          //   - escrow constructs payouts → fires swap:payout_received
           //   - both parties verify their payout → swap:completed
-          // ~30-120s end-to-end on testnet aggregator.
+          // Typically 30-180s once submitted; 600s gives 3x+ margin.
           let completed = false;
-          const settleDeadline = Date.now() + 300_000;
+          const settleDeadline = Date.now() + 600_000;
           let lastSeenProgress: string | null = null;
           while (Date.now() < settleDeadline) {
             const status = runSphere(alice!.env, ['swap', 'status', swapId], { timeoutMs: 60_000 });
@@ -380,9 +455,9 @@ describe.skipIf(integrationSkip || !RUN_SWAP_E2E)(
           }
           expect(
             completed,
-            `swap ${swapId.slice(0, 8)} did not complete within 300s (last seen progress: ${lastSeenProgress})`,
+            `swap ${swapId.slice(0, 8)} did not complete within 600s (last seen progress: ${lastSeenProgress})`,
           ).toBe(true);
-        }, 600_000);
+        }, 900_000);
       },
     );
   },

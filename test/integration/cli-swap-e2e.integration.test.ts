@@ -12,7 +12,7 @@
  * Gates:
  *   - `SKIP_INTEGRATION=1`  — skip all integration tests (CI fast tier).
  *   - `E2E_RUN_SWAP=1`      — opt in to this suite. Default skipped because:
- *       * needs Docker + escrow image (`ghcr.io/vrogojin/agentic-hosting/escrow:v0.1`)
+ *       * needs Docker + escrow image (`ghcr.io/vrogojin/agentic-hosting/escrow:v0.3`)
  *       * faucet round-trips consume testnet tokens
  *       * full setup takes 3-6 minutes
  *
@@ -296,48 +296,64 @@ describe.skipIf(integrationSkip || !RUN_SWAP_E2E)(
     }, 240_000);
 
     // ── Full deposit-settlement tier (opt-in) ──────────────────────────
-    // #163 item 1 — STILL FRAGILE. Investigation 2026-05-20 revealed
-    // this is not a test-level race; it's an escrow-side bug.
+    // #163 item 1 — investigation history (2026-05-20) → resolved
+    // upstream in escrow:v0.3 (2026-05-21).
     //
     // What we tried in #163 item 1:
     //
-    //   (a) Parallel deposits via Promise.all + runSphereAsync. Failed:
-    //       both deposits arriving simultaneously triggered the escrow's
-    //       `[PerTokenMutex] bounded-hold ... manifest CID rewrite CAS
-    //       failure: cas-mismatch` on its OWN wallet manifest. Swap
-    //       stuck at `PARTIAL_DEPOSIT` → `invoice:covered with
-    //       unconfirmed deposits — waiting for aggregator confirmation`.
+    //   (a) Parallel deposits via Promise.all + runSphereAsync. Failed
+    //       against escrow:v0.2: both deposits arriving simultaneously
+    //       triggered `[PerTokenMutex] bounded-hold ... manifest CID
+    //       rewrite CAS failure: cas-mismatch` on the escrow's OWN
+    //       wallet manifest. Swap stuck at `PARTIAL_DEPOSIT` →
+    //       `invoice:covered with unconfirmed deposits — waiting for
+    //       aggregator confirmation`.
     //
     //   (b) Sequential deposits (bob `accept --deposit --no-wait` then
     //       alice `swap deposit`) + wait-for-announced poll + extended
-    //       budget 300s → 600s. ALSO failed with the same CAS-mismatch
-    //       pattern: the escrow's bounded-hold mutex aborts the
-    //       manifest update even when deposits arrive ~50s apart.
+    //       budget 300s → 600s. ALSO failed against v0.2 with the same
+    //       cas-mismatch pattern — deposits arriving ~50s apart still
+    //       triggered the failure. Sequential vs parallel was a
+    //       red-herring; the bug was structural, not a timing race.
     //
-    // Root cause sits in the escrow process's sphere-sdk profile layer:
-    // the bounded-hold per-token mutex aborts the manifest CID rewrite
-    // detached fn after timeout, and the state machine can't advance
-    // past PARTIAL_DEPOSIT. Filed as a separate sphere-sdk issue —
-    // unblocking this test depends on that fix landing in the escrow
-    // image (escrow:v0.3+).
+    // Root cause (filed as unicity-sphere/sphere-sdk#195, fixed in
+    // PR #196): two bugs in the recipient finalization worker —
+    //   - A placeholder manifest entry pre-seeded in the poll callback
+    //     violated the §5.5 step 5 CAS contract on every inbound
+    //     deposit (the "cas-mismatch" the operator dashboard
+    //     surfaced).
+    //   - The recipient dispositionWriter VALID branch never emitted
+    //     `transfer:confirmed`, so AccountingModule never re-fired
+    //     `invoice:covered` with `confirmed: true` — the signal the
+    //     escrow swap orchestrator gates on.
     //
-    // What this PR keeps:
-    //   - Wait-for-announced poll loop. Independent of the CAS bug;
-    //     prevents alice's `swap deposit` from racing its own 60s
-    //     event-wait against escrow's invoice-delivery DM
-    //     propagation. Worth keeping for when the escrow bug is fixed.
+    // Resolved by bumping the default escrow image to v0.3 (which
+    // bundles sphere-sdk PR #196). Verified end-to-end on 2026-05-21:
+    //
+    //   SPHERE_CLI_ESCROW_IMAGE=ghcr.io/vrogojin/agentic-hosting/escrow:v0.3 \
+    //   E2E_RUN_SWAP=1 E2E_RUN_SWAP_FULL=1 \
+    //   npm run test:integration -- test/integration/cli-swap-e2e.integration.test.ts
+    //
+    //   → all 3 tests pass; full settlement reaches `completed` in 131s.
+    //
+    // What this PR keeps (independently useful even now that the
+    // upstream bug is fixed):
+    //   - Wait-for-announced poll loop. Prevents alice's `swap deposit`
+    //     from racing its own 60s event-wait against escrow's
+    //     invoice-delivery DM propagation. Orthogonal to the CAS bug.
     //   - Sequential deposit ordering (bob `accept --deposit --no-wait`
-    //     then alice `swap deposit`). Matches what worked occasionally
-    //     in the original flow before the CAS-mismatch became
-    //     reproducible.
-    //   - Budget 300s → 600s + outer timeout 600s → 900s. Once the
-    //     escrow bug is fixed, the longer budget covers slow testnet
-    //     days with comfortable margin.
+    //     then alice `swap deposit`). Cleaner test invariant than
+    //     parallel-with-Promise.all.
+    //   - Budget 300s → 600s + outer timeout 600s → 900s. Comfortable
+    //     margin for slow testnet days; well above the observed ~130s
+    //     completion time on a healthy testnet.
     //
-    // Gated behind `E2E_RUN_SWAP_FULL=1` because the test STILL DOES
-    // NOT PASS reliably until the escrow CAS-mismatch is fixed
-    // upstream. The default e2e tier (ping + propose/list/cancel)
-    // stays green; that's what gates CI.
+    // Still gated behind `E2E_RUN_SWAP_FULL=1` because faucet round-
+    // trips + full settlement take ~5 minutes of wall-clock per run
+    // and consume real testnet tokens. The default `E2E_RUN_SWAP=1`
+    // tier (ping + propose/list/cancel) is enough to catch regressions
+    // in the namespace-bridge → SwapModule → Nostr-DM glue without
+    // paying that cost on every CI run.
     describe.skipIf(!RUN_SWAP_FULL)(
       'full deposit settlement (E2E_RUN_SWAP_FULL=1)',
       () => {

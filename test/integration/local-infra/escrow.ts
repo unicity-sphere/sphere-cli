@@ -25,27 +25,34 @@ import { join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 
 /**
- * Image pin — defaults to `ghcr.io/vrogojin/agentic-hosting/escrow:v0.2`,
- * published 2026-05-16 against the uxf `integration/all-fixes` HEAD
- * (commit 3a575cd02ff7ab2fc5b2b8696fd8fdfd614779ff). Publicly pullable;
- * digest `sha256:311903b6f98b33a63791bf79db6522a66d118588ba56fcf6e56654ed6670ebac`.
+ * Image pin — defaults to `ghcr.io/vrogojin/agentic-hosting/escrow:v0.3`,
+ * published 2026-05-20 against the uxf `integration/all-fixes` HEAD
+ * (commit af3c0a101f2a6f7f3bccff42b974e7b26148ee73). Publicly pullable;
+ * digest `sha256:0fe3f926320c7200806b7231b6c76dfd26896f829144a919581afef227a88219`.
+ *
+ * Composition (vs v0.2):
+ *   - escrow-service: master (no source changes; only SPHERE_SDK_SHA bump)
+ *   - sphere-sdk: uxf integration/all-fixes @af3c0a1, picking up:
+ *       * PR #196 (issue #195 fix) — unblocks recipient finalization for
+ *         inbound deposits by (a) removing the placeholder manifest entry
+ *         in the recipient poll callback (eliminates the cas-mismatch on
+ *         every finalization) and (b) emitting `transfer:confirmed` from
+ *         the recipient dispositionWriter so AccountingModule re-fires
+ *         `invoice:covered` with `confirmed: true`. Verified end-to-end:
+ *         `E2E_RUN_SWAP_FULL=1` full settlement completes in ~130s vs
+ *         600s budget; v0.2 hung at PARTIAL_DEPOSIT indefinitely.
+ *       * All upstream content from v0.2 (PR #105, #115, #119, #128,
+ *         #146/147/149/152, payments/* faucet-flow regression fixes).
  *
  * Composition (vs v0.1):
  *   - escrow-service: master + `fix/conservative-payout-mode` HEAD
  *     (4 commits ahead of v0.1: conservative payout transferMode,
  *     UNICITY_NOSTR_RELAYS env override, deliverDepositInvoice
  *     instrumentation, BUG-001 docstring cleanup)
- *   - sphere-sdk: uxf integration/all-fixes @3a575cd, including:
- *       * PR #105 (UXF Inter-Wallet Transfer Protocol)
- *       * PR #115 (swap/accounting race-condition fixes from live e2e)
- *       * PR #119 (verifyPayout OVER_COVERAGE rejection)
- *       * PR #128 (getTokenIdsForInvoice on deps facade)
- *       * PR #146/147/149/152 (UXF dispatcher work)
- *       * All payments/* faucet-flow regression fixes
  *
  * v0.1 (`ghcr.io/vrogojin/agentic-hosting/escrow:v0.1`, 2026-04-25)
- * is STALE — it predates everything in the list above and causes
- * protocol-level mismatches against current sphere-sdk wallets. The
+ * and v0.2 (2026-05-16) are STALE for full-settlement testing —
+ * v0.2 specifically hangs at PARTIAL_DEPOSIT (issue #195). The
  * trader-service harness still pins v0.1 as of 2026-05-16; that
  * coordination is tracked separately.
  *
@@ -63,7 +70,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
  *   SPHERE_CLI_ESCROW_IMAGE=escrow:local-uxf E2E_RUN_SWAP=1 npm run test:integration
  */
 export const ESCROW_IMAGE =
-  process.env['SPHERE_CLI_ESCROW_IMAGE'] ?? 'ghcr.io/vrogojin/agentic-hosting/escrow:v0.2';
+  process.env['SPHERE_CLI_ESCROW_IMAGE'] ?? 'ghcr.io/vrogojin/agentic-hosting/escrow:v0.3';
 
 const DEFAULT_READY_TIMEOUT_MS = 120_000;
 

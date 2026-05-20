@@ -35,6 +35,7 @@ import {
   createSphereEnv,
   destroySphereEnv,
   runSphere,
+  runSphereAsync,
   integrationSkip,
   PUBLIC_TESTNET,
   type SphereEnv,
@@ -296,27 +297,35 @@ describe.skipIf(integrationSkip || !RUN_SWAP_E2E)(
     }, 240_000);
 
     // ── Full deposit-settlement tier (opt-in) ──────────────────────────
-    // Known fragile. Observed failure mode: bob's `swap accept --deposit
-    // --no-wait` returns once the deposit is *submitted*, but the
-    // on-chain transfer to the escrow's deposit invoice may not complete
-    // before alice's 300s status budget elapses. The escrow only
-    // concludes the swap once BOTH parties have deposited, so settlement
-    // stalls at "depositing" on alice's side.
+    // Restructured #163 item 1 (was: known-fragile, "stalls at depositing").
     //
-    // Likely fix paths (left for a future PR):
-    //   1. Lengthen the polling budget (300s → 600s).
-    //   2. Drive both parties' deposits explicitly + await each one's
-    //      `swap:deposit_confirmed` event before polling for completion.
-    //   3. Restructure: alice deposits FIRST (with --no-wait), then bob
-    //      runs full accept + deposit + wait.
+    // Previous shape failed because bob's `swap accept --deposit --no-wait`
+    // returned after submitting the deposit but BEFORE the on-chain
+    // transfer to the escrow's deposit invoice completed. By the time
+    // alice's separate `swap deposit` ran and we started polling status,
+    // bob's deposit was often still in-flight; the escrow can only
+    // conclude after seeing BOTH deposits, so settlement stalled at
+    // `depositing` on alice's view, exhausting the 300s budget.
+    //
+    // New shape:
+    //   1. bob accepts WITHOUT --deposit (announces the swap; cheap).
+    //   2. Both deposits run IN PARALLEL via runSphereAsync — each
+    //      `swap deposit` BLOCKS until the on-chain transfer is
+    //      confirmed, so when Promise.all resolves we know both
+    //      deposits have actually landed.
+    //   3. We then poll alice's status for `completed`; the escrow's
+    //      payout construction + per-party verification typically
+    //      finishes in 30-120s once both deposits are visible.
+    //
+    // Budget bumped 300s → 600s as a defensive safety net for slow
+    // testnet days. Outer test timeout 900s.
     //
     // Gated behind `E2E_RUN_SWAP_FULL=1` so the default e2e tier (ping
-    // + propose/list/cancel) stays green. Run this tier only when you
-    // have time + a stable testnet to debug it.
+    // + propose/list/cancel) stays green and quick.
     describe.skipIf(!RUN_SWAP_FULL)(
       'full deposit settlement (E2E_RUN_SWAP_FULL=1)',
       () => {
-        it('alice proposes, bob accepts + deposits, alice deposits, both reach completed', async () => {
+        it('alice proposes, bob accepts, both deposit in parallel, swap reaches completed', async () => {
           // Use fresh amounts so this scenario is independent of the
           // cancelled one above (re-uses faucet-funded balances).
           const propose = runSphere(
@@ -335,36 +344,43 @@ describe.skipIf(integrationSkip || !RUN_SWAP_E2E)(
           expect(idMatch).toBeTruthy();
           const swapId = idMatch![1]!;
 
-          // bob accepts with --deposit (announces + deposits) but
-          // --no-wait so we can drive alice's deposit in parallel.
-          const accept = runSphere(
-            bob!.env,
-            ['swap', 'accept', swapId, '--deposit', '--no-wait'],
-            { timeoutMs: 180_000 },
-          );
+          // Step 1: bob accepts (announces the swap). NO --deposit here —
+          // we'll drive both parties' deposits explicitly in parallel below.
+          const accept = runSphere(bob!.env, ['swap', 'accept', swapId], {
+            timeoutMs: 120_000,
+          });
           if (accept.status !== 0) {
             console.error('bob accept failed', { stdout: accept.stdout, stderr: accept.stderr });
           }
           expect(accept.status).toBe(0);
 
-          // alice deposits. swap-deposit waits for swap:announced if
-          // still in `proposed`/`accepted` state (up to 120s for the
-          // proposed→announced transition).
-          const deposit = runSphere(alice!.env, ['swap', 'deposit', swapId], {
-            timeoutMs: 240_000,
-          });
-          if (deposit.status !== 0) {
-            console.error('alice deposit failed', { stdout: deposit.stdout, stderr: deposit.stderr });
+          // Step 2: parallel deposits. Each `swap deposit` blocks until
+          // the on-chain transfer is confirmed (the SDK waits for
+          // inclusion proof + escrow ack). When Promise.all resolves
+          // both deposits are observable to the escrow — eliminating
+          // the original race where one was still in-flight at poll
+          // start.
+          const [aliceDep, bobDep] = await Promise.all([
+            runSphereAsync(alice!.env, ['swap', 'deposit', swapId], { timeoutMs: 300_000 }),
+            runSphereAsync(bob!.env, ['swap', 'deposit', swapId], { timeoutMs: 300_000 }),
+          ]);
+          if (aliceDep.status !== 0) {
+            console.error('alice deposit failed', { stdout: aliceDep.stdout, stderr: aliceDep.stderr });
           }
-          expect(deposit.status).toBe(0);
+          if (bobDep.status !== 0) {
+            console.error('bob deposit failed', { stdout: bobDep.stdout, stderr: bobDep.stderr });
+          }
+          expect(aliceDep.status).toBe(0);
+          expect(bobDep.status).toBe(0);
 
-          // Poll status until completed or timeout. Settlement involves:
+          // Step 3: poll alice's status for `completed`. Settlement
+          // pipeline (post both deposits):
           //   - escrow detects both deposits     → swap:deposits_covered
           //   - escrow constructs payouts        → swap:payout_received
           //   - both parties verify their payout → swap:completed
-          // ~30-120s end-to-end on testnet aggregator.
+          // Typically 30-120s. Budget 600s = 10x slack for slow testnet.
           let completed = false;
-          const settleDeadline = Date.now() + 300_000;
+          const settleDeadline = Date.now() + 600_000;
           let lastSeenProgress: string | null = null;
           while (Date.now() < settleDeadline) {
             const status = runSphere(alice!.env, ['swap', 'status', swapId], { timeoutMs: 60_000 });
@@ -380,9 +396,9 @@ describe.skipIf(integrationSkip || !RUN_SWAP_E2E)(
           }
           expect(
             completed,
-            `swap ${swapId.slice(0, 8)} did not complete within 300s (last seen progress: ${lastSeenProgress})`,
+            `swap ${swapId.slice(0, 8)} did not complete within 600s (last seen progress: ${lastSeenProgress})`,
           ).toBe(true);
-        }, 600_000);
+        }, 900_000);
       },
     );
   },

@@ -2,7 +2,7 @@
  * Shared helpers for sphere-cli integration tests against real infrastructure.
  */
 
-import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import {
   mkdtempSync,
   rmSync,
@@ -212,6 +212,65 @@ export function runSphere(
     input: opts?.input,
     timeout: opts?.timeoutMs ?? 90_000,
     killSignal: 'SIGKILL',
+  });
+}
+
+/**
+ * Promise-based variant of {@link runSphere}. Use this when a test
+ * needs to run multiple CLI invocations concurrently — e.g., driving
+ * both peers' `swap deposit` commands in parallel so escrow sees both
+ * deposits land within the same polling window.
+ *
+ * Returns the same shape as `runSphere` (`SpawnSyncReturns<string>`)
+ * so callers can read `.status`, `.stdout`, `.stderr` identically.
+ * Internally uses `child_process.spawn` + Promise resolution; on
+ * timeout the process is SIGKILL'd and the returned object carries
+ * `signal: 'SIGKILL'` matching the sync wrapper's behaviour.
+ */
+export function runSphereAsync(
+  env: SphereEnv,
+  args: string[],
+  opts?: { input?: string; timeoutMs?: number },
+): Promise<SpawnSyncReturns<string>> {
+  return new Promise((resolve) => {
+    const child = spawn('node', [BIN_PATH, ...args], {
+      cwd: env.home,
+      env: env.env,
+    });
+
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    child.stdout?.on('data', (b: Buffer) => out.push(b));
+    child.stderr?.on('data', (b: Buffer) => err.push(b));
+
+    let timer: NodeJS.Timeout | null = null;
+    let timedOut = false;
+    const timeoutMs = opts?.timeoutMs ?? 90_000;
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        // Matching runSphere's killSignal: SIGKILL so a hung child
+        // holding open Nostr WebSockets can't outlive the budget.
+        child.kill('SIGKILL');
+      }, timeoutMs);
+    }
+
+    child.on('close', (status, signal) => {
+      if (timer) clearTimeout(timer);
+      resolve({
+        pid: child.pid ?? 0,
+        output: [null, Buffer.concat(out).toString('utf8'), Buffer.concat(err).toString('utf8')],
+        stdout: Buffer.concat(out).toString('utf8'),
+        stderr: Buffer.concat(err).toString('utf8'),
+        status,
+        signal: timedOut ? 'SIGKILL' : signal,
+      });
+    });
+
+    if (opts?.input !== undefined && child.stdin) {
+      child.stdin.write(opts.input);
+      child.stdin.end();
+    }
   });
 }
 

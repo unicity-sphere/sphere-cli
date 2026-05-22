@@ -3761,7 +3761,25 @@ async function main(): Promise<void> {
             console.error('Usage: invoice-create --target <address> --asset "<amount> <coin>" [--nft <id>] [--due <ISO-date>] [--memo <text>] [--delivery <method>] [--terms <json-file>]');
             process.exit(1);
           }
-          const targetAddress = args[targetIdx + 1];
+          let targetAddress = args[targetIdx + 1];
+          // Accept `@nametag` (and chain-pubkey / alpha1...) as targets for
+          // user convenience — symmetric with `payments send --recipient`.
+          // AccountingModule.createInvoice itself requires a canonical
+          // `DIRECT://` address because invoice terms commit (cryptographically
+          // bind) the recipient identity, so we resolve once here before
+          // constructing the request. The resolved address is what gets baked
+          // into the invoice's signed terms.
+          if (!targetAddress.startsWith('DIRECT://')) {
+            const resolved = await sphere.resolve(targetAddress);
+            if (!resolved || !resolved.directAddress) {
+              console.error(
+                `Could not resolve target "${targetAddress}" to a DIRECT:// address. ` +
+                  'Provide an @nametag, chain pubkey, alpha1 address, or a DIRECT:// address.',
+              );
+              process.exit(1);
+            }
+            targetAddress = resolved.directAddress;
+          }
           const nftId = nftIdx !== -1 ? args[nftIdx + 1] : undefined;
           const dueDate = dueIdx !== -1 ? new Date(args[dueIdx + 1]).getTime() : undefined;
           if (dueDate !== undefined && isNaN(dueDate)) {

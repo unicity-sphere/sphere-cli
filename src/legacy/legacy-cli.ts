@@ -3930,7 +3930,15 @@ async function main(): Promise<void> {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`Failed to deliver invoice: ${msg}`);
+          // legacy-cli.ts wraps `process.exit` to schedule an async teardown
+          // before the real exit (see main()'s `originalExit`). The wrapper
+          // returns `undefined as never`, so synchronous control flow
+          // continues past this point — without the explicit `return`
+          // below, the post-catch code crashes on `result.failed` (result
+          // is still undefined). Same pattern that every handler in this
+          // file should adopt for any catch followed by more work.
           process.exit(1);
+          return;
         }
         console.log('Invoice delivery result:');
         console.log(JSON.stringify(result, null, 2));
@@ -3940,6 +3948,7 @@ async function main(): Promise<void> {
           // from partial failure. The per-recipient detail above tells
           // the operator which targets failed and why.
           process.exit(2);
+          return;
         }
 
         await syncAfterWrite(sphere);

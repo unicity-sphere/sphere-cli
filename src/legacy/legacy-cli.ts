@@ -4277,7 +4277,12 @@ async function main(): Promise<void> {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
-        await ensureSync(sphere, 'nostr');
+        // Invoice listing surfaces invoice tokens, including those received
+        // cross-device via Profile/IPFS sync. 'nostr' only pulls inbox DMs
+        // and skips the IPFS pull, so on a fresh device or after a wipe the
+        // list misses invoices that landed on another peer. Use 'full' to
+        // include the IPFS / Profile pointer pull (issue sphere-cli#24).
+        await ensureSync(sphere, 'full');
 
         const stateIdx = args.indexOf('--state');
         const limitIdx2 = args.indexOf('--limit');
@@ -4340,7 +4345,12 @@ async function main(): Promise<void> {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
-        await ensureSync(sphere, 'nostr');
+        // Per-target balance is computed from on-chain payment attribution,
+        // which requires the IPFS / Profile pointer pull — not just the
+        // Nostr inbox. 'nostr' mode skips that pull, so on a fresh device
+        // or after a wipe the status is stale / "No invoice found" even
+        // when the invoice exists on another peer (issue sphere-cli#24).
+        await ensureSync(sphere, 'full');
 
         // Resolve ID from prefix
         const allInvoices = await sphere.accounting.getInvoices();

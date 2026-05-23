@@ -580,8 +580,15 @@ export async function runDaemon(
     // invocation of `daemon start --_forked`). Calling `process.disconnect()`
     // without a live channel throws "IPC channel is not open", which under
     // `stdio: 'ignore'` would crash the child silently with no log trail.
+    //
+    // The try/catch handles a residual race: the parent's child.disconnect()
+    // closes the channel at the OS layer, but the JS 'disconnect' event
+    // (which flips process.connected to false) is async — there's a microtask
+    // window where process.connected reads true while the underlying channel
+    // is already torn down, in which case disconnect() throws. Swallowing
+    // here is correct: the goal state (channel closed) already holds.
     if (process.connected && process.disconnect) {
-      process.disconnect();
+      try { process.disconnect(); } catch { /* already torn down by parent */ }
     }
 
     // Restore on exit for cleanup logging

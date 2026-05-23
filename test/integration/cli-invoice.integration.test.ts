@@ -240,6 +240,64 @@ describe.skipIf(integrationSkip)(
       expect(r.stdout).toMatch(/"state":\s*"OPEN"/);
     }, 180_000);
 
+    // Regression pin for sphere-cli #21: `sphere invoice status <prefix>` for
+    // a prefix that doesn't match any local invoice used to crash with
+    //
+    //   Error: Cannot read properties of undefined (reading 'invoiceId')
+    //
+    // The handler called `process.exit(1)` and then dereferenced `matched[0]`,
+    // but the legacy-cli's process.exit wrapper scheduled an async destroy
+    // and returned `undefined` instead of terminating — so control flow
+    // continued past the exit call and crashed on the empty match array.
+    //
+    // Expected after the ExitSignal interceptor refactor: clean exit code 1
+    // with only the "No invoice found matching prefix" message on stderr,
+    // and no Node.js TypeError stack trace anywhere in the output.
+    //
+    // The same fall-through pattern affects every other `invoice-*` command
+    // that does `process.exit(1)` after `await getSphere()` — `close`,
+    // `cancel`, `pay`, etc. We pin status here because it's the simplest
+    // shape; the wrapper fix is shared across them.
+    it('`sphere invoice status <unknown-prefix>` exits cleanly without crashing (#21)', () => {
+      // A 64-hex prefix that almost certainly doesn't match anything in the
+      // freshly-minted wallet. We don't care which prefix as long as it
+      // doesn't accidentally collide with `invoiceId` — guarded below.
+      const bogus = '00005eb450a21d54f6d77b3c352a26a7539cc453ccdb1d1928dcdb6a0a266ca31e82';
+      if (invoiceId && invoiceId.startsWith(bogus.slice(0, 8))) {
+        // Astronomically unlikely (8-hex collision on a fresh wallet with
+        // one invoice), but skip rather than fail if it ever happens.
+        return;
+      }
+      const r = runSphere(env, ['invoice', 'status', bogus], { timeoutMs: 120_000 });
+
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/No invoice found matching prefix:/);
+      // The crash signature from #21. If this match flips green, the
+      // process.exit wrapper has regressed back to its pre-#21 form.
+      const combined = `${r.stdout}\n${r.stderr}`;
+      expect(combined).not.toMatch(/Cannot read properties of undefined/);
+      expect(combined).not.toMatch(/TypeError/);
+    }, 180_000);
+
+    // Companion pins for the other invoice-* commands that share the same
+    // `process.exit(1)` fall-through shape. We only assert exit-code + no
+    // crash signature — each command's own usage / state-machine semantics
+    // are pinned by tests above and by sphere-sdk's AccountingModule unit
+    // tests. The intent here is purely to catch the wrapper regression
+    // surfacing on any of these handlers.
+    it.each([
+      ['close'],
+      ['cancel'],
+      ['pay'],
+    ])('`sphere invoice %s <unknown-prefix>` exits cleanly without crashing (#21)', (sub) => {
+      const bogus = '00005eb450a21d54f6d77b3c352a26a7539cc453ccdb1d1928dcdb6a0a266ca31e82';
+      const r = runSphere(env, ['invoice', sub, bogus], { timeoutMs: 120_000 });
+      expect(r.status).not.toBe(0);
+      const combined = `${r.stdout}\n${r.stderr}`;
+      expect(combined).not.toMatch(/Cannot read properties of undefined/);
+      expect(combined).not.toMatch(/TypeError/);
+    }, 180_000);
+
     it('`sphere invoice close <prefix>` moves the invoice to CLOSED', () => {
       expect(invoiceId).toBeTruthy();
       const prefix = invoiceId!.slice(0, 12);

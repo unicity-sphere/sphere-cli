@@ -22,7 +22,12 @@ import { isValidPrivateKey, base58Encode, base58Decode } from '@unicitylabs/sphe
 import { toSmallestUnit, toHumanReadable, formatAmount } from '@unicitylabs/sphere-sdk';
 import { getPublicKey } from '@unicitylabs/sphere-sdk';
 import { Sphere } from '@unicitylabs/sphere-sdk';
-import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+import { createNodeProviders, FileTokenStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs';
+import { importLegacyTokens } from '@unicitylabs/sphere-sdk/profile';
+import {
+  buildSphereProviders,
+  detectWalletKind,
+} from '../shared/sphere-providers.js';
 import { TokenRegistry } from '@unicitylabs/sphere-sdk';
 import { TokenValidator } from '@unicitylabs/sphere-sdk';
 import { tokenToTxf } from '@unicitylabs/sphere-sdk';
@@ -253,12 +258,45 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
   if (sphereInstance) return sphereInstance;
 
   const config = loadConfig();
-  const providers = createNodeProviders({
-    network: config.network,
-    dataDir: config.dataDir,
+
+  // Issue #23 — guard data-mutating bootstrap against legacy file-storage
+  // wallets. The deprecated IPNS-based `IpfsStorageProvider` path is gone;
+  // Profile (OrbitDB + aggregator pointer + IPFS CAR) replaces it. A
+  // wallet minted before the migration has `wallet.json` but no
+  // `${dataDir}/orbitdb/` — booting Profile against that dataDir would
+  // start a fresh empty Profile and silently leave the user's token
+  // state in the legacy files. Instead, exit with EX_TEMPFAIL and tell
+  // the user to run `sphere wallet migrate`, which imports the legacy
+  // token state into Profile non-destructively (via the SDK's
+  // `importLegacyTokens`).
+  //
+  // Suppress the gate when the caller is supplying a mnemonic — those
+  // flows (`init --mnemonic`, `wallet recover`) are meant to seed a new
+  // wallet against the configured dataDir, so detection of pre-existing
+  // legacy data would be a false positive against the very state the
+  // user is replacing.
+  const isSeedingFromMnemonic =
+    typeof options?.mnemonic === 'string' && options.mnemonic.length > 0;
+  if (!isSeedingFromMnemonic) {
+    const kind = detectWalletKind(config.dataDir);
+    if (kind === 'legacy') {
+      process.stderr.write(
+        `\nLegacy wallet detected at ${config.dataDir} (file storage + IPNS sync).\n` +
+          'This CLI no longer boots the deprecated IpfsStorageProvider path.\n\n' +
+          'Migrate non-destructively to the new Profile storage:\n' +
+          '  npm run cli -- wallet migrate          # dry-run summary first\n' +
+          '  npm run cli -- wallet migrate --apply  # commit the import\n\n' +
+          'See GitHub sphere-cli#23 for the migration rationale.\n',
+      );
+      process.exit(75); // EX_TEMPFAIL — caller can retry after migrating.
+    }
+  }
+
+  const providers = buildSphereProviders({
+    network:   config.network,
+    dataDir:   config.dataDir,
     tokensDir: config.tokensDir,
-    tokenSync: { ipfs: { enabled: true } },
-    market: true,
+    market:    true,
     groupChat: true,
   });
 
@@ -279,10 +317,9 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
 
   sphereInstance = result.sphere;
 
-  // Attach IPFS storage provider for sync if available
-  if (providers.ipfsTokenStorage) {
-    await sphereInstance.addTokenStorageProvider(providers.ipfsTokenStorage);
-  }
+  // The deprecated `addTokenStorageProvider(ipfsTokenStorage)` call that
+  // used to live here is GONE — Profile's OrbitDB replication subsumes
+  // what IpfsStorageProvider was doing.
 
   return sphereInstance;
 }
@@ -513,7 +550,7 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       'npm run cli -- wallet delete myprofile',
     ],
     notes: [
-      'Subcommands: list, create, use, current, delete',
+      'Subcommands: list, create, use, current, delete, migrate',
       'Use "help wallet <subcommand>" for detailed help on each.',
     ],
   },
@@ -560,6 +597,23 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     ],
     notes: [
       'Cannot delete the currently active profile. Switch to a different profile first.',
+    ],
+  },
+  'wallet migrate': {
+    usage: 'wallet migrate [--apply]',
+    description:
+      'Import a legacy file-storage wallet into the new Profile storage (OrbitDB + aggregator pointer + IPFS CAR). ' +
+      'Non-destructive: legacy files are NOT removed. Defaults to a dry-run summary. Pass `--apply` to commit.',
+    flags: [
+      { flag: '--apply', description: 'Commit the import (otherwise dry-run summary only)' },
+    ],
+    examples: [
+      'npm run cli -- wallet migrate',
+      'npm run cli -- wallet migrate --apply',
+    ],
+    notes: [
+      'Auto-detects the wallet kind from the dataDir layout (`orbitdb/` subdir = already on Profile).',
+      'Replaces the deprecated `IpfsStorageProvider` path; see GitHub sphere-cli#23.',
     ],
   },
 
@@ -1803,17 +1857,44 @@ async function main(): Promise<void> {
         }
 
         const config = loadConfig();
-        const providers = createNodeProviders({
-          network: config.network,
-          dataDir: config.dataDir,
-          tokensDir: config.tokensDir,
-        });
+
+        // Issue #23 — clear path depends on the wallet kind:
+        //   - 'legacy' or 'fresh' → use the legacy provider bundle.
+        //     Booting Profile here would needlessly spin up OrbitDB
+        //     (and depend on libp2p peer connectivity) only to wipe
+        //     empty state.
+        //   - 'profile' → use the Profile provider bundle. Profile's
+        //     local-cache layer is a FileStorageProvider against the
+        //     same wallet.json, so its `clear()` removes the legacy
+        //     wallet.json too. Token storage (OrbitDB) is wiped via
+        //     the Profile token storage's `clear()`.
+        //
+        // Post-migrate wallets fall under 'profile' — any legacy
+        // tokensDir contents that survived the migration are NOT
+        // cleared by Profile's wipe. Users with such residue can `rm
+        // -rf` the tokensDir manually; an automated cleanup belongs
+        // to a follow-up archive flag, not the destructive clear.
+        const kind = detectWalletKind(config.dataDir);
+        const providers = kind === 'profile'
+          ? buildSphereProviders({
+              network:   config.network,
+              dataDir:   config.dataDir,
+              tokensDir: config.tokensDir,
+            })
+          : createNodeProviders({
+              network:   config.network,
+              dataDir:   config.dataDir,
+              tokensDir: config.tokensDir,
+            });
 
         await providers.storage.connect();
         await providers.tokenStorage.initialize();
 
         console.log('Clearing all wallet data...');
-        await Sphere.clear({ storage: providers.storage, tokenStorage: providers.tokenStorage });
+        await Sphere.clear({
+          storage: providers.storage,
+          tokenStorage: providers.tokenStorage,
+        });
         console.log('All wallet data cleared.');
 
         await providers.storage.disconnect();
@@ -1990,6 +2071,203 @@ async function main(): Promise<void> {
             break;
           }
 
+          // Issue #23 — non-destructive import of legacy file-storage
+          // token state into the new Profile-backed wallet. Mirrors the
+          // sphere-sdk `importLegacyTokens` helper's semantics (always
+          // explicit, idempotent, leaves the source untouched).
+          //
+          // Default is dry-run: prints what *would* happen but writes
+          // nothing. Pass `--apply` to actually import. Legacy files
+          // stay on disk afterwards — the user removes them via
+          // `wallet clear` (which wipes everything) or by hand. A
+          // future PR can add an `--archive` flag if usage feedback
+          // demands it.
+          case 'migrate': {
+            const apply = args.includes('--apply');
+            const config = loadConfig();
+
+            const kind = detectWalletKind(config.dataDir);
+            if (kind === 'fresh') {
+              console.log(`No wallet found at ${config.dataDir} — nothing to migrate.`);
+              break;
+            }
+            if (kind === 'profile') {
+              console.log(
+                `Wallet at ${config.dataDir} is already on the Profile path ` +
+                  `(\`orbitdb/\` subdir present). Nothing to migrate.`,
+              );
+              break;
+            }
+
+            // ------------------------------------------------------
+            // DRY RUN — strictly side-effect-free w.r.t. Profile.
+            //
+            // Boot Sphere with the LEGACY provider bundle (no
+            // Profile), with the Nostr transport stubbed to a noop
+            // so we don't open relay sockets just to enumerate
+            // local files. Sphere.init loads the identity from
+            // wallet.json and propagates it onto
+            // `legacyProviders.tokenStorage`, which is exactly the
+            // shape `importLegacyTokens` reads from. The `orbitdb/`
+            // subdir is NOT created on this path — re-classifying
+            // the wallet after a dry-run still returns 'legacy'.
+            //
+            // The dry-run branch of `importLegacyTokens` does NOT
+            // touch `targetPayments`; cast `null` through `unknown`
+            // to satisfy the TS signature without constructing a
+            // PaymentsModule. If the SDK ever uses targetPayments in
+            // its dry-run path, that change surfaces here as a
+            // crash with a useful TypeError instead of a silent
+            // semantic drift.
+            // ------------------------------------------------------
+            if (!apply) {
+              console.log(`Legacy wallet at ${config.dataDir} — dry-run inventory...`);
+
+              const legacyProviders = createNodeProviders({
+                network:   config.network,
+                dataDir:   config.dataDir,
+                tokensDir: config.tokensDir,
+              });
+
+              const { sphere: legacySphere } = await Sphere.init({
+                ...legacyProviders,
+                transport: createNoopTransport(),
+                autoGenerate: false,
+              });
+
+              try {
+                const dryRunResult = await importLegacyTokens(
+                  legacyProviders.tokenStorage,
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  null as any,
+                  { dryRun: true },
+                );
+
+                console.log('');
+                console.log(`Legacy token inventory at ${config.tokensDir}:`);
+                console.log(`  Tokens found:      ${dryRunResult.tokensFound}`);
+                console.log(`  Forks skipped:     ${dryRunResult.forksSkipped} (not imported by design)`);
+                if (dryRunResult.error) {
+                  console.log(`  Source error:      ${dryRunResult.error}`);
+                }
+                console.log('');
+                console.log('This was a dry run. To commit the import, re-run with `--apply`:');
+                console.log('  npm run cli -- wallet migrate --apply');
+              } finally {
+                await legacySphere.destroy();
+              }
+              break;
+            }
+
+            // ------------------------------------------------------
+            // APPLY — boot Profile and import via `importLegacyTokens`.
+            //
+            // The Profile factory wraps the same FileStorageProvider
+            // that the legacy bundle uses, so wallet.json (identity /
+            // mnemonic / tracked addresses) is preserved across the
+            // boot. After this point, `orbitdb/` exists on disk and
+            // detectWalletKind will return 'profile' on subsequent
+            // calls.
+            // ------------------------------------------------------
+            console.log(`Legacy wallet at ${config.dataDir} — applying migration...`);
+
+            const providers = buildSphereProviders({
+              network:   config.network,
+              dataDir:   config.dataDir,
+              tokensDir: config.tokensDir,
+              market:    true,
+              groupChat: true,
+            });
+            const initProviders = noNostrGlobal
+              ? { ...providers, transport: createNoopTransport() }
+              : providers;
+
+            const { sphere } = await Sphere.init({
+              ...initProviders,
+              autoGenerate: false,
+              market: true,
+              groupChat: true,
+              accounting: true,
+              swap: true,
+            });
+
+            try {
+              const identity = sphere.identity;
+              if (!identity?.directAddress) {
+                console.error(
+                  'Migration aborted: Sphere booted but identity has no directAddress. ' +
+                    'wallet.json may be corrupted — back it up and re-run `sphere init`.',
+                );
+                process.exit(1);
+              }
+
+              // Source — the legacy `tokensDir/${addressId}/` layout.
+              // We construct a fresh FileTokenStorageProvider rather
+              // than reuse `createNodeProviders().tokenStorage` so the
+              // identity wiring is explicit and there's no second
+              // pass at the wallet.json file that might race the
+              // Profile's local cache.
+              const legacyTokenStorage = new FileTokenStorageProvider({
+                tokensDir: config.tokensDir,
+              });
+              // FileTokenStorageProvider's tokensDir resolver only
+              // touches `identity.directAddress`. The TS signature
+              // demands `FullIdentity` (incl. privateKey) — we cast a
+              // partial since the read path doesn't sign anything.
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              legacyTokenStorage.setIdentity(identity as any);
+              await legacyTokenStorage.initialize();
+
+              console.log('');
+              console.log('Applying migration...');
+              const applyResult = await importLegacyTokens(
+                legacyTokenStorage,
+                // The sphere-sdk tsup bundle declares `PaymentsModule`
+                // separately in `dist/index.d.ts` and `dist/profile/index.d.ts`.
+                // TypeScript treats them as nominally distinct because each has
+                // its own private members. The runtime class is the SAME — the
+                // duplication is a build artifact. Casting through unknown is
+                // the documented escape hatch until the SDK bundle layout is
+                // refactored to share types across subpaths.
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                sphere.payments as any,
+                { dryRun: false },
+              );
+
+              console.log('');
+              console.log('Migration complete:');
+              console.log(`  Imported:          ${applyResult.tokensAdded}`);
+              console.log(`  Skipped:           ${applyResult.tokensSkipped}` +
+                          ` (duplicates=${applyResult.skippedByCode.duplicate}` +
+                          `, tombstoned=${applyResult.skippedByCode.tombstoned}` +
+                          `, genesis-exists=${applyResult.skippedByCode['genesis-exists']}` +
+                          `, unknown=${applyResult.skippedByCode.unknown})`);
+              console.log(`  Rejected:          ${applyResult.tokensRejected}`);
+              console.log(`  Duration:          ${applyResult.durationMs} ms`);
+              if (applyResult.error) {
+                console.log(`  Error:             ${applyResult.error}`);
+              }
+              if (applyResult.tokensRejected > 0) {
+                console.log('');
+                console.log(`Rejection details (up to 100 shown, truncated=${applyResult.rejectionsTruncated}):`);
+                for (const r of applyResult.rejections) {
+                  console.log(`  - tokenId=${r.genesisTokenId} code=${r.code} reason=${r.reason}`);
+                }
+              }
+
+              console.log('');
+              console.log(
+                `Legacy files at ${config.tokensDir} were NOT removed. They are now redundant — ` +
+                  'delete them manually or run `wallet clear` for a full reset.',
+              );
+
+              await legacyTokenStorage.shutdown();
+            } finally {
+              await sphere.destroy();
+            }
+            break;
+          }
+
           default:
             console.error('Unknown wallet subcommand:', subCmd);
             console.log('\nUsage:');
@@ -1998,6 +2276,7 @@ async function main(): Promise<void> {
             console.log('  wallet create <name>     Create new profile');
             console.log('  wallet current           Show current profile');
             console.log('  wallet delete <name>     Delete profile');
+            console.log('  wallet migrate [--apply] Import legacy wallet into Profile storage');
             process.exit(1);
         }
         break;

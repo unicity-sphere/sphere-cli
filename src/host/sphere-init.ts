@@ -9,8 +9,11 @@
 
 import * as fs from 'node:fs';
 import { Sphere } from '@unicitylabs/sphere-sdk';
-import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 import type { NetworkType } from '@unicitylabs/sphere-sdk';
+import {
+  buildSphereProviders,
+  detectWalletKind,
+} from '../shared/sphere-providers.js';
 
 // All paths are CWD-relative by design — matches legacy-cli behaviour so the
 // same wallet is visible whether invoked via `sphere wallet …` (legacy) or
@@ -48,9 +51,25 @@ function loadConfig(): CliConfig {
 export async function initSphere(): Promise<Sphere> {
   const config = loadConfig();
 
-  const providers = createNodeProviders({
-    network: config.network,
-    dataDir: config.dataDir,
+  // Issue #23 — same gate as the legacy CLI bootstrap. Host commands
+  // cannot operate against a pre-migration wallet because the new
+  // Profile-backed token storage would start empty and silently miss
+  // every token the user has on the legacy IPNS-pointer path. Surface
+  // the migration step explicitly instead of silently mis-routing.
+  const kind = detectWalletKind(config.dataDir);
+  if (kind === 'legacy') {
+    throw new Error(
+      `Legacy wallet detected at ${config.dataDir} (file storage + IPNS sync).\n` +
+        '`sphere host` requires the new Profile storage. Migrate via:\n' +
+        '  sphere wallet migrate           # dry-run summary first\n' +
+        '  sphere wallet migrate --apply   # commit the import\n' +
+        'See GitHub sphere-cli#23 for context.',
+    );
+  }
+
+  const providers = buildSphereProviders({
+    network:   config.network,
+    dataDir:   config.dataDir,
     tokensDir: config.tokensDir,
   });
 
@@ -62,10 +81,11 @@ export async function initSphere(): Promise<Sphere> {
   }
 
   const { sphere } = await Sphere.init({
-    storage: providers.storage,
-    transport: providers.transport,
-    oracle: providers.oracle,
-    network: config.network,
+    storage:      providers.storage,
+    tokenStorage: providers.tokenStorage,
+    transport:    providers.transport,
+    oracle:       providers.oracle,
+    network:      config.network,
     autoGenerate: false,
   });
 

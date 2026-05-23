@@ -93,6 +93,17 @@ describe('buildLegacyArgv dispatcher', () => {
       expect(buildLegacyArgv('wallet', ['create', 'foo', '--network', 'testnet']))
         .toEqual(['wallet', 'create', 'foo', '--network', 'testnet']);
     });
+    // Issue #23 — `sphere wallet migrate` is the user-facing entry
+    // point for moving a legacy IPNS-pointer wallet into the new
+    // Profile storage. Lock the dispatch shape so a future namespace
+    // refactor doesn't silently route it elsewhere.
+    it('`wallet migrate` falls through to legacy `wallet migrate`', () => {
+      expect(buildLegacyArgv('wallet', ['migrate'])).toEqual(['wallet', 'migrate']);
+    });
+    it('`wallet migrate --apply` preserves the apply flag', () => {
+      expect(buildLegacyArgv('wallet', ['migrate', '--apply']))
+        .toEqual(['wallet', 'migrate', '--apply']);
+    });
     it('bare `wallet` with no subcommand produces `[wallet]`', () => {
       expect(buildLegacyArgv('wallet', [])).toEqual(['wallet']);
     });

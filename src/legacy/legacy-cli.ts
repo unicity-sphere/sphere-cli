@@ -3968,13 +3968,11 @@ async function main(): Promise<void> {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`Failed to deliver invoice: ${msg}`);
-          // legacy-cli.ts wraps `process.exit` to schedule an async teardown
-          // before the real exit (see main()'s `originalExit`). The wrapper
-          // returns `undefined as never`, so synchronous control flow
-          // continues past this point — without the explicit `return`
-          // below, the post-catch code crashes on `result.failed` (result
-          // is still undefined). Same pattern that every handler in this
-          // file should adopt for any catch followed by more work.
+          // process.exit(1) below throws an ExitSignal which the outer
+          // catch in main() converts into a real exit. The `return` is
+          // unreachable but kept as a defensive marker so a future
+          // refactor of the wrapper cannot silently reintroduce the
+          // fall-through that #21 / #226 fixed.
           process.exit(1);
           return;
         }

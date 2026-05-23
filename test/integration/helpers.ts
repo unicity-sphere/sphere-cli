@@ -103,16 +103,42 @@ function shredAllActive(): void {
 // produce a failed-test JSON report, and an extra handler calling
 // process.exit(1) would truncate that output. The `exit` handler below
 // still runs on vitest's natural shutdown and shreds any lingering envs.
-process.once('exit', shredAllActive);
-process.once('SIGINT', () => { shredAllActive(); process.exit(130); });
-process.once('SIGTERM', () => { shredAllActive(); process.exit(143); });
+//
+// Guard against double-registration: vitest may evaluate this module
+// more than once per worker (test-file isolation + module cache).
+// Without the guard, three handlers per file × N files trips Node's
+// default MaxListeners=10 warning. The flag lives on a global symbol
+// so it survives any per-import scope.
+const HANDLERS_REGISTERED = Symbol.for('sphere-cli-it-helpers-handlers-registered');
+if (!(globalThis as Record<symbol, unknown>)[HANDLERS_REGISTERED]) {
+  (globalThis as Record<symbol, unknown>)[HANDLERS_REGISTERED] = true;
+  process.once('exit', shredAllActive);
+  process.once('SIGINT', () => { shredAllActive(); process.exit(130); });
+  process.once('SIGTERM', () => { shredAllActive(); process.exit(143); });
+}
+
+/**
+ * Options for `createSphereEnv`.
+ */
+export interface CreateSphereEnvOptions {
+  /**
+   * Extra env vars to merge into the spawned CLI's env (overlaid on top
+   * of the allowlist + CI / FORCE_COLOR). Use sparingly — the env
+   * surface is intentionally narrow to avoid leaking parent state into
+   * child processes. Justified for things like `SPHERE_NOSTR_RELAYS`
+   * (override the network's default relay set when the test wants to
+   * point wallets at a local Docker relay) or `UNICITY_API_KEY`
+   * (forwarded explicitly when set).
+   */
+  readonly extraEnv?: Readonly<Record<string, string>>;
+}
 
 /**
  * Create an isolated sphere-cli profile rooted in a fresh 0700 tmp directory.
  * The CLI reads `./.sphere-cli/config.json` relative to cwd, so we set
  * cwd to the tmp home when invoking and pre-seed a testnet config.
  */
-export function createSphereEnv(label: string): SphereEnv {
+export function createSphereEnv(label: string, opts?: CreateSphereEnvOptions): SphereEnv {
   const home = mkdtempSync(join(tmpdir(), `${TMP_PREFIX}${label}-`));
   // Lock permissions to owner-only BEFORE writing anything. Testnet keys
   // are still secp256k1 material; don't leave a readable wallet on a
@@ -151,6 +177,12 @@ export function createSphereEnv(label: string): SphereEnv {
   // spawned CLI — no other var from process.env is forwarded.
   if (typeof process.env['UNICITY_API_KEY'] === 'string') {
     env['UNICITY_API_KEY'] = process.env['UNICITY_API_KEY'];
+  }
+  // Caller-supplied overlay. Applied LAST so it can override defaults.
+  // Used by the swap e2e suite to inject SPHERE_NOSTR_RELAYS pointing at
+  // a local Docker relay alongside the testnet relay.
+  if (opts?.extraEnv) {
+    for (const [k, v] of Object.entries(opts.extraEnv)) env[k] = v;
   }
 
   return { home, env };

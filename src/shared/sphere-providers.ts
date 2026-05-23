@@ -131,20 +131,3 @@ export function buildSphereProviders(
     groupChat:    legacy.groupChat,
   };
 }
-
-/**
- * Construct ONLY the legacy file-based providers — used by the
- * `sphere wallet migrate` command to read the source state before
- * importing it into Profile. Bypass `buildSphereProviders` because
- * the migrate command needs simultaneous access to both bundles
- * pointed at the SAME dataDir/tokensDir.
- */
-export function buildLegacyOnlyProviders(
-  config: SphereProvidersConfig,
-): ReturnType<typeof createNodeProviders> {
-  return createNodeProviders({
-    network:   config.network,
-    dataDir:   config.dataDir,
-    tokensDir: config.tokensDir,
-  });
-}

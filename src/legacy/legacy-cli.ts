@@ -3761,7 +3761,25 @@ async function main(): Promise<void> {
             console.error('Usage: invoice-create --target <address> --asset "<amount> <coin>" [--nft <id>] [--due <ISO-date>] [--memo <text>] [--delivery <method>] [--terms <json-file>]');
             process.exit(1);
           }
-          const targetAddress = args[targetIdx + 1];
+          let targetAddress = args[targetIdx + 1];
+          // Accept `@nametag` (and chain-pubkey / alpha1...) as targets for
+          // user convenience — symmetric with `payments send --recipient`.
+          // AccountingModule.createInvoice itself requires a canonical
+          // `DIRECT://` address because invoice terms commit (cryptographically
+          // bind) the recipient identity, so we resolve once here before
+          // constructing the request. The resolved address is what gets baked
+          // into the invoice's signed terms.
+          if (!targetAddress.startsWith('DIRECT://')) {
+            const resolved = await sphere.resolve(targetAddress);
+            if (!resolved || !resolved.directAddress) {
+              console.error(
+                `Could not resolve target "${targetAddress}" to a DIRECT:// address. ` +
+                  'Provide an @nametag, chain pubkey, alpha1 address, or a DIRECT:// address.',
+              );
+              process.exit(1);
+            }
+            targetAddress = resolved.directAddress;
+          }
           const nftId = nftIdx !== -1 ? args[nftIdx + 1] : undefined;
           const dueDate = dueIdx !== -1 ? new Date(args[dueIdx + 1]).getTime() : undefined;
           if (dueDate !== undefined && isNaN(dueDate)) {
@@ -3849,6 +3867,91 @@ async function main(): Promise<void> {
         console.log('Invoice imported:');
         console.log(JSON.stringify(terms, null, 2));
 
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-deliver': {
+        // sphere invoice deliver <id-or-prefix> [--to <recipient>...] [--memo <text>]
+        //
+        // Ships a previously-minted invoice to its targets (default) or to
+        // an explicit recipient list via the SDK's deliverInvoice() —
+        // packages the invoice token into a UXF bundle and sends it inside
+        // an `invoice_delivery:` NIP-17 DM. Per-recipient outcome is
+        // surfaced as JSON for scripting (manual-test-full-recovery.sh §C
+        // calls this between `invoice create` and Bob's `invoice pay`).
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-deliver <id-or-prefix> [--to <recipient>...] [--memo <text>]');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled. Initialize with accounting support.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'full');
+
+        // Prefix-match against the local invoice ledger so callers can use
+        // any unambiguous prefix (parallel to invoice-pay).
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        // Collect every `--to <recipient>` flag (repeatable). When absent,
+        // the SDK defaults to every non-self target from the invoice terms.
+        const recipients: string[] = [];
+        for (let i = 0; i < args.length - 1; i++) {
+          if (args[i] === '--to') {
+            const v = args[i + 1];
+            if (typeof v === 'string' && v.length > 0) recipients.push(v);
+          }
+        }
+
+        const memoIdx3 = args.indexOf('--memo');
+        const memo = memoIdx3 !== -1 ? args[memoIdx3 + 1] : undefined;
+
+        const optionsMut: Record<string, unknown> = {};
+        if (recipients.length > 0) optionsMut['recipients'] = recipients;
+        if (memo !== undefined) optionsMut['memo'] = memo;
+
+        let result;
+        try {
+          result = await sphere.accounting.deliverInvoice(invoiceId, optionsMut as Parameters<typeof sphere.accounting.deliverInvoice>[1]);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Failed to deliver invoice: ${msg}`);
+          // legacy-cli.ts wraps `process.exit` to schedule an async teardown
+          // before the real exit (see main()'s `originalExit`). The wrapper
+          // returns `undefined as never`, so synchronous control flow
+          // continues past this point — without the explicit `return`
+          // below, the post-catch code crashes on `result.failed` (result
+          // is still undefined). Same pattern that every handler in this
+          // file should adopt for any catch followed by more work.
+          process.exit(1);
+          return;
+        }
+        console.log('Invoice delivery result:');
+        console.log(JSON.stringify(result, null, 2));
+
+        if (result.failed > 0) {
+          // Non-zero exit so shell scripts can distinguish full success
+          // from partial failure. The per-recipient detail above tells
+          // the operator which targets failed and why.
+          process.exit(2);
+          return;
+        }
+
+        await syncAfterWrite(sphere);
         await closeSphere();
         break;
       }
@@ -4958,6 +5061,7 @@ function getCompletionCommands(): CompletionCommand[] {
     { name: 'group-members', description: 'List group members' },
     { name: 'group-info', description: 'Show group details' },
     { name: 'invoice-create', description: 'Create an invoice', flags: ['--target', '--asset', '--nft', '--due', '--memo', '--delivery', '--anonymous', '--terms'] },
+    { name: 'invoice-deliver', description: 'Deliver an existing invoice to its targets (UXF DM)', flags: ['--to', '--memo'] },
     { name: 'invoice-import', description: 'Import invoice from token file' },
     { name: 'invoice-list', description: 'List invoices', flags: ['--state', '--limit'] },
     { name: 'invoice-status', description: 'Show invoice status' },

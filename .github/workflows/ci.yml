@@ -39,21 +39,32 @@ jobs:
       - name: Clone sphere-sdk sibling
         # Pin to a specific commit SHA (not a branch name) for supply-chain
         # integrity — a branch pointer can be force-pushed or rebased,
-        # silently changing the code CI builds against. This SHA points at
-        # the tip of `refactor/extract-cli-to-sphere-cli` at the time of
-        # this commit; that branch contains `bc07e89 feat(cli-extraction)`
-        # which promoted CLI-consumed types (CreateInvoiceRequest,
-        # PayInvoiceParams, encrypt/decrypt helpers, etc.) to the public
-        # module surface. Those exports have not yet landed on `main` or
-        # in any published npm version.
+        # silently changing the code CI builds against. This SHA is the
+        # tip of `integration/all-fixes` after PR #225 (issue-223 cross-
+        # process UXF delivery fix) landed; that branch contains the
+        # CLI-consumed type exports (CreateInvoiceRequest, PayInvoice
+        # Params, encrypt/decrypt helpers, ...) on the public module
+        # surface. Those exports have not yet landed on `main` or in any
+        # published npm version.
+        #
+        # Why the bump: the previous pin (86468103a, tip of
+        # `refactor/extract-cli-to-sphere-cli`) became unreachable to
+        # `git clone` after the refactor branch was deleted from origin —
+        # the commit still exists in the GitHub repo object database but
+        # isn't on any branch tip, so a default `git clone` doesn't fetch
+        # it and `checkout --detach` fails with "unable to read tree".
         #
         # Bump this SHA when a new sphere-sdk commit is required; remove
         # this whole workaround once sphere-sdk publishes v0.7.1+ to npm
         # with the post-extraction exports.
         env:
-          SPHERE_SDK_SHA: 86468103ac25271b96a338f64349dd0eb472689f
+          SPHERE_SDK_SHA: 02cb4550facae0bea58c3b04aceaf3059599464b
         run: |
           git clone https://github.com/unicity-sphere/sphere-sdk.git ../../sphere-sdk
+          # The pinned SHA may not be on a branch tip after future merges;
+          # fetch it explicitly before checkout so the workflow keeps
+          # working when integration/all-fixes advances past this commit.
+          git -C ../../sphere-sdk fetch origin "$SPHERE_SDK_SHA" || true
           git -C ../../sphere-sdk checkout --detach "$SPHERE_SDK_SHA"
 
       - name: "Build sphere-sdk (required for file: dependency to resolve types)"

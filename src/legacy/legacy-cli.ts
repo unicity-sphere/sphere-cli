@@ -197,6 +197,36 @@ let sphereInstance: Sphere | null = null;
 let noNostrGlobal = false;
 
 /**
+ * Sentinel thrown by the `process.exit` interceptor in `main()` so the
+ * caller's synchronous control flow unwinds instead of continuing past
+ * the exit call.
+ *
+ * Background: the interceptor needs to destroy the Sphere instance
+ * (Nostr relays, IPFS handles, SQLite connections) BEFORE the real
+ * `process.exit`. Cleanup is async, so the wrapper used to return
+ * `undefined` after scheduling `inst.destroy().finally(originalExit)`.
+ * That left the calling line of code to continue executing — e.g.
+ * `process.exit(1)` after a "no invoice found" check fell through to
+ * `matched[0].invoiceId`, which crashed with "Cannot read properties of
+ * undefined" (see issue #21).
+ *
+ * Throwing this sentinel synchronously unwinds back to the outer
+ * try/catch in `main()`, which then awaits cleanup and calls the
+ * original `process.exit` with the requested code.
+ *
+ * Deliberately NOT extending `Error` so inner `catch (err)` blocks that
+ * test `err instanceof Error` (the common pattern in this file) do not
+ * classify it as a normal error worth logging. In practice every inner
+ * catch in this file either (a) re-calls `process.exit(N)` — which
+ * re-throws an ExitSignal and propagates correctly — or (b) sits over a
+ * try body that does no `process.exit` itself, so a thrown ExitSignal
+ * cannot reach it.
+ */
+class ExitSignal {
+  constructor(public readonly code: number) {}
+}
+
+/**
  * Create a no-op transport that does nothing.
  * Used with --no-nostr to prove IPFS-only recovery.
  */
@@ -1551,17 +1581,25 @@ export async function legacyMain(argv: string[]): Promise<void> {
 async function main(): Promise<void> {
   // Intercept process.exit() so we tear down the Sphere instance (Nostr
   // relays, IPFS handles, SQLite connections) before the process dies.
-  // Inside command handlers there are ~25 `process.exit(1)` calls that
+  // Inside command handlers there are ~180 `process.exit(N)` calls that
   // would otherwise skip finally blocks and leak resources.
+  //
+  // We CANNOT return synchronously from this wrapper after scheduling
+  // an async destroy — the caller's next statement would still run and
+  // typically crashes when it dereferences a result that should have
+  // been "guarded" by the exit (e.g. invoice-status calling
+  // `matched[0].invoiceId` after `process.exit(1)` on an empty array;
+  // see issue #21).
+  //
+  // Instead we throw an `ExitSignal` sentinel. The outer try/catch in
+  // this function awaits `closeSphere()` and then calls `originalExit`
+  // with the requested code. When no Sphere instance is loaded (early
+  // arg-validation paths) we fall straight through to `originalExit`,
+  // matching the previous synchronous behaviour.
   const originalExit = process.exit.bind(process);
   process.exit = ((code?: number) => {
     if (sphereInstance) {
-      const inst = sphereInstance;
-      sphereInstance = null;
-      inst.destroy()
-        .catch(() => { /* best-effort cleanup */ })
-        .finally(() => originalExit(code));
-      return undefined as never;
+      throw new ExitSignal((code as number) ?? 0);
     }
     return originalExit(code);
   }) as typeof process.exit;
@@ -3930,13 +3968,11 @@ async function main(): Promise<void> {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`Failed to deliver invoice: ${msg}`);
-          // legacy-cli.ts wraps `process.exit` to schedule an async teardown
-          // before the real exit (see main()'s `originalExit`). The wrapper
-          // returns `undefined as never`, so synchronous control flow
-          // continues past this point — without the explicit `return`
-          // below, the post-catch code crashes on `result.failed` (result
-          // is still undefined). Same pattern that every handler in this
-          // file should adopt for any catch followed by more work.
+          // process.exit(1) below throws an ExitSignal which the outer
+          // catch in main() converts into a real exit. The `return` is
+          // unreachable but kept as a defensive marker so a future
+          // refactor of the wrapper cannot silently reintroduce the
+          // fall-through that #21 / #226 fixed.
           process.exit(1);
           return;
         }
@@ -4997,9 +5033,17 @@ async function main(): Promise<void> {
         process.exit(1);
     }
   } catch (e) {
+    if (e instanceof ExitSignal) {
+      // Intentional `process.exit(N)` from a command handler. Cleanup and
+      // forward the requested code through the original (non-wrapped) exit
+      // so we don't re-enter this catch.
+      await closeSphere().catch(() => { /* best-effort cleanup */ });
+      originalExit(e.code);
+      return;
+    }
     console.error('Error:', e instanceof Error ? e.message : e);
     await closeSphere().catch(() => { /* best-effort cleanup */ });
-    process.exit(1);
+    originalExit(1);
   }
 }
 

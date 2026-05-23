@@ -47,17 +47,47 @@ export type WalletKind =
  *     happily — the local FileStorage cache (`wallet.json`) lives
  *     alongside the OrbitDB subdir, but the OrbitDB subdir is the
  *     authoritative marker that Profile init has run at least once.
- *   - `legacy`:  `${dataDir}/wallet.json` exists AND no `orbitdb/`. The
- *     wallet was minted with the deprecated `IpfsStorageProvider`
- *     bootstrap. The migrate command moves its token state into
- *     OrbitDB-backed Profile storage.
- *   - `fresh`:   neither marker. First-time init — defaults to Profile.
+ *   - `legacy`:  `${dataDir}/wallet.json` has *substantive* content
+ *     (at least one key) AND no `orbitdb/`. The wallet was minted
+ *     with the deprecated `IpfsStorageProvider` bootstrap. The
+ *     migrate command moves its token state into OrbitDB-backed
+ *     Profile storage.
+ *   - `fresh`:   no orbitdb/ AND no wallet.json — OR a wallet.json
+ *     that's an empty `{}` placeholder. The CLI's `sphere wallet use`
+ *     flow constructs a `FileStorageProvider` whose `connect()` writes
+ *     an empty `wallet.json` as a side-effect before any wallet data
+ *     exists, so the placeholder must NOT trip the migration gate
+ *     (regression caught by `manual-test-full-recovery.sh §1`). A
+ *     wallet.json that fails to parse is treated as `legacy` — its
+ *     content is unknown, route it through migrate triage rather than
+ *     silently bootstrapping a Profile on top.
  */
 export function detectWalletKind(dataDir: string): WalletKind {
   if (!fs.existsSync(dataDir)) return 'fresh';
   if (fs.existsSync(path.join(dataDir, 'orbitdb'))) return 'profile';
-  if (fs.existsSync(path.join(dataDir, 'wallet.json'))) return 'legacy';
-  return 'fresh';
+  const walletJsonPath = path.join(dataDir, 'wallet.json');
+  if (!fs.existsSync(walletJsonPath)) return 'fresh';
+  // Distinguish the empty `{}` placeholder (a connect()-time side-effect
+  // of the legacy FileStorageProvider) from a real legacy wallet that
+  // carries actual key/value entries.
+  try {
+    const raw = fs.readFileSync(walletJsonPath, 'utf8');
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      parsed !== null &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed) &&
+      Object.keys(parsed as Record<string, unknown>).length === 0
+    ) {
+      return 'fresh';
+    }
+    return 'legacy';
+  } catch {
+    // Unreadable / unparseable wallet.json — be conservative: route
+    // through migrate triage instead of clobbering with a fresh
+    // Profile boot. Operator can inspect or delete the file.
+    return 'legacy';
+  }
 }
 
 /** Configuration for `buildSphereProviders`. Mirrors the prior `createNodeProviders` call sites. */

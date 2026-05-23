@@ -64,4 +64,42 @@ describe('detectWalletKind', () => {
     fs.writeFileSync(path.join(scratch, 'README.md'), '# nothing');
     expect(detectWalletKind(scratch)).toBe('fresh');
   });
+
+  it('returns "fresh" for an empty `{}` wallet.json placeholder', () => {
+    // The CLI's `sphere wallet use <name>` flow constructs a
+    // FileStorageProvider whose `connect()` writes an empty `{}` to
+    // wallet.json as a side-effect — BEFORE any wallet data exists.
+    // detectWalletKind must NOT classify this no-content sentinel as
+    // legacy or the migrate gate fires on every fresh wallet (regression
+    // observed in manual-test-full-recovery.sh §1).
+    fs.writeFileSync(path.join(scratch, 'wallet.json'), '{}');
+    expect(detectWalletKind(scratch)).toBe('fresh');
+  });
+
+  it('returns "fresh" for a `{}` placeholder even with whitespace', () => {
+    fs.writeFileSync(path.join(scratch, 'wallet.json'), '  {\n}  \n');
+    expect(detectWalletKind(scratch)).toBe('fresh');
+  });
+
+  it('returns "legacy" when wallet.json carries any key', () => {
+    // The substantive-content marker — a single key is enough to
+    // signal that real wallet state lives here.
+    fs.writeFileSync(path.join(scratch, 'wallet.json'), '{"mnemonic":"..."}');
+    expect(detectWalletKind(scratch)).toBe('legacy');
+  });
+
+  it('returns "legacy" for an unparseable wallet.json (conservative)', () => {
+    // Garbage content is routed through migrate triage rather than
+    // being treated as fresh — clobbering an unreadable file with a
+    // Profile boot could destroy unrecoverable wallet state.
+    fs.writeFileSync(path.join(scratch, 'wallet.json'), 'not-json-at-all');
+    expect(detectWalletKind(scratch)).toBe('legacy');
+  });
+
+  it('returns "legacy" for an array wallet.json (unexpected shape)', () => {
+    // FileStorageProvider always writes a top-level object. An array
+    // or primitive at the root is unexpected — keep it conservative.
+    fs.writeFileSync(path.join(scratch, 'wallet.json'), '[]');
+    expect(detectWalletKind(scratch)).toBe('legacy');
+  });
 });

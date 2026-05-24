@@ -42,7 +42,7 @@ interface PidFileData {
  * Parse a PID file. Handles both the new JSON format and the legacy plain-text
  * format (just a number). Returns null on parse failure or missing file.
  */
-function readPidFile(pidFile: string): PidFileData | null {
+export function readPidFile(pidFile: string): PidFileData | null {
   let raw: string;
   try {
     raw = fs.readFileSync(pidFile, 'utf8').trim();
@@ -81,7 +81,7 @@ function readPidFile(pidFile: string): PidFileData | null {
  * Returns false for dead PIDs and for PIDs that are alive but clearly not ours
  * (i.e. PID reuse case).
  */
-function isDaemonProcessAlive(pid: number): boolean {
+export function isDaemonProcessAlive(pid: number): boolean {
   if (!isProcessAlive(pid)) return false;
   // Best-effort PID reuse detection via /proc/<pid>/comm (Linux only).
   try {

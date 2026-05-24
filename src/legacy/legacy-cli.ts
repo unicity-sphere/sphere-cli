@@ -7,6 +7,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
+import { readPidFile, isDaemonProcessAlive } from './daemon.js';
+import { getDefaultPidFile } from './daemon-config.js';
 // `encrypt`, `decrypt`, `hexToWIF`, `generatePrivateKey`, and
 // `generateAddressFromMasterKey` are no longer top-level exports of
 // @unicitylabs/sphere-sdk — they live in the L1 (alpha-chain) namespace
@@ -254,8 +256,51 @@ function createNoopTransport(): TransportProvider {
   };
 }
 
+/**
+ * Issue #247 short-term gate — refuse to open a Sphere instance when a
+ * sphere daemon is running against the same wallet directory.
+ *
+ * Background: the daemon at `daemon.ts:711` parks the event loop forever
+ * with OrbitDB / Helia open. LevelDB takes a POSIX advisory file lock
+ * (`fcntl(F_SETLK)`) on `<dataDir>/orbitdb/<dbAddress>/_index/LOCK` and
+ * on `<dataDir>/datastore/LOCK`. The lease is held until SIGTERM. A
+ * second process opening the same directory hits `LEVEL_LOCKED` →
+ * `Database is not open`, and the PR #245/#246 3-attempt retry can
+ * never succeed because the contention isn't transient.
+ *
+ * The proper fix is a daemon-as-broker IPC surface (#247 long-term).
+ * This short-term gate detects the live-daemon case at CLI entry, exits
+ * with EX_TEMPFAIL, and tells the operator how to proceed.
+ *
+ * Skipped when the current process IS the daemon (PID match) — `daemon
+ * start` itself calls getSphere via the runDaemon callback to acquire
+ * its OrbitDB handle, and that path is the legitimate owner.
+ */
+function checkNoLiveDaemonOrExit(): void {
+  const pidFile = getDefaultPidFile();
+  const pidData = readPidFile(pidFile);
+  if (!pidData) return;
+  if (pidData.pid === process.pid) return; // we ARE the daemon
+  if (!isDaemonProcessAlive(pidData.pid)) return; // stale PID file
+  process.stderr.write(
+    `\nA sphere daemon is running (pid=${pidData.pid}) and holds the wallet's\n` +
+      `OrbitDB / Helia directory lock. CLI commands that open the wallet would\n` +
+      `fail with "Database is not open" after the bounded retry budget.\n\n` +
+      `Stop the daemon first:\n` +
+      `  sphere daemon stop\n\n` +
+      `Then re-run your command. (#247 follow-up will add a daemon-broker IPC\n` +
+      `surface so CLI commands can coexist with a running daemon.)\n`,
+  );
+  process.exit(75); // EX_TEMPFAIL — caller can retry after stopping the daemon.
+}
+
 async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; nametag?: string }): Promise<Sphere> {
   if (sphereInstance) return sphereInstance;
+
+  // Issue #247 — refuse to open Sphere when a daemon already holds the
+  // OrbitDB / Helia directory lock. Skipped when our own PID owns the
+  // PID file (i.e. `daemon start` calling back into getSphere).
+  checkNoLiveDaemonOrExit();
 
   const config = loadConfig();
 

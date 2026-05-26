@@ -230,7 +230,11 @@ describe('sphere-cli — wallet profile CRUD lifecycle (offline)', () => {
   it('`wallet use alice` switches the active profile', () => {
     const r = runSphere(env, ['wallet', 'use', 'alice'], { timeoutMs: 15_000 });
     expect(r.status).toBe(0);
-    expect(r.stdout).toMatch(/Switched to wallet profile:\s*alice/);
+    // sphere-sdk#282 Residual #2 — confirmation lives on STDERR so
+    // downstream `sphere wallet use … && sphere balance > file` shell
+    // pipelines don't fold the banner into the captured snapshot.
+    expect(r.stderr).toMatch(/Switched to wallet profile:\s*alice/);
+    expect(r.stdout).not.toMatch(/Switched to wallet profile/);
 
     // Verify by re-reading current.
     const current = runSphere(env, ['wallet', 'current'], { timeoutMs: 15_000 });

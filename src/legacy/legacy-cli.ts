@@ -1982,19 +1982,29 @@ async function main(): Promise<void> {
             }
 
             if (switchToProfile(profileName)) {
-              console.log(`✓ Switched to wallet profile: ${profileName}`);
+              // Issue sphere-sdk#282 Residual #2 — confirmation output
+              // goes to STDERR so that pipelines capturing the NEXT
+              // command's stdout (e.g. `sphere wallet use alice &&
+              // sphere balance > file`) don't accidentally include the
+              // wallet-use banner in the captured snapshot. Without
+              // this, the same logical command sequence produces
+              // different captured-stdout content depending on whether
+              // the harness redirects the `wallet use` invocation
+              // separately or groups it in a subshell — see the
+              // peer1-vs-peer2 asymmetry in `manual-test-full-recovery.sh`.
+              console.error(`✓ Switched to wallet profile: ${profileName}`);
 
               // Show wallet status
               try {
                 const sphere = await getSphere();
                 const identity = sphere.identity;
                 if (identity) {
-                  console.log(`  Nametag:  ${identity.nametag || '(not set)'}`);
-                  console.log(`  L1 Addr:  ${identity.l1Address}`);
+                  console.error(`  Nametag:  ${identity.nametag || '(not set)'}`);
+                  console.error(`  L1 Addr:  ${identity.l1Address}`);
                 }
                 await closeSphere();
               } catch {
-                console.log('  (wallet not initialized in this profile)');
+                console.error('  (wallet not initialized in this profile)');
               }
             } else {
               console.error(`Profile "${profileName}" not found.`);

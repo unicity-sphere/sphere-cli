@@ -116,6 +116,17 @@ function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+function parsePositiveInteger(raw: string, flag: string): number | string {
+  if (!/^\d+$/.test(raw)) {
+    return `${flag} must be a positive integer (got "${raw}")`;
+  }
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n <= 0) {
+    return `${flag} must be a positive integer (got "${raw}")`;
+  }
+  return n;
+}
+
 // =============================================================================
 // Core runner
 // =============================================================================
@@ -231,10 +242,11 @@ export function buildCreateIntentParams(
     volume_max: opts.volumeMax,
   };
   if (opts.expiryMs !== undefined) {
-    const n = Number.parseInt(opts.expiryMs, 10);
-    if (!Number.isFinite(n) || n <= 0) {
-      return { error: `--expiry-ms must be a positive integer (got "${opts.expiryMs}")` };
+    const parsed = parsePositiveInteger(opts.expiryMs, '--expiry-ms');
+    if (typeof parsed === 'string') {
+      return { error: parsed };
     }
+    const n = parsed;
     // Trader's ACP CREATE_INTENT param is `expiry_sec` (validated
     // as a finite positive integer ≤ 7 days). The CLI flag stays
     // in milliseconds for ergonomic consistency with other timeout
@@ -282,13 +294,13 @@ async function handleListIntents(cmd: Command, opts: ListIntentsOpts): Promise<v
     const params: Record<string, unknown> = {};
     if (opts.state !== undefined) params['state'] = opts.state;
     if (opts.limit !== undefined) {
-      const n = Number.parseInt(opts.limit, 10);
-      if (!Number.isFinite(n) || n <= 0) {
-        writeStderr(`--limit must be a positive integer (got "${opts.limit}")`);
+      const parsed = parsePositiveInteger(opts.limit, '--limit');
+      if (typeof parsed === 'string') {
+        writeStderr(parsed);
         process.exitCode = 1;
         return;
       }
-      params['limit'] = n;
+      params['limit'] = parsed;
     }
     const response = await transport.sendCommand('LIST_INTENTS', params);
     emitResult(json, response);
@@ -300,13 +312,13 @@ async function handleListDeals(cmd: Command, opts: ListDealsOpts): Promise<void>
     const params: Record<string, unknown> = {};
     if (opts.state !== undefined) params['state'] = opts.state;
     if (opts.limit !== undefined) {
-      const n = Number.parseInt(opts.limit, 10);
-      if (!Number.isFinite(n) || n <= 0) {
-        writeStderr(`--limit must be a positive integer (got "${opts.limit}")`);
+      const parsed = parsePositiveInteger(opts.limit, '--limit');
+      if (typeof parsed === 'string') {
+        writeStderr(parsed);
         process.exitCode = 1;
         return;
       }
-      params['limit'] = n;
+      params['limit'] = parsed;
     }
     // Trader exposes the swap-set via LIST_SWAPS; alias it as `list-deals`
     // because operators think in deal language. Spec also accepts LIST_SWAPS

@@ -410,7 +410,12 @@ function resolveCoin(identifier: string): { coinId: string; symbol: string; deci
 
 /**
  * Parse an asset argument in "<amount> <symbol>" format.
- * Examples: "1000000 UCT", "10.5 BTC", "500000 USDU"
+ *
+ * Amount is human-readable (e.g., "7", "7.5", "0.001"). Smallest-unit
+ * conversion via the token registry's decimals happens at the call
+ * site (see `invoice-create`'s --asset loop).
+ *
+ * Examples: "7 UCT", "7.5 ETH", "0.001 BTC", "500 USDU"
  */
 /**
  * Resolve a swap ID prefix to a full 64-char swap ID.
@@ -420,7 +425,7 @@ function resolveCoin(identifier: string): { coinId: string; symbol: string; deci
 function parseAssetArg(value: string): { amount: string; coin: string } {
   const parts = value.trim().split(/\s+/);
   if (parts.length !== 2) {
-    console.error(`Invalid asset format: "${value}". Expected "<amount> <symbol>" (e.g., "1000000 UCT")`);
+    console.error(`Invalid asset format: "${value}". Expected "<amount> <symbol>" (e.g., "7 UCT", "7.5 ETH", "0.001 BTC")`);
     process.exit(1);
   }
   return { amount: parts[0], coin: parts[1] };
@@ -1073,24 +1078,26 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
 
   // --- INVOICES ---
   'invoice-create': {
-    usage: 'invoice-create --target <address> --asset "<amount> <coin>" [options]',
-    description: 'Create a new invoice by specifying a target address and requested payment. Alternatively, load full terms from a JSON file with --terms. The invoice is minted as an on-chain token.',
+    usage: 'invoice-create --target <address> --asset "<amount> <coin>" [--asset "..."] [options]',
+    description: 'Create a new invoice by specifying a target address and one or more requested payments. Pass --asset multiple times for multi-asset invoices. Alternatively, load full terms from a JSON file with --terms. The invoice is minted as an on-chain token.',
     flags: [
-      { flag: '--target <address>', description: 'Target address (@nametag or DIRECT:// address) (required unless --terms)' },
-      { flag: '--asset "<amount> <coin>"', description: 'Requested asset in "<amount> <symbol>" format (e.g., "1000000 UCT")' },
-      { flag: '--nft <id>', description: 'Request a specific NFT by token ID (instead of coin+amount)' },
+      { flag: '--target <address>', description: 'Target address — @nametag, chain pubkey, alpha1, or DIRECT:// (required unless --terms)' },
+      { flag: '--asset "<amount> <coin>"', description: 'Requested asset in human-readable "<amount> <symbol>" format. Repeatable for multi-asset invoices. Examples: "7 UCT", "7.5 ETH", "0.001 BTC".' },
+      { flag: '--nft <id>', description: 'Request a specific NFT by token ID (instead of coin+amount; can combine with --asset)' },
       { flag: '--due <ISO-date>', description: 'Due date in ISO-8601 format (e.g., 2026-12-31)' },
       { flag: '--memo <text>', description: 'Invoice memo text' },
       { flag: '--delivery <method>', description: 'Delivery method description' },
-      { flag: '--terms <json-file>', description: 'Load full CreateInvoiceRequest from a JSON file (overrides other flags)' },
+      { flag: '--terms <json-file>', description: 'Load full CreateInvoiceRequest from a JSON file (overrides other flags). @nametag values in target addresses are still resolved.' },
     ],
     examples: [
-      'npm run cli -- invoice-create --target @alice --asset "1000000 UCT"',
-      'npm run cli -- invoice-create --target @alice --asset "500000 BTC" --memo "Order #42" --due 2026-12-31',
+      'npm run cli -- invoice-create --target @alice --asset "7 UCT"',
+      'npm run cli -- invoice-create --target @alice --asset "7 UCT" --asset "2 ETH"',
+      'npm run cli -- invoice-create --target @alice --asset "0.001 BTC" --memo "Order #42" --due 2026-12-31',
       'npm run cli -- invoice-create --terms invoice-terms.json',
     ],
     notes: [
-      'Amounts must be positive integers in smallest units (no decimals, no leading zeros).',
+      'Amounts accept decimals (e.g., 7.5 UCT) — the CLI converts to smallest units via the token registry. Negative or zero amounts are rejected.',
+      'Each --asset is a separate flag occurrence; the CLI iterates them all to build the multi-asset request.',
     ],
   },
   'invoice-import': {
@@ -4117,9 +4124,39 @@ async function main(): Promise<void> {
             }
             process.exit(1);
           }
+          // Resolve any @nametag / chainPubkey / alpha1 target addresses
+          // to DIRECT://. AccountingModule.createInvoice requires
+          // DIRECT:// at the cryptographic boundary (invoice terms bind
+          // the recipient identity — see
+          // sphere-sdk:modules/accounting/AccountingModule.ts:840-903).
+          // The `--target` single-asset path already does this resolution
+          // before constructing the request; the `--terms` JSON path
+          // historically bypassed it, forcing callers to bake
+          // `DIRECT://…` into their terms files. By resolving here we
+          // honour the CLI's "addressing via unicity ids" UX principle
+          // — callers pass `@nametag` everywhere and the CLI does the
+          // identity-binding resolution internally.
+          const sanitizedTerms = stripDangerousKeys(termsJson) as CreateInvoiceRequest;
+          if (sanitizedTerms.targets && Array.isArray(sanitizedTerms.targets)) {
+            for (const target of sanitizedTerms.targets) {
+              if (target && typeof target.address === 'string'
+                  && !target.address.startsWith('DIRECT://')) {
+                const original = target.address;
+                const resolved = await sphere.resolve(original);
+                if (!resolved || !resolved.directAddress) {
+                  console.error(
+                    `Could not resolve invoice target "${original}" to a DIRECT:// address. ` +
+                      'Provide an @nametag, chain pubkey, alpha1 address, or a DIRECT:// address.',
+                  );
+                  process.exit(1);
+                }
+                target.address = resolved.directAddress;
+              }
+            }
+          }
           let result;
           try {
-            result = await sphere.accounting.createInvoice(stripDangerousKeys(termsJson) as CreateInvoiceRequest);
+            result = await sphere.accounting.createInvoice(sanitizedTerms);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             console.error(`Failed to create invoice from terms file: ${msg}`);
@@ -4161,24 +4198,56 @@ async function main(): Promise<void> {
           const memo = memoIdx !== -1 ? args[memoIdx + 1] : undefined;
           const delivery = deliveryIdx !== -1 ? args[deliveryIdx + 1] : undefined;
 
+          // Collect ALL --asset flags (multi-asset support). Each
+          // takes a human-readable "<amount> <symbol>" string —
+          // e.g., "7 UCT", "7.5 ETH", "0.001 BTC". Smallest-unit
+          // conversion is performed here via the registry's per-
+          // coin `decimals`; the SDK call receives the
+          // smallest-unit string it has always expected, but the
+          // user never needs to type a long zero-tail integer.
+          //
+          // Why this is the right place. AccountingModule
+          // .createInvoice validates coinId shape and amount as a
+          // bigint-shaped string — it does NOT know decimals. The
+          // CLI is the layer that owns the human↔machine
+          // conversion, just like `payments send <amount> <symbol>`
+          // already does for transfers.
           const assets: InvoiceRequestedAsset[] = [];
-          if (assetIdx !== -1 && args[assetIdx + 1]) {
-            const parsed = parseAssetArg(args[assetIdx + 1]);
-            if (!/^[1-9][0-9]*$/.test(parsed.amount)) {
-              console.error(`Invalid amount "${parsed.amount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
-              process.exit(1);
+          for (let i = 0; i < args.length; i++) {
+            if (args[i] === '--asset' && i + 1 < args.length) {
+              const parsed = parseAssetArg(args[i + 1]);
+              const { symbol: resolvedSymbol, decimals } = resolveCoin(parsed.coin);
+              // Accept any non-empty positive amount: integer or
+              // decimal-fractional. Reject negatives / non-numeric
+              // up front to avoid handing nonsense to toSmallestUnit.
+              if (!/^[0-9]+(\.[0-9]+)?$/.test(parsed.amount) || parsed.amount === '0') {
+                console.error(`Invalid amount "${parsed.amount}" — must be a positive number (e.g., "7", "7.5", "0.001")`);
+                process.exit(1);
+              }
+              const smallest = toSmallestUnit(parsed.amount, decimals);
+              if (smallest <= 0n) {
+                console.error(
+                  `Amount "${parsed.amount} ${parsed.coin}" resolves to zero smallest units ` +
+                    `(decimals=${decimals}). Pick a value at least 1 / 10^${decimals}.`,
+                );
+                process.exit(1);
+              }
+              assets.push({ coin: [resolvedSymbol, smallest.toString()] });
             }
-            // AccountingModule.createInvoice validates coinId as
-            // /^[A-Za-z0-9]+$/ with length ≤20 — i.e. it expects the
-            // human-readable symbol (UCT, USDU, ...), NOT the 64-char
-            // hex token-type id that `payments.send` uses. resolveCoin
-            // is still useful to fail fast on unknown symbols (it
-            // exits non-zero before invoice mint), but we hand the
-            // SYMBOL through to the SDK.
-            const { symbol: resolvedSymbol } = resolveCoin(parsed.coin);
-            assets.push({ coin: [resolvedSymbol, parsed.amount] });
-          } else if (nftId) {
+          }
+          if (assets.length === 0 && nftId) {
             assets.push({ nft: { tokenId: nftId } });
+          }
+          if (assets.length === 0) {
+            console.error(
+              'Usage: invoice-create --target <address> --asset "<amount> <coin>" [--asset "..."] [--nft <id>] [...]\n' +
+                'At least one --asset or --nft is required. --asset accepts repeated flags for multi-asset invoices.\n' +
+                'Examples:\n' +
+                '  --asset "7 UCT"\n' +
+                '  --asset "7 UCT" --asset "2 ETH"\n' +
+                '  --asset "0.001 BTC"',
+            );
+            process.exit(1);
           }
 
           const request: CreateInvoiceRequest = {

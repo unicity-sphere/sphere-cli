@@ -87,6 +87,10 @@ export async function initSphere(): Promise<Sphere> {
     oracle:       providers.oracle,
     network:      config.network,
     autoGenerate: false,
+    // sphere-sdk #394 — pass through the UXF CID-delivery wiring so
+    // sends of > RELAY_SAFE_CAP_BYTES bundles can promote to CID.
+    ...(providers.publishToIpfs ? { publishToIpfs: providers.publishToIpfs } : {}),
+    ...(providers.cidFetchGateways ? { cidFetchGateways: providers.cidFetchGateways } : {}),
   });
 
   return sphere;

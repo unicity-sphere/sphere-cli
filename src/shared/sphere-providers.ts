@@ -24,7 +24,12 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+import {
+  createNodeProviders,
+  createUxfCarPublisher,
+  DEFAULT_IPFS_GATEWAYS,
+  type PublishToIpfsCallback,
+} from '@unicitylabs/sphere-sdk/impl/nodejs';
 import { createNodeProfileProviders } from '@unicitylabs/sphere-sdk/profile/node';
 import type { NetworkType } from '@unicitylabs/sphere-sdk';
 
@@ -99,6 +104,21 @@ export interface SphereProvidersConfig {
   readonly market?: boolean;
   /** Enable the group-chat module. Default false. */
   readonly groupChat?: boolean;
+  /**
+   * IPFS gateway URLs for outgoing UXF CID-delivery + incoming CID
+   * fetch. Defaults to `DEFAULT_IPFS_GATEWAYS` (which honors the
+   * `SPHERE_IPFS_GATEWAY` env override at module load time). Pass an
+   * empty array to disable the publisher entirely — large bundles
+   * will then throw `INLINE_CAR_TOO_LARGE` again.
+   *
+   * Sphere-sdk issue #394 — the CLI wires `publishToIpfs` +
+   * `cidFetchGateways` so the auto-CID promotion path
+   * (`AUTOMATED_CID_DELIVERY_ENABLED = true` post-#394, triggered at
+   * `RELAY_SAFE_CAP_BYTES = 96 KiB`) has a working publisher behind
+   * it. Without this wiring the SDK throws on multi-hop bundles
+   * that exceed the relay event ceiling.
+   */
+  readonly ipfsGateways?: readonly string[];
 }
 
 /**
@@ -119,6 +139,19 @@ export interface SphereProvidersBundle {
   readonly price?:       ReturnType<typeof createNodeProviders>['price'];
   readonly market?:      ReturnType<typeof createNodeProviders>['market'];
   readonly groupChat?:   ReturnType<typeof createNodeProviders>['groupChat'];
+  /**
+   * Outgoing UXF CID-delivery callback (sphere-sdk issue #394). Wired
+   * from `createUxfCarPublisher(ipfsGateways)`; passed through to
+   * `Sphere.init` so the SDK's `delivery: { kind: 'auto' }` path can
+   * promote bundles > `RELAY_SAFE_CAP_BYTES` (96 KiB) to CID-over-Nostr.
+   */
+  readonly publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * IPFS gateway URLs for the recipient pipeline's stream-fetch of
+   * incoming `uxf-cid` bundles. Without this, every `uxf-cid` event
+   * is silently dropped on receive.
+   */
+  readonly cidFetchGateways?: readonly string[];
 }
 
 /**
@@ -128,9 +161,16 @@ export interface SphereProvidersBundle {
  * aggregator-pointer layer's `RootTrustBase` is the same instance the
  * rest of Sphere uses (SPEC §8.4.2 H6).
  *
- * `tokenSync.ipfs` is NOT passed to `createNodeProviders` — that's the
- * deprecated IPNS-based mutable-pointer path that this migration
- * removes. Profile + aggregator pointer + IPFS CAR is the replacement.
+ * `tokenSync.ipfs` (the deprecated IPNS-based wallet-storage flag) is
+ * NOT passed to `createNodeProviders` — Profile + aggregator pointer +
+ * IPFS CAR replaced that wallet-storage path. The outgoing UXF
+ * bundle publisher (`publishToIpfs`) is a SEPARATE concern that
+ * survives the migration: bundles still need to be pinnable for the
+ * CID-by-reference (`uxf-cid`) Nostr delivery path. Sphere-sdk
+ * issue #394 closes the wiring here by importing the canonical
+ * `createUxfCarPublisher` from `@unicitylabs/sphere-sdk/impl/nodejs`
+ * directly, avoiding the deprecated `IpfsStorageProvider` tail that
+ * `tokenSync.ipfs.enabled: true` would otherwise also activate.
  */
 export function buildSphereProviders(
   config: SphereProvidersConfig,
@@ -141,7 +181,9 @@ export function buildSphereProviders(
     tokensDir: config.tokensDir,
     market:    config.market ?? false,
     groupChat: config.groupChat ?? false,
-    // tokenSync.ipfs deliberately omitted — Profile replaces it.
+    // tokenSync.ipfs deliberately omitted — Profile replaces the
+    // deprecated IpfsStorageProvider wallet-storage path. The UXF
+    // bundle publisher below is wired independently.
   });
 
   const profile = createNodeProfileProviders({
@@ -149,6 +191,16 @@ export function buildSphereProviders(
     dataDir: config.dataDir,
     oracle:  legacy.oracle,
   });
+
+  // Sphere-sdk issue #394 — wire the UXF CID-delivery publisher and
+  // the recipient's fetch-gateway list. The default gateway list
+  // honors the `SPHERE_IPFS_GATEWAY` env override at module load.
+  // Empty array disables — sends > 96 KiB will throw
+  // `INLINE_CAR_TOO_LARGE` if the kill-switch is also off.
+  const ipfsGateways: readonly string[] =
+    config.ipfsGateways ?? [...DEFAULT_IPFS_GATEWAYS];
+  const publishToIpfs: PublishToIpfsCallback | undefined =
+    ipfsGateways.length > 0 ? createUxfCarPublisher(ipfsGateways) : undefined;
 
   return {
     storage:      profile.storage,
@@ -159,5 +211,7 @@ export function buildSphereProviders(
     price:        legacy.price,
     market:       legacy.market,
     groupChat:    legacy.groupChat,
+    publishToIpfs,
+    cidFetchGateways: ipfsGateways.length > 0 ? ipfsGateways : undefined,
   };
 }

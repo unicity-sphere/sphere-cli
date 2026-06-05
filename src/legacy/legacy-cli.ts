@@ -293,8 +293,29 @@ function renderInvoiceCreateResult(p: Record<string, unknown>): void {
 }
 
 function renderIdStatusResult(p: Record<string, unknown>): void {
+  // Bulk-refund shape: { refunds: [ { id, status, recipient, amount, coin }, ... ] }
+  // emitted by `invoice return <id>` (no args) and `invoice return <id> --recipient <x>`.
+  if (Array.isArray(p.refunds)) {
+    const rows = p.refunds as Array<Record<string, unknown>>;
+    if (rows.length === 0) {
+      console.log('  (no refunds executed — nothing was attributed to this invoice)');
+      return;
+    }
+    console.log(`  ${rows.length} refund(s) submitted:`);
+    rows.forEach((r, i) => {
+      const recipient = (r.recipient as string) ?? '(unknown)';
+      const recipientShort = recipient.length > 32 ? `${recipient.slice(0, 28)}…` : recipient;
+      console.log(`  [${i}] ${r.amount ?? '?'} ${r.coin ?? '?'} → ${recipientShort}`);
+      console.log(`       id     : ${r.id ?? '(unknown)'}`);
+      console.log(`       status : ${r.status ?? '(unknown)'}`);
+      if (r.error) console.log(`       error  : ${r.error}`);
+    });
+    return;
+  }
   console.log(`  id     : ${p.id ?? '(unknown)'}`);
   console.log(`  status : ${p.status ?? '(unknown)'}`);
+  if (p.recipient) console.log(`  recipient : ${p.recipient}`);
+  if (p.amount && p.coin) console.log(`  amount    : ${p.amount} ${p.coin}`);
   if (p.error) console.log(`  error  : ${p.error}`);
   if (p.txHash) console.log(`  txHash : ${p.txHash}`);
 }
@@ -753,6 +774,23 @@ async function resolveInvoiceId(sphere: Sphere, idOrPrefix: string, cmdName: str
     failWithHelp(cmdName, `ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices — use more characters`);
   }
   return matched[0].invoiceId;
+}
+
+/**
+ * Resolve a user-facing recipient (@nametag, chain pubkey, alpha1, or
+ * DIRECT://) to a DIRECT:// address. Same pattern as `invoice-create`'s
+ * target resolution. Returns DIRECT:// addresses unchanged.
+ */
+async function resolveRecipientToDirect(sphere: Sphere, recipient: string, cmdName: string): Promise<string> {
+  if (recipient.startsWith('DIRECT://')) return recipient;
+  const resolved = await sphere.resolve(recipient);
+  if (!resolved || !resolved.directAddress) {
+    failWithHelp(
+      cmdName,
+      `could not resolve recipient "${recipient}" to a DIRECT:// address — provide an @nametag, chain pubkey, alpha1 address, or DIRECT:// address`,
+    );
+  }
+  return resolved.directAddress;
 }
 
 /**
@@ -1523,14 +1561,20 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     ],
   },
   'invoice-return': {
-    usage: 'invoice-return <id-or-prefix> --recipient <address> --asset <amount> <coin>',
-    description: 'Manually return a payment to a sender for a specific invoice.',
+    usage: 'invoice-return <id-or-prefix> [--recipient <address>] [--asset <amount> <coin>]',
+    description: 'Refund attributed payments on an invoice. With no flags, refunds every sender. With --recipient, refunds all of that sender\'s balances. With --recipient + --asset, refunds exactly that amount.',
     flags: [
-      { flag: '--recipient <address>', description: 'Recipient address or @nametag (required)' },
-      { flag: '--asset <amount> <coin>', description: 'Asset to return — two positional tokens (e.g., --asset 100000 UCT). Amount is in smallest units.' },
+      { flag: '--recipient <address>', description: '@nametag, chain pubkey, alpha1, or DIRECT://. Limit refunds to this sender. Resolved to DIRECT:// before SDK handoff.' },
+      { flag: '--asset <amount> <coin>', description: 'Refund exactly this amount of this coin to --recipient. Two positional tokens (e.g., --asset 100 UCT). Amount is in HUMAN units. Requires --recipient.' },
     ],
     examples: [
-      'sphere invoice return a1b2c3d4 --recipient @bob --asset 100000 UCT',
+      'sphere invoice return a1b2c3d4                                  # refund every sender\'s full balance',
+      'sphere invoice return a1b2c3d4 --recipient @alice                # refund all balances owed to @alice',
+      'sphere invoice return a1b2c3d4 --recipient @alice --asset 3 UCT  # refund exactly 3 UCT to @alice',
+    ],
+    notes: [
+      'Forms without --asset delegate to sphere-sdk AccountingModule.returnAllInvoicePayments — sender addresses come from invoice status\'s senderBalances. This handles masked-predicate sends where the on-chain sender is a per-send one-time DIRECT://.',
+      'Refunds use the :B (back) direction in the memo. The invoice state is NOT terminated — netCovered drops and the invoice can be paid again.',
     ],
   },
   'invoice-receipts': {
@@ -4821,44 +4865,109 @@ async function main(): Promise<void> {
         const invoiceId = await resolveInvoiceId(sphere, idOrPrefix, 'invoice-return');
         const recipientIdx = args.indexOf('--recipient');
         const assetIdx3 = args.indexOf('--asset');
+        const explicitRecipient = recipientIdx !== -1 ? args[recipientIdx + 1] : undefined;
+        const hasAsset = assetIdx3 !== -1;
 
-        if (recipientIdx === -1 || !args[recipientIdx + 1]) {
-          failWithHelp('invoice-return', '--recipient <address> is required');
+        // Three forms, in order of specificity:
+        //   (A) --recipient <addr> --asset <amt> <coin>  → refund EXACTLY this.
+        //   (B) --recipient <addr>                       → refund ALL of that
+        //       sender's attributed balances on this invoice (across coins).
+        //   (C) (no flags)                                → refund EVERY sender's
+        //       attributed balances on this invoice.
+        //
+        // Forms B and C delegate to sphere-sdk's `returnAllInvoicePayments`
+        // (added in sphere-sdk feat/accounting-return-all-invoice-payments),
+        // which iterates `getInvoiceStatus().senderBalances` internally — so
+        // the user doesn't have to fish per-send DIRECT://… addresses out of
+        // invoice status JSON. This particularly matters for masked-predicate
+        // sends, where the on-chain sender address is a one-time DIRECT://…
+        // that the user CANNOT guess from their own wallet identity.
+        //
+        // Recipient addresses (@nametag / chain pubkey / alpha1 / DIRECT://)
+        // are resolved to DIRECT:// here before the SDK call, matching the
+        // pattern `invoice deliver --to` and `invoice create --target`
+        // already use.
+        if (hasAsset && !explicitRecipient) {
+          failWithHelp(
+            'invoice-return',
+            '--asset requires --recipient — refunding a specific amount needs a specific sender. Drop --asset to refund all balances, or add --recipient.',
+          );
         }
 
-        // Canonical asset input (issue #32): --asset <amount> <coin>
-        if (assetIdx3 === -1) {
-          failWithHelp('invoice-return', '--asset <amount> <coin> is required');
-        }
-        const pair = consumeAssetPair(args, assetIdx3 + 1);
-        if (!pair) {
-          failWithHelp('invoice-return', '--asset expects two positional tokens: --asset <amount> <coin>');
-        }
-        // Canonical UX (#32): amount is in HUMAN units (e.g. "100 UCT" = 100
-        // whole UCT). Convert to smallest-unit integer before handing off to
-        // the SDK. Same SDK convention as invoice-create — the
-        // AccountingModule's ReturnPaymentParams.coinId is the symbol
-        // (UCT, USDU, ...), not the 64-char hex.
-        const { symbol: returnSymbol, decimals: returnDecimals } = resolveCoin(pair.coin);
-        let returnSmallest: bigint;
-        try {
-          returnSmallest = toSmallestUnit(pair.amount, returnDecimals);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          failWithHelp('invoice-return', `invalid amount "${pair.amount}" — ${msg}`);
-        }
-        if (returnSmallest <= 0n) {
-          failWithHelp('invoice-return', `invalid amount "${pair.amount}" — must be positive`);
-        }
+        if (hasAsset) {
+          // ----- Form A: explicit recipient + asset -----
+          const pair = consumeAssetPair(args, assetIdx3 + 1);
+          if (!pair) {
+            failWithHelp('invoice-return', '--asset expects two positional tokens: --asset <amount> <coin>');
+          }
+          const { symbol: returnSymbol, decimals: returnDecimals } = resolveCoin(pair.coin);
+          let returnSmallest: bigint;
+          try {
+            returnSmallest = toSmallestUnit(pair.amount, returnDecimals);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            failWithHelp('invoice-return', `invalid amount "${pair.amount}" — ${msg}`);
+          }
+          if (returnSmallest <= 0n) {
+            failWithHelp('invoice-return', `invalid amount "${pair.amount}" — must be positive`);
+          }
 
-        const returnParams: ReturnPaymentParams = {
-          recipient: args[recipientIdx + 1],
-          amount: returnSmallest.toString(),
-          coinId: returnSymbol,
-        };
-
-        const result = await sphere.accounting!.returnInvoicePayment(invoiceId, returnParams);
-        formatOutput({ id: result.id, status: result.status }, 'invoice-return-result', 'Return payment result:');
+          const recipientDirect = await resolveRecipientToDirect(sphere, explicitRecipient!, 'invoice-return');
+          const result = await sphere.accounting!.returnInvoicePayment(invoiceId, {
+            recipient: recipientDirect,
+            amount: returnSmallest.toString(),
+            coinId: returnSymbol,
+          } as ReturnPaymentParams);
+          formatOutput(
+            { id: result.id, status: result.status, recipient: recipientDirect, amount: pair.amount, coin: returnSymbol },
+            'invoice-return-result',
+            'Return payment result:',
+          );
+        } else {
+          // ----- Form B or C: bulk-refund via SDK -----
+          const sdkOptions: { recipient?: string } = {};
+          if (explicitRecipient) {
+            sdkOptions.recipient = await resolveRecipientToDirect(sphere, explicitRecipient, 'invoice-return');
+          }
+          const results = await sphere.accounting!.returnAllInvoicePayments(invoiceId, sdkOptions);
+          if (results.length === 0) {
+            const reason = explicitRecipient
+              ? `no refundable balance for recipient "${explicitRecipient}" on invoice ${invoiceId.slice(0, 16)}…`
+              : `no refundable balance found on invoice ${invoiceId.slice(0, 16)}… — nothing to return`;
+            failWithHelp('invoice-return', reason);
+          }
+          // The SDK returns TransferResult per row but doesn't echo back the
+          // (recipient, amount, coin) tuple — re-attach those from status so
+          // the human renderer can show what got refunded where.
+          const status = await sphere.accounting!.getInvoiceStatus(invoiceId);
+          const refundRows: Array<Record<string, unknown>> = [];
+          let cursor = 0;
+          for (const target of status.targets) {
+            for (const ca of target.coinAssets) {
+              const [coinId] = ca.coin;
+              const { decimals } = resolveCoin(coinId);
+              for (const sb of ca.senderBalances) {
+                // Skip rows that returnAllInvoicePayments wouldn't have
+                // refunded (zero balance, or recipient filter).
+                if (sdkOptions.recipient !== undefined && sb.senderAddress !== sdkOptions.recipient) continue;
+                if (cursor >= results.length) break;
+                const result = results[cursor++];
+                refundRows.push({
+                  id: result.id,
+                  status: result.status,
+                  recipient: sb.senderAddress,
+                  amount: toHumanReadable(sb.netBalance, decimals),
+                  coin: coinId,
+                });
+              }
+            }
+          }
+          formatOutput(
+            { refunds: refundRows } as Record<string, unknown>,
+            'invoice-return-result',
+            'Return payment results:',
+          );
+        }
 
         await syncAfterWrite(sphere);
         await closeSphere();

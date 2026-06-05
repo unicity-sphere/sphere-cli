@@ -39,31 +39,29 @@ jobs:
       - name: Clone sphere-sdk sibling
         # Pin to a specific commit SHA (not a branch name) for supply-chain
         # integrity — a branch pointer can be force-pushed or rebased,
-        # silently changing the code CI builds against. This SHA is the
-        # tip of `integration/all-fixes` after PR #225 (issue-223 cross-
-        # process UXF delivery fix) landed; that branch contains the
-        # CLI-consumed type exports (CreateInvoiceRequest, PayInvoice
-        # Params, encrypt/decrypt helpers, ...) on the public module
-        # surface. Those exports have not yet landed on `main` or in any
-        # published npm version.
+        # silently changing the code CI builds against.
         #
-        # Why the bump: the previous pin (86468103a, tip of
-        # `refactor/extract-cli-to-sphere-cli`) became unreachable to
-        # `git clone` after the refactor branch was deleted from origin —
-        # the commit still exists in the GitHub repo object database but
-        # isn't on any branch tip, so a default `git clone` doesn't fetch
-        # it and `checkout --detach` fails with "unable to read tree".
+        # This SHA is the tip of sphere-sdk `main` ("merge: PR #395 #394
+        # automated CID delivery re-enabled + 512 KiB inline cap + demo
+        # playbook"). That commit exports the symbols `src/shared/sphere-
+        # providers.ts` consumes from `@unicitylabs/sphere-sdk/impl/nodejs`:
+        # `createUxfCarPublisher`, `DEFAULT_IPFS_GATEWAYS`,
+        # `PublishToIpfsCallback`. It also exposes `AccountingModule.
+        # deliverInvoice`, which `invoice-deliver` (PR #18 / issue #226)
+        # calls. Pinning to `main` (rather than the previous integration-
+        # branch tip 02cb4550) avoids the "unable to read tree" failure
+        # when an integration tip is rebased away.
         #
         # Bump this SHA when a new sphere-sdk commit is required; remove
         # this whole workaround once sphere-sdk publishes v0.7.1+ to npm
         # with the post-extraction exports.
         env:
-          SPHERE_SDK_SHA: 02cb4550facae0bea58c3b04aceaf3059599464b
+          SPHERE_SDK_SHA: 3f3dadf9d03eb29db87f062921751f24bfefdec8
         run: |
           git clone https://github.com/unicity-sphere/sphere-sdk.git ../../sphere-sdk
           # The pinned SHA may not be on a branch tip after future merges;
           # fetch it explicitly before checkout so the workflow keeps
-          # working when integration/all-fixes advances past this commit.
+          # working when sphere-sdk main advances past this commit.
           git -C ../../sphere-sdk fetch origin "$SPHERE_SDK_SHA" || true
           git -C ../../sphere-sdk checkout --detach "$SPHERE_SDK_SHA"
 

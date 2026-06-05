@@ -37,6 +37,9 @@ const LEGACY_NAMESPACES = new Set([
   // sphere-sdk → @unicity-sphere/cli extraction. `wallet init` / `wallet
   // status` map to the same legacy backing case via buildLegacyArgv.
   'init', 'status', 'clear',
+  // Issue #32 Pass C: route `sphere help <cmd>` to the legacy dispatcher
+  // so the COMMAND_HELP registry powers detailed per-command help.
+  'help',
 ]);
 
 // Phase 4 namespaces — DM-native, not yet implemented.
@@ -89,6 +92,11 @@ export function buildLegacyArgv(namespace: string, tail: string[] = process.argv
     case 'init':   return ['init',   ...tail];
     case 'status': return ['status', ...tail];
     case 'clear':  return ['clear',  ...tail];
+
+    // Issue #32: `sphere help <cmd>` and `sphere help <cmd> <sub>` —
+    // the legacy dispatcher recognises 'help' as a top-level command
+    // and prints the COMMAND_HELP entry for the rest of the tail.
+    case 'help':   return ['help',   ...tail];
 
     // faucet → legacy 'topup'
     case 'faucet': return ['topup', ...tail];
@@ -158,6 +166,12 @@ export function createCli(): Command {
       .description(`${name} commands (legacy bridge — phase 2)`);
 
     sub.allowUnknownOption(true);
+    // Issue #32 Pass C: forward `--help` / `-h` to the legacy dispatcher
+    // so per-command help blocks (e.g. `sphere invoice create --help`,
+    // `sphere swap propose --help`) print the full COMMAND_HELP entry
+    // instead of commander's thin namespace stub. The top-level
+    // `sphere --help` still works via the root command.
+    sub.helpOption(false);
     sub.action(async () => {
       const legacyArgv = buildLegacyArgv(name);
       // Dynamic import keeps the legacy ~40-file dispatcher out of the hot

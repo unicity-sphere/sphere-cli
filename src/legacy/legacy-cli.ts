@@ -89,6 +89,324 @@ let args: string[] = [];
 let command: string | undefined;
 
 // =============================================================================
+// Output formatting (issue #32)
+// =============================================================================
+//
+// Canonical UX rule (no legacy): default output is a human-friendly labelled
+// block. `--json` is the opt-in machine-readable mode. Helpers below render
+// SDK payloads in either form via `formatOutput()`.
+
+/** True iff `--json` appeared anywhere in the command-line args. */
+let jsonMode = false;
+
+type OutputShape =
+  | 'identity'
+  | 'invoice-terms'
+  | 'invoice-status'
+  | 'invoice-create-result'
+  | 'invoice-import-result'
+  | 'invoice-pay-result'
+  | 'invoice-return-result'
+  | 'invoice-receipts-result'
+  | 'invoice-notices-result'
+  | 'invoice-auto-return'
+  | 'invoice-transfers'
+  | 'invoice-memo'
+  | 'transfer-result'
+  | 'swap-result'
+  | 'swap-status'
+  | 'swap-ping'
+  | 'config'
+  | 'nametag-info'
+  | 'encrypt-result'
+  | 'wallet-info'
+  | 'parse-wallet-result'
+  | 'parse-wallet-tokens'
+  | 'generate-key'
+  | 'validate-key'
+  | 'generic';
+
+/**
+ * Render a payload for human consumption (default) or as JSON (`--json`).
+ *
+ * Always writes to stdout. The label is printed once above the block when
+ * provided (matches the existing "Invoice Status:" / "Auto-return settings:"
+ * pattern that was paired with the old `JSON.stringify` calls).
+ */
+function formatOutput(payload: unknown, shape: OutputShape, label?: string): void {
+  if (jsonMode) {
+    if (label) console.log(label);
+    console.log(JSON.stringify(payload, null, 2));
+    return;
+  }
+  if (label) console.log(label);
+  renderHuman(payload, shape);
+}
+
+function renderHuman(payload: unknown, shape: OutputShape): void {
+  switch (shape) {
+    case 'identity': return renderIdentity(payload as Record<string, unknown>);
+    case 'invoice-terms': return renderInvoiceTerms(payload);
+    case 'invoice-status': return renderInvoiceStatus(payload);
+    case 'invoice-create-result': return renderInvoiceCreateResult(payload as Record<string, unknown>);
+    case 'invoice-import-result': return renderInvoiceTerms(payload);
+    case 'invoice-pay-result':
+    case 'invoice-return-result': return renderIdStatusResult(payload as Record<string, unknown>);
+    case 'invoice-receipts-result':
+    case 'invoice-notices-result': return renderDeliveryResult(payload as Record<string, unknown>);
+    case 'invoice-auto-return': return renderAutoReturn(payload as Record<string, unknown>);
+    case 'invoice-transfers': return renderInvoiceTransfers(payload as unknown[]);
+    case 'invoice-memo': return renderInvoiceMemo(payload as Record<string, unknown>);
+    case 'transfer-result': return renderIdStatusResult(payload as Record<string, unknown>);
+    case 'swap-result': return renderSwapResult(payload as Record<string, unknown>);
+    case 'swap-status': return renderSwapStatus(payload as Record<string, unknown>);
+    case 'swap-ping': return renderSwapPing(payload as Record<string, unknown>);
+    case 'config': return renderKvBlock(payload as Record<string, unknown>);
+    case 'nametag-info': return renderKvBlock(payload as Record<string, unknown>);
+    case 'encrypt-result': return renderKvBlock(payload as Record<string, unknown>);
+    case 'wallet-info': return renderKvBlock(payload as Record<string, unknown>);
+    case 'parse-wallet-result': return renderParseWalletResult(payload as Record<string, unknown>);
+    case 'parse-wallet-tokens': return renderKvBlock(payload as Record<string, unknown>);
+    case 'generate-key': return renderKvBlock(payload as Record<string, unknown>);
+    case 'validate-key': return renderKvBlock(payload as Record<string, unknown>);
+    case 'generic':
+    default:
+      return renderGeneric(payload);
+  }
+}
+
+function renderKvBlock(obj: Record<string, unknown> | null | undefined, indent = 2): void {
+  if (!obj || typeof obj !== 'object') {
+    console.log(`${' '.repeat(indent)}${String(obj)}`);
+    return;
+  }
+  const entries = Object.entries(obj).filter(([, v]) => v !== undefined);
+  if (entries.length === 0) {
+    console.log(`${' '.repeat(indent)}(empty)`);
+    return;
+  }
+  const maxKeyLen = Math.max(...entries.map(([k]) => k.length));
+  const pad = ' '.repeat(indent);
+  for (const [k, v] of entries) {
+    if (v === null) {
+      console.log(`${pad}${k.padEnd(maxKeyLen)} : (null)`);
+    } else if (Array.isArray(v)) {
+      if (v.length === 0) {
+        console.log(`${pad}${k.padEnd(maxKeyLen)} : (none)`);
+      } else if (v.every(item => typeof item !== 'object' || item === null)) {
+        console.log(`${pad}${k.padEnd(maxKeyLen)} : ${v.join(', ')}`);
+      } else {
+        console.log(`${pad}${k.padEnd(maxKeyLen)} :`);
+        for (let i = 0; i < v.length; i++) {
+          console.log(`${pad}  [${i}]`);
+          renderKvBlock(v[i] as Record<string, unknown>, indent + 4);
+        }
+      }
+    } else if (typeof v === 'object') {
+      console.log(`${pad}${k.padEnd(maxKeyLen)} :`);
+      renderKvBlock(v as Record<string, unknown>, indent + 2);
+    } else {
+      console.log(`${pad}${k.padEnd(maxKeyLen)} : ${String(v)}`);
+    }
+  }
+}
+
+function renderIdentity(id: Record<string, unknown>): void {
+  // Field order chosen to surface the most-used identifiers first.
+  // Keep the JSON keys as labels so existing operator muscle memory
+  // (and integration tests that look for `l1Address`/`directAddress`/
+  // `chainPubkey` substrings) keeps working under the human format.
+  const fields: Array<[string, unknown]> = [
+    ['l1Address',     id.l1Address ?? '(n/a)'],
+    ['directAddress', id.directAddress ?? '(n/a)'],
+    ['chainPubkey',   id.chainPubkey ?? '(n/a)'],
+    ['nametag',       id.nametag ? `@${id.nametag}` : '(none)'],
+  ];
+  const maxLen = Math.max(...fields.map(([k]) => k.length));
+  for (const [k, v] of fields) {
+    console.log(`  ${k.padEnd(maxLen)} : ${String(v)}`);
+  }
+}
+
+function renderInvoiceTerms(payload: unknown): void {
+  const p = payload as Record<string, unknown>;
+  // Both createInvoice() and importInvoice() return an object with
+  // `invoiceId`, `terms`, and an optional `confirmed` flag.
+  const invoiceId = (p.invoiceId ?? p.id) as string | undefined;
+  const terms = (p.terms ?? p) as Record<string, unknown>;
+  const confirmed = p.confirmed;
+  if (invoiceId) console.log(`  invoiceId : ${invoiceId}`);
+  if (confirmed !== undefined) console.log(`  confirmed : ${confirmed}`);
+  if (terms?.memo) console.log(`  memo      : ${terms.memo}`);
+  if (terms?.dueDate) {
+    const ts = Number(terms.dueDate);
+    if (!Number.isNaN(ts) && ts > 0) {
+      console.log(`  dueDate   : ${new Date(ts).toISOString()}`);
+    }
+  }
+  if (Array.isArray(terms?.targets)) {
+    console.log(`  targets   : (${(terms.targets as unknown[]).length})`);
+    for (let i = 0; i < (terms.targets as unknown[]).length; i++) {
+      const t = (terms.targets as Array<Record<string, unknown>>)[i];
+      console.log(`    [${i}] address: ${t.address ?? '(missing)'}`);
+      if (Array.isArray(t.assets)) {
+        for (const a of t.assets as Array<Record<string, unknown>>) {
+          if (Array.isArray(a.coin)) {
+            const [coinId, amount] = a.coin as [string, string];
+            console.log(`         coin: ${amount} ${coinId}`);
+          } else if (a.nft && typeof a.nft === 'object') {
+            console.log(`         nft:  ${(a.nft as Record<string, unknown>).tokenId ?? '(no tokenId)'}`);
+          }
+        }
+      }
+    }
+  }
+}
+
+function renderInvoiceStatus(payload: unknown): void {
+  const p = payload as Record<string, unknown>;
+  console.log(`  invoiceId : ${p.invoiceId ?? '(unknown)'}`);
+  console.log(`  state     : ${p.state ?? '(unknown)'}`);
+  if (p.cancelled !== undefined) console.log(`  cancelled : ${p.cancelled}`);
+  if (p.closed !== undefined)    console.log(`  closed    : ${p.closed}`);
+  if (p.expiredAt) console.log(`  expiredAt : ${p.expiredAt}`);
+  if (Array.isArray(p.perTarget)) {
+    console.log(`  perTarget :`);
+    for (let i = 0; i < (p.perTarget as unknown[]).length; i++) {
+      const t = (p.perTarget as Array<Record<string, unknown>>)[i];
+      console.log(`    [${i}] address: ${t.address ?? '(missing)'}`);
+      if (Array.isArray(t.assets)) {
+        for (const a of t.assets as Array<Record<string, unknown>>) {
+          const requested = a.requested ?? '?';
+          const received  = a.received  ?? '?';
+          const label = a.coinId ? `coin ${a.coinId}` : (a.tokenId ? `nft  ${a.tokenId}` : 'asset');
+          console.log(`         ${label}: received ${received} / requested ${requested}`);
+        }
+      }
+    }
+  }
+}
+
+function renderInvoiceCreateResult(p: Record<string, unknown>): void {
+  // createInvoice() returns { invoiceId, terms, confirmed }
+  renderInvoiceTerms(p);
+}
+
+function renderIdStatusResult(p: Record<string, unknown>): void {
+  console.log(`  id     : ${p.id ?? '(unknown)'}`);
+  console.log(`  status : ${p.status ?? '(unknown)'}`);
+  if (p.error) console.log(`  error  : ${p.error}`);
+  if (p.txHash) console.log(`  txHash : ${p.txHash}`);
+}
+
+function renderDeliveryResult(p: Record<string, unknown>): void {
+  // sendInvoiceReceipts / sendCancellationNotices return arrays of attempts.
+  if (Array.isArray(p)) {
+    for (let i = 0; i < p.length; i++) {
+      console.log(`  [${i}]`);
+      renderKvBlock(p[i] as Record<string, unknown>, 4);
+    }
+    return;
+  }
+  renderKvBlock(p);
+}
+
+function renderAutoReturn(p: Record<string, unknown>): void {
+  if (p.globalEnabled !== undefined) console.log(`  globalEnabled : ${p.globalEnabled}`);
+  if (Array.isArray(p.overrides)) {
+    console.log(`  overrides    : (${(p.overrides as unknown[]).length})`);
+    for (const o of p.overrides as Array<Record<string, unknown>>) {
+      console.log(`    ${o.invoiceId} -> ${o.enabled}`);
+    }
+  } else {
+    renderKvBlock(p);
+  }
+}
+
+function renderInvoiceTransfers(arr: unknown[]): void {
+  if (!Array.isArray(arr) || arr.length === 0) {
+    console.log('  (none)');
+    return;
+  }
+  for (let i = 0; i < arr.length; i++) {
+    const t = arr[i] as Record<string, unknown>;
+    console.log(`  [${i}]`);
+    if (t.direction) console.log(`    direction : ${t.direction}`);
+    if (t.id)        console.log(`    id        : ${t.id}`);
+    if (t.status)    console.log(`    status    : ${t.status}`);
+    if (t.amount)    console.log(`    amount    : ${t.amount}`);
+    if (t.coinId)    console.log(`    coinId    : ${t.coinId}`);
+    if (t.timestamp) console.log(`    timestamp : ${new Date(Number(t.timestamp)).toISOString()}`);
+  }
+}
+
+function renderInvoiceMemo(p: Record<string, unknown>): void {
+  renderKvBlock(p);
+}
+
+function renderSwapResult(p: Record<string, unknown>): void {
+  console.log(`  swapId  : ${p.swapId ?? '(unknown)'}`);
+  if (p.role)     console.log(`  role    : ${p.role}`);
+  if (p.deal && typeof p.deal === 'object') {
+    console.log(`  deal    :`);
+    renderKvBlock(p.deal as Record<string, unknown>, 4);
+  }
+}
+
+function renderSwapStatus(p: Record<string, unknown>): void {
+  console.log(`  swapId   : ${p.swapId ?? '(unknown)'}`);
+  if (p.progress) console.log(`  progress : ${p.progress}`);
+  if (p.role)     console.log(`  role     : ${p.role}`);
+  if (p.deal && typeof p.deal === 'object') {
+    console.log(`  deal     :`);
+    renderKvBlock(p.deal as Record<string, unknown>, 4);
+  }
+  if (p.cancelReason) console.log(`  cancelReason : ${p.cancelReason}`);
+}
+
+function renderSwapPing(p: Record<string, unknown>): void {
+  renderKvBlock(p);
+}
+
+function renderParseWalletResult(p: Record<string, unknown>): void {
+  // parse-wallet may return either raw text/dat structure or a {wallet, tokens} shape.
+  if (p.wallet) {
+    console.log('  wallet :');
+    renderKvBlock(p.wallet as Record<string, unknown>, 4);
+  }
+  if (Array.isArray(p.tokens)) {
+    console.log(`  tokens : (${(p.tokens as unknown[]).length})`);
+  }
+  if (p.wallet === undefined && !Array.isArray(p.tokens)) {
+    renderKvBlock(p);
+  }
+}
+
+function renderGeneric(payload: unknown): void {
+  if (payload === null || payload === undefined) {
+    console.log('  (none)');
+    return;
+  }
+  if (Array.isArray(payload)) {
+    if (payload.length === 0) { console.log('  (none)'); return; }
+    if (payload.every(v => typeof v !== 'object' || v === null)) {
+      for (const v of payload) console.log(`  - ${String(v)}`);
+      return;
+    }
+    for (let i = 0; i < payload.length; i++) {
+      console.log(`  [${i}]`);
+      renderKvBlock(payload[i] as Record<string, unknown>, 4);
+    }
+    return;
+  }
+  if (typeof payload === 'object') {
+    renderKvBlock(payload as Record<string, unknown>);
+    return;
+  }
+  console.log(`  ${String(payload)}`);
+}
+
+// =============================================================================
 // CLI Configuration
 // =============================================================================
 
@@ -409,21 +727,55 @@ function resolveCoin(identifier: string): { coinId: string; symbol: string; deci
 }
 
 /**
- * Parse an asset argument in "<amount> <symbol>" format.
- * Examples: "1000000 UCT", "10.5 BTC", "500000 USDU"
- */
-/**
  * Resolve a swap ID prefix to a full 64-char swap ID.
  * Accepts full IDs or unique prefixes (like invoice commands do).
  */
 
-function parseAssetArg(value: string): { amount: string; coin: string } {
-  const parts = value.trim().split(/\s+/);
-  if (parts.length !== 2) {
-    console.error(`Invalid asset format: "${value}". Expected "<amount> <symbol>" (e.g., "1000000 UCT")`);
-    process.exit(1);
+/**
+ * Resolve an invoice id-or-prefix to its canonical 64-char ID.
+ *
+ * Loads the wallet's invoice list, picks the unique match by prefix, and
+ * raises a help-formatted error if zero or multiple invoices match. Use
+ * from any `invoice-*` handler that takes `<id-or-prefix>` as its first
+ * positional arg.
+ */
+async function resolveInvoiceId(sphere: Sphere, idOrPrefix: string, cmdName: string): Promise<string> {
+  const accounting = sphere.accounting;
+  if (!accounting) {
+    failWithHelp(cmdName, 'accounting module not enabled — initialize with accounting support');
   }
-  return { amount: parts[0], coin: parts[1] };
+  const allInvoices = await accounting.getInvoices();
+  const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+  if (matched.length === 0) {
+    failWithHelp(cmdName, `no invoice found matching prefix: ${idOrPrefix}`);
+  }
+  if (matched.length > 1) {
+    failWithHelp(cmdName, `ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices — use more characters`);
+  }
+  return matched[0].invoiceId;
+}
+
+/**
+ * Canonical asset-pair parser (issue #32).
+ *
+ * Reads `args[startIdx]` as the amount and `args[startIdx + 1]` as the
+ * coin symbol. Returns `null` if either slot is missing or looks like the
+ * next flag (`--…`). No legacy quoted-string form — every command takes
+ * `--asset <amount> <coin>` (or `--offer / --want / --recipient-asset`).
+ *
+ * Caller is responsible for surfacing the failure via `failWithHelp()` so
+ * the full help block is printed (Pass E rule). This helper does not
+ * exit on failure.
+ */
+function consumeAssetPair(
+  argv: string[],
+  startIdx: number,
+): { amount: string; coin: string } | null {
+  const amount = argv[startIdx];
+  const coin = argv[startIdx + 1];
+  if (!amount || amount.startsWith('--')) return null;
+  if (!coin || coin.startsWith('--')) return null;
+  return { amount, coin };
 }
 
 /** Map common symbols to faucet coin names. */
@@ -1073,11 +1425,11 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
 
   // --- INVOICES ---
   'invoice-create': {
-    usage: 'invoice-create --target <address> --asset "<amount> <coin>" [options]',
-    description: 'Create a new invoice by specifying a target address and requested payment. Alternatively, load full terms from a JSON file with --terms. The invoice is minted as an on-chain token.',
+    usage: 'invoice-create --target <address> --asset <amount> <coin> [--asset <amount> <coin>...] [options]',
+    description: 'Create a new invoice by specifying a target address and requested payment(s). Use multiple --asset flags for multi-asset invoices. Alternatively, load full terms from a JSON file with --terms. The invoice is minted as an on-chain token.',
     flags: [
       { flag: '--target <address>', description: 'Target address (@nametag or DIRECT:// address) (required unless --terms)' },
-      { flag: '--asset "<amount> <coin>"', description: 'Requested asset in "<amount> <symbol>" format (e.g., "1000000 UCT")' },
+      { flag: '--asset <amount> <coin>', description: 'Requested asset — two positional tokens (e.g., --asset 1000000 UCT). May repeat for multi-asset invoices.' },
       { flag: '--nft <id>', description: 'Request a specific NFT by token ID (instead of coin+amount)' },
       { flag: '--due <ISO-date>', description: 'Due date in ISO-8601 format (e.g., 2026-12-31)' },
       { flag: '--memo <text>', description: 'Invoice memo text' },
@@ -1085,12 +1437,14 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       { flag: '--terms <json-file>', description: 'Load full CreateInvoiceRequest from a JSON file (overrides other flags)' },
     ],
     examples: [
-      'npm run cli -- invoice-create --target @alice --asset "1000000 UCT"',
-      'npm run cli -- invoice-create --target @alice --asset "500000 BTC" --memo "Order #42" --due 2026-12-31',
-      'npm run cli -- invoice-create --terms invoice-terms.json',
+      'sphere invoice create --target @alice --asset 1000000 UCT',
+      'sphere invoice create --target @alice --asset 500000 BTC --memo "Order #42" --due 2026-12-31',
+      'sphere invoice create --target @alice --asset 1000000 UCT --asset 500000 USDU',
+      'sphere invoice create --terms invoice-terms.json',
     ],
     notes: [
-      'Amounts must be positive integers in smallest units (no decimals, no leading zeros).',
+      'Asset amounts must be positive integers in smallest units (no decimals, no leading zeros).',
+      'Asset syntax is two positional tokens: --asset <amount> <coin>. No quoted compound form ("legacy") is accepted.',
     ],
   },
   'invoice-import': {
@@ -1098,6 +1452,21 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     description: 'Import an invoice from a TXF token JSON file. Parses the invoice terms from the token data and adds it to local tracking.',
     examples: [
       'npm run cli -- invoice-import ./received-invoice.json',
+    ],
+  },
+  'invoice-deliver': {
+    usage: 'invoice-deliver <id-or-prefix> [--to <recipient>...] [--memo <text>]',
+    description: 'Ship a previously-minted invoice to its targets (default) or to an explicit recipient list. Packages the invoice token into a UXF bundle and sends it inside a NIP-17 DM. Returns per-recipient outcome.',
+    flags: [
+      { flag: '--to <recipient>', description: 'Explicit recipient (@nametag, chain pubkey, or DIRECT:// address). Repeatable. When omitted, delivers to every non-self target from the invoice terms.' },
+      { flag: '--memo <text>', description: 'Optional memo accompanying the delivery DM' },
+    ],
+    examples: [
+      'sphere invoice deliver a1b2c3d4',
+      'sphere invoice deliver a1b2c3d4 --to @alice --to @charlie --memo "Q3 invoice"',
+    ],
+    notes: [
+      'Exits 2 (not 1) when some recipients failed but at least one succeeded — useful so scripts can distinguish partial vs total failure.',
     ],
   },
   'invoice-list': {
@@ -1154,14 +1523,14 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     ],
   },
   'invoice-return': {
-    usage: 'invoice-return <id-or-prefix> --recipient <address> --asset "<amount> <coin>"',
+    usage: 'invoice-return <id-or-prefix> --recipient <address> --asset <amount> <coin>',
     description: 'Manually return a payment to a sender for a specific invoice.',
     flags: [
       { flag: '--recipient <address>', description: 'Recipient address or @nametag (required)' },
-      { flag: '--asset "<amount> <coin>"', description: 'Asset to return in "<amount> <symbol>" format (e.g., "100000 UCT")' },
+      { flag: '--asset <amount> <coin>', description: 'Asset to return — two positional tokens (e.g., --asset 100000 UCT). Amount is in smallest units.' },
     ],
     examples: [
-      'npm run cli -- invoice-return a1b2c3d4 --recipient @bob --asset "100000 UCT"',
+      'sphere invoice return a1b2c3d4 --recipient @bob --asset 100000 UCT',
     ],
   },
   'invoice-receipts': {
@@ -1216,22 +1585,23 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
 
   // --- SWAPS ---
   'swap-propose': {
-    usage: 'swap-propose --to <recipient> --offer "<amount> <coin>" --want "<amount> <coin>" [options]',
+    usage: 'swap-propose --to <recipient> --offer <amount> <coin> --want <amount> <coin> [options]',
     description: 'Propose a token swap deal to a counterparty. Both parties deposit tokens into an escrow, which executes the swap atomically.',
     flags: [
       { flag: '--to <recipient>', description: 'Counterparty @nametag or address (required)' },
-      { flag: '--offer "<amount> <coin>"', description: 'Asset you are offering (e.g., "10 BTC", "0.5 ETH")' },
-      { flag: '--want "<amount> <coin>"', description: 'Asset you want in return (e.g., "100 USDU", "5 UCT")' },
+      { flag: '--offer <amount> <coin>', description: 'Asset you are offering — two positional tokens (e.g., --offer 10 BTC)' },
+      { flag: '--want <amount> <coin>',  description: 'Asset you want in return — two positional tokens (e.g., --want 100 USDU)' },
       { flag: '--escrow <address>', description: 'Custom escrow address (optional, uses config default)' },
       { flag: '--timeout <seconds>', description: 'Swap timeout in seconds (60-86400)', default: '3600' },
       { flag: '--message <text>', description: 'Optional message to the counterparty' },
     ],
     examples: [
-      'npm run cli -- swap-propose --to @bob --offer "10 UCT" --want "5 USDU"',
-      'npm run cli -- swap-propose --to @bob --offer "1 BTC" --want "10 ETH" --timeout 7200 --message "Quick trade?"',
+      'sphere swap propose --to @bob --offer 10 UCT --want 5 USDU',
+      'sphere swap propose --to @bob --offer 1 BTC --want 10 ETH --timeout 7200 --message "Quick trade?"',
     ],
     notes: [
       'Amounts are in human-readable units (e.g., "10 BTC" = 10 whole BTC). Decimals are supported (e.g., "0.5 ETH").',
+      '--offer and --want each consume the next two positional tokens. No quoted compound form ("legacy") is accepted.',
     ],
   },
   'swap-list': {
@@ -1499,9 +1869,59 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       'npm run cli -- base58-decode 2NEpo7TZRhna',
     ],
   },
+
+  // --- META ---
+  'completions': {
+    usage: 'completions <bash|zsh|fish>',
+    description: 'Generate a shell completion script for tab-completion of sphere commands and flags. Pipe the output into the shell completion directory of your choice.',
+    flags: [
+      { flag: '<shell>', description: 'Target shell — one of: bash, zsh, fish' },
+    ],
+    examples: [
+      'sphere completions bash > ~/.local/share/bash-completion/completions/sphere',
+      'sudo sh -c "sphere completions bash > /etc/bash_completion.d/sphere"',
+      'sphere completions zsh > ~/.zsh/completions/_sphere',
+      'sphere completions fish > ~/.config/fish/completions/sphere.fish',
+    ],
+    notes: [
+      'After installing, re-source your shell rc (e.g., `source ~/.bashrc`) or open a new terminal.',
+      'See README.md "Shell completion" section for a no-sudo install path.',
+    ],
+  },
+  'help': {
+    usage: 'help [command]',
+    description: 'Show the top-level usage summary, or detailed help for a specific command. Equivalent to "sphere <command> --help".',
+    examples: [
+      'sphere help',
+      'sphere help send',
+      'sphere help invoice create',
+    ],
+  },
 };
 
-function printCommandHelp(cmdName: string): void {
+/**
+ * Print "Error: <msg>" + full help block for `cmdName`, then exit 1.
+ *
+ * Issue #32 Pass E rule: invalid input never produces a one-line "Usage: …"
+ * stub. We always show the full help block for the closest matching
+ * subcommand so the operator sees the flags, examples, and notes inline.
+ *
+ * Falls back to a bare error if no help entry exists for `cmdName`. The
+ * fallback should never fire in practice because every dispatched command
+ * has a COMMAND_HELP entry — if you hit it, add the missing entry.
+ */
+function failWithHelp(cmdName: string, errorMsg: string): never {
+  console.error(`Error: ${errorMsg}\n`);
+  const help = COMMAND_HELP[cmdName];
+  if (help) {
+    printCommandHelpToStderr(cmdName);
+  } else {
+    console.error(`(no detailed help registered for "${cmdName}" — please file an issue)`);
+  }
+  process.exit(1);
+}
+
+function printCommandHelp(cmdName: string, sink: (line: string) => void = console.log): void {
   const help = COMMAND_HELP[cmdName];
   if (!help) {
     console.error(`No help available for command: ${cmdName}`);
@@ -1509,35 +1929,45 @@ function printCommandHelp(cmdName: string): void {
     process.exit(1);
   }
 
-  console.log(`\n  ${cmdName}\n`);
-  console.log(`  Usage: npm run cli -- ${help.usage}\n`);
-  console.log(`  ${help.description}\n`);
+  sink(`\n  ${cmdName}\n`);
+  sink(`  Usage: npm run cli -- ${help.usage}\n`);
+  sink(`  ${help.description}\n`);
 
   if (help.flags && help.flags.length > 0) {
-    console.log('  Flags:');
+    sink('  Flags:');
     const maxFlagLen = Math.max(...help.flags.map(f => f.flag.length));
     for (const f of help.flags) {
       const defaultStr = f.default ? ` (default: ${f.default})` : '';
-      console.log(`    ${f.flag.padEnd(maxFlagLen + 2)}${f.description}${defaultStr}`);
+      sink(`    ${f.flag.padEnd(maxFlagLen + 2)}${f.description}${defaultStr}`);
     }
-    console.log('');
+    sink('');
   }
 
+  // Universal flags — apply to every command (issue #32 Pass A + Pass C).
+  sink('  Universal flags:');
+  sink('    --json        Emit raw JSON (default is human-friendly labelled output)');
+  sink('    --help, -h    Show this help block');
+  sink('');
+
   if (help.examples.length > 0) {
-    console.log('  Examples:');
+    sink('  Examples:');
     for (const ex of help.examples) {
-      console.log(`    ${ex}`);
+      sink(`    ${ex}`);
     }
-    console.log('');
+    sink('');
   }
 
   if (help.notes && help.notes.length > 0) {
-    console.log('  Notes:');
+    sink('  Notes:');
     for (const note of help.notes) {
-      console.log(`    - ${note}`);
+      sink(`    - ${note}`);
     }
-    console.log('');
+    sink('');
   }
+}
+
+function printCommandHelpToStderr(cmdName: string): void {
+  printCommandHelp(cmdName, (line) => process.stderr.write(`${line}\n`));
 }
 
 function printUsage() {
@@ -1706,6 +2136,9 @@ async function main(): Promise<void> {
   // Global flag: --no-nostr disables Nostr transport (uses no-op)
   noNostrGlobal = args.includes('--no-nostr');
 
+  // Universal global flags (issue #32 Pass A): --json toggles output mode.
+  jsonMode = args.includes('--json');
+
   if (!command || command === '--help' || command === '-h') {
     printUsage();
     process.exit(0);
@@ -1725,6 +2158,24 @@ async function main(): Promise<void> {
       printCommandHelp(helpTarget);
     } else {
       console.error(`No help available for command: ${helpTarget}`);
+      console.error('Run "npm run cli -- help" for a list of all commands.');
+      process.exit(1);
+    }
+    process.exit(0);
+  }
+
+  // Issue #32 Pass C: `--help` / `-h` works for any command/subcommand.
+  // Sub-subcommand keys ("wallet create", "daemon start") match first;
+  // fall back to the top-level command key. Help is printed to stdout so
+  // operators can pipe it.
+  if (args.includes('--help') || args.includes('-h')) {
+    const compoundKey = args[1] ? `${command} ${args[1]}` : undefined;
+    if (compoundKey && COMMAND_HELP[compoundKey]) {
+      printCommandHelp(compoundKey);
+    } else if (COMMAND_HELP[command]) {
+      printCommandHelp(command);
+    } else {
+      console.error(`No help available for command: ${command}`);
       console.error('Run "npm run cli -- help" for a list of all commands.');
       process.exit(1);
     }
@@ -1787,13 +2238,12 @@ async function main(): Promise<void> {
         }
 
         console.log('\nWallet initialized successfully!\n');
-        console.log('Identity:');
-        console.log(JSON.stringify({
+        formatOutput({
           l1Address: identity.l1Address,
           directAddress: identity.directAddress,
           chainPubkey: identity.chainPubkey,
           nametag: identity.nametag,
-        }, null, 2));
+        }, 'identity', 'Identity:');
 
         if (!mnemonic) {
           // Show generated mnemonic for backup — only when stdout is a TTY.
@@ -1876,15 +2326,12 @@ async function main(): Promise<void> {
           } else if (key === 'tokensDir') {
             config.tokensDir = value;
           } else {
-            console.error('Unknown config key:', key);
-            console.error('Valid keys: network, dataDir, tokensDir');
-            process.exit(1);
+            failWithHelp('config', `Unknown config key: "${key}" (valid keys: network, dataDir, tokensDir)`);
           }
           saveConfig(config);
           console.log(`Set ${key} = ${value}`);
         } else {
-          console.log('\nCurrent Configuration:');
-          console.log(JSON.stringify(config, null, 2));
+          formatOutput(config as unknown as Record<string, unknown>, 'config', '\nCurrent Configuration:');
         }
         break;
       }
@@ -1976,9 +2423,7 @@ async function main(): Promise<void> {
 
           case 'use': {
             if (!profileName) {
-              console.error('Usage: wallet use <name>');
-              console.error('Example: npm run cli -- wallet use babaika9');
-              process.exit(1);
+              failWithHelp('wallet use', 'missing required <name> argument');
             }
 
             if (switchToProfile(profileName)) {
@@ -2007,29 +2452,22 @@ async function main(): Promise<void> {
                 console.error('  (wallet not initialized in this profile)');
               }
             } else {
-              console.error(`Profile "${profileName}" not found.`);
-              console.error('Run: npm run cli -- wallet list');
-              process.exit(1);
+              failWithHelp('wallet use', `profile "${profileName}" not found — run: sphere wallet list`);
             }
             break;
           }
 
           case 'create': {
             if (!profileName) {
-              console.error('Usage: wallet create <name> [--network testnet|mainnet|dev]');
-              console.error('Example: npm run cli -- wallet create mywalletname');
-              process.exit(1);
+              failWithHelp('wallet create', 'missing required <name> argument');
             }
             if (!/^[a-zA-Z0-9_-]+$/.test(profileName)) {
-              console.error('Profile name must contain only letters, digits, hyphens, and underscores.');
-              process.exit(1);
+              failWithHelp('wallet create', 'profile name must contain only letters, digits, hyphens, and underscores');
             }
 
             // Check if profile already exists
             if (getProfile(profileName)) {
-              console.error(`Profile "${profileName}" already exists.`);
-              console.error('Run: npm run cli -- wallet use ' + profileName);
-              process.exit(1);
+              failWithHelp('wallet create', `profile "${profileName}" already exists — run: sphere wallet use ${profileName}`);
             }
 
             // Parse optional network
@@ -2106,22 +2544,19 @@ async function main(): Promise<void> {
 
           case 'delete': {
             if (!profileName) {
-              console.error('Usage: wallet delete <name>');
-              process.exit(1);
+              failWithHelp('wallet delete', 'missing required <name> argument');
             }
 
             const config = loadConfig();
             if (config.currentProfile === profileName) {
-              console.error(`Cannot delete the current profile. Switch to another profile first.`);
-              process.exit(1);
+              failWithHelp('wallet delete', 'cannot delete the current profile — switch to another profile first');
             }
 
             if (deleteProfile(profileName)) {
               console.log(`✓ Deleted profile: ${profileName}`);
               console.log('Note: Wallet data directory was NOT deleted. Remove manually if needed.');
             } else {
-              console.error(`Profile "${profileName}" not found.`);
-              process.exit(1);
+              failWithHelp('wallet delete', `profile "${profileName}" not found`);
             }
             break;
           }
@@ -2324,15 +2759,7 @@ async function main(): Promise<void> {
           }
 
           default:
-            console.error('Unknown wallet subcommand:', subCmd);
-            console.log('\nUsage:');
-            console.log('  wallet list              List all profiles');
-            console.log('  wallet use <name>        Switch to profile');
-            console.log('  wallet create <name>     Create new profile');
-            console.log('  wallet current           Show current profile');
-            console.log('  wallet delete <name>     Delete profile');
-            console.log('  wallet migrate [--apply] Import legacy wallet into Profile storage');
-            process.exit(1);
+            failWithHelp('wallet', `unknown wallet subcommand: "${subCmd}"`);
         }
         break;
       }
@@ -2492,12 +2919,7 @@ async function main(): Promise<void> {
       case 'asset-info': {
         const identifier = args[1];
         if (!identifier) {
-          console.error('Usage: asset-info <symbol|name|coinId>');
-          console.error('Examples:');
-          console.error('  npm run cli -- asset-info UCT');
-          console.error('  npm run cli -- asset-info bitcoin');
-          console.error('  npm run cli -- asset-info 0a1b2c3d...');
-          process.exit(1);
+          failWithHelp('asset-info', 'missing required <symbol|name|coinId> argument');
         }
 
         // Initialize Sphere so TokenRegistry is loaded
@@ -2510,9 +2932,7 @@ async function main(): Promise<void> {
         if (!def) def = registry.getDefinition(identifier); // by coinId hex
 
         if (!def) {
-          console.error(`Asset not found: "${identifier}"`);
-          console.error('Use "assets" command to list all registered assets.');
-          process.exit(1);
+          failWithHelp('asset-info', `asset not found: "${identifier}" — use "sphere assets" to list registered assets`);
         }
 
         console.log('');
@@ -2541,8 +2961,7 @@ async function main(): Promise<void> {
         const sphere = await getSphere();
 
         if (!sphere.payments.l1) {
-          console.error('L1 module not available. Initialize with L1 config.');
-          process.exit(1);
+          failWithHelp('l1-balance', 'L1 module not available — initialize with L1 config');
         }
 
         const balance = await sphere.payments.l1.getBalance();
@@ -2702,15 +3121,7 @@ async function main(): Promise<void> {
       case 'send': {
         const [, recipient, amountStr] = args;
         if (!recipient || !amountStr) {
-          console.error('Usage: send <recipient> <amount> <coin> [--direct|--proxy] [--instant|--conservative]');
-          console.error('  recipient: @nametag or DIRECT:// address');
-          console.error('  amount: decimal amount (e.g., 0.5, 100)');
-          console.error('  coin: token symbol (e.g., UCT, BTC, ETH, SOL) - default: UCT');
-          console.error('  --direct: force DirectAddress transfer (requires new nametag with directAddress)');
-          console.error('  --proxy: force PROXY address transfer (works with any nametag)');
-          console.error('  --instant: send via Nostr immediately (default, receiver gets unconfirmed token)');
-          console.error('  --conservative: collect all proofs first, receiver gets confirmed token');
-          process.exit(1);
+          failWithHelp('send', 'missing required <recipient> <amount> arguments');
         }
 
         // Parse coin: positional arg[3]
@@ -2725,8 +3136,7 @@ async function main(): Promise<void> {
         const forceDirect = args.includes('--direct');
         const forceProxy = args.includes('--proxy');
         if (forceDirect && forceProxy) {
-          console.error('Cannot use both --direct and --proxy');
-          process.exit(1);
+          failWithHelp('send', 'cannot use both --direct and --proxy');
         }
         const addressMode = forceDirect ? 'direct' : forceProxy ? 'proxy' : 'auto';
 
@@ -2734,8 +3144,7 @@ async function main(): Promise<void> {
         const forceInstant = args.includes('--instant');
         const forceConservative = args.includes('--conservative');
         if (forceInstant && forceConservative) {
-          console.error('Cannot use both --instant and --conservative');
-          process.exit(1);
+          failWithHelp('send', 'cannot use both --instant and --conservative');
         }
         const transferMode = forceConservative ? 'conservative' as const : 'instant' as const;
 
@@ -2908,15 +3317,12 @@ async function main(): Promise<void> {
       case 'switch': {
         const [, indexStr] = args;
         if (!indexStr) {
-          console.error('Usage: switch <index>');
-          console.error('  index: HD address index (0, 1, 2, ...)');
-          process.exit(1);
+          failWithHelp('switch', 'missing required <index> argument');
         }
 
         const index = parseInt(indexStr);
         if (isNaN(index) || index < 0) {
-          console.error('Invalid index. Must be a non-negative integer.');
-          process.exit(1);
+          failWithHelp('switch', `invalid index "${indexStr}" — must be a non-negative integer`);
         }
 
         const sphere = await getSphere();
@@ -2935,8 +3341,7 @@ async function main(): Promise<void> {
       case 'hide': {
         const [, indexStr] = args;
         if (!indexStr) {
-          console.error('Usage: hide <index>');
-          process.exit(1);
+          failWithHelp('hide', 'missing required <index> argument');
         }
 
         const sphere = await getSphere();
@@ -2949,8 +3354,7 @@ async function main(): Promise<void> {
       case 'unhide': {
         const [, indexStr] = args;
         if (!indexStr) {
-          console.error('Usage: unhide <index>');
-          process.exit(1);
+          failWithHelp('unhide', 'missing required <index> argument');
         }
 
         const sphere = await getSphere();
@@ -2964,9 +3368,7 @@ async function main(): Promise<void> {
       case 'nametag': {
         const [, name] = args;
         if (!name) {
-          console.error('Usage: nametag <name>');
-          console.error('  name: desired nametag (without @)');
-          process.exit(1);
+          failWithHelp('nametag', 'missing required <name> argument');
         }
 
         const cleanName = name.replace('@', '');
@@ -2991,8 +3393,7 @@ async function main(): Promise<void> {
       case 'nametag-info': {
         const [, name] = args;
         if (!name) {
-          console.error('Usage: nametag-info <name>');
-          process.exit(1);
+          failWithHelp('nametag-info', 'missing required argument <name>');
         }
 
         const cleanName = name.replace('@', '');
@@ -3003,10 +3404,7 @@ async function main(): Promise<void> {
         const info = await transport?.resolveNametagInfo?.(cleanName);
 
         if (info) {
-          console.log(`\nNametag Info: @${cleanName}`);
-          console.log('─'.repeat(50));
-          console.log(JSON.stringify(info, null, 2));
-          console.log('─'.repeat(50));
+          formatOutput(info as Record<string, unknown>, 'nametag-info', `\nNametag Info: @${cleanName}`);
         } else {
           console.log(`\nNametag @${cleanName} not found.`);
         }
@@ -3037,9 +3435,7 @@ async function main(): Promise<void> {
         const identity = sphere.identity;
 
         if (!identity?.nametag) {
-          console.error('\nNo nametag to sync.');
-          console.error('Register one first with: npm run cli -- nametag <name>');
-          process.exit(1);
+          failWithHelp('nametag-sync', 'no nametag to sync — register one first with: sphere nametag <name>');
         }
 
         console.log(`\nRe-publishing nametag @${identity.nametag} with chainPubkey...`);
@@ -3079,19 +3475,17 @@ async function main(): Promise<void> {
       case 'encrypt': {
         const [, data, password] = args;
         if (!data || !password) {
-          console.error('Usage: encrypt <data> <password>');
-          process.exit(1);
+          failWithHelp('encrypt', 'missing required <data> <password> arguments');
         }
         const result = encrypt(data, password);
-        console.log(JSON.stringify(result, null, 2));
+        formatOutput(result as unknown as Record<string, unknown>, 'encrypt-result');
         break;
       }
 
       case 'decrypt': {
         const [, encrypted, password] = args;
         if (!encrypted || !password) {
-          console.error('Usage: decrypt <encrypted-json> <password>');
-          process.exit(1);
+          failWithHelp('decrypt', 'missing required <encrypted-json> <password> arguments');
         }
         const encryptedData = JSON.parse(encrypted);
         const result = decrypt(encryptedData, password);
@@ -3103,23 +3497,20 @@ async function main(): Promise<void> {
       case 'parse-wallet': {
         const [, filePath, password] = args;
         if (!filePath) {
-          console.error('Usage: parse-wallet <file> [password]');
-          process.exit(1);
+          failWithHelp('parse-wallet', 'missing required <file> argument');
         }
 
         if (!fs.existsSync(filePath)) {
-          console.error('File not found:', filePath);
-          process.exit(1);
+          failWithHelp('parse-wallet', `file not found: ${filePath}`);
         }
 
         if (filePath.endsWith('.dat')) {
           const data = fs.readFileSync(filePath);
           if (!isSQLiteDatabase(data)) {
-            console.error('Not a valid wallet.dat (SQLite) file');
-            process.exit(1);
+            failWithHelp('parse-wallet', `not a valid wallet.dat (SQLite) file: ${filePath}`);
           }
           const result = parseWalletDat(data);
-          console.log(JSON.stringify(result, null, 2));
+          formatOutput(result as unknown as Record<string, unknown>, 'parse-wallet-result');
         } else {
           const content = fs.readFileSync(filePath, 'utf8');
           const isEncrypted = isTextWalletEncrypted(content);
@@ -3132,7 +3523,7 @@ async function main(): Promise<void> {
           const result = password
             ? parseAndDecryptWalletText(content, password)
             : parseWalletText(content);
-          console.log(JSON.stringify(result, null, 2));
+          formatOutput(result as unknown as Record<string, unknown>, 'parse-wallet-result');
         }
         break;
       }
@@ -3140,13 +3531,11 @@ async function main(): Promise<void> {
       case 'wallet-info': {
         const [, filePath] = args;
         if (!filePath) {
-          console.error('Usage: wallet-info <file>');
-          process.exit(1);
+          failWithHelp('wallet-info', 'missing required <file> argument');
         }
 
         if (!fs.existsSync(filePath)) {
-          console.error('File not found:', filePath);
-          process.exit(1);
+          failWithHelp('wallet-info', `file not found: ${filePath}`);
         }
 
         const info: Record<string, unknown> = { file: filePath };
@@ -3167,7 +3556,7 @@ async function main(): Promise<void> {
           info.hasChainCode = !!content.chainCode;
         }
 
-        console.log(JSON.stringify(info, null, 2));
+        formatOutput(info, 'wallet-info');
         break;
       }
 
@@ -3185,12 +3574,12 @@ async function main(): Promise<void> {
             process.stderr.write('sphere generate-key: refusing to print private key to non-TTY stdout. Use --allow-non-tty to override.\n');
             process.exit(1);
           }
-          console.log(JSON.stringify({
+          formatOutput({
             privateKey,
             publicKey,
             wif,
             address: addressInfo.address,
-          }, null, 2));
+          }, 'generate-key');
         } else {
           console.log(`Public Key: ${publicKey}`);
           console.log(`Address: ${addressInfo.address}`);
@@ -3202,11 +3591,10 @@ async function main(): Promise<void> {
       case 'validate-key': {
         const [, hex] = args;
         if (!hex) {
-          console.error('Usage: validate-key <hex>');
-          process.exit(1);
+          failWithHelp('validate-key', 'missing required <hex> argument');
         }
         const valid = isValidPrivateKey(hex);
-        console.log(JSON.stringify({ valid, length: hex.length }));
+        formatOutput({ valid, length: hex.length }, 'validate-key');
         process.exit(valid ? 0 : 1);
         break;
       }
@@ -3214,8 +3602,7 @@ async function main(): Promise<void> {
       case 'hex-to-wif': {
         const [, hex] = args;
         if (!hex) {
-          console.error('Usage: hex-to-wif <hex>');
-          process.exit(1);
+          failWithHelp('hex-to-wif', 'missing required <hex> argument');
         }
         console.log(hexToWIF(hex));
         break;
@@ -3224,8 +3611,7 @@ async function main(): Promise<void> {
       case 'derive-pubkey': {
         const [, privateKey] = args;
         if (!privateKey) {
-          console.error('Usage: derive-pubkey <private-key-hex>');
-          process.exit(1);
+          failWithHelp('derive-pubkey', 'missing required <private-key-hex> argument');
         }
         const publicKey = getPublicKey(privateKey);
         console.log(publicKey);
@@ -3235,9 +3621,7 @@ async function main(): Promise<void> {
       case 'derive-address': {
         const [, privateKey, index = '0'] = args;
         if (!privateKey) {
-          console.error('Usage: derive-address <private-key-hex> [index]');
-          console.error('Index: address derivation index (default: 0)');
-          process.exit(1);
+          failWithHelp('derive-address', 'missing required <private-key-hex> argument');
         }
         const addressInfo = generateAddressFromMasterKey(privateKey, parseInt(index));
         console.log(addressInfo.address);
@@ -3248,8 +3632,7 @@ async function main(): Promise<void> {
       case 'to-smallest': {
         const [, amount] = args;
         if (!amount) {
-          console.error('Usage: to-smallest <amount> <coin>');
-          process.exit(1);
+          failWithHelp('to-smallest', 'missing required <amount> argument');
         }
         const coinArgSmallest: string | undefined = (args[2] && !args[2].startsWith('--')) ? args[2] : undefined;
         let decimalsSmallest = 8;
@@ -3265,8 +3648,7 @@ async function main(): Promise<void> {
       case 'to-human': {
         const [, amount] = args;
         if (!amount) {
-          console.error('Usage: to-human <amount> <coin>');
-          process.exit(1);
+          failWithHelp('to-human', 'missing required <amount> argument');
         }
         const coinArgHuman: string | undefined = (args[2] && !args[2].startsWith('--')) ? args[2] : undefined;
         let decimalsHuman = 8;
@@ -3282,8 +3664,7 @@ async function main(): Promise<void> {
       case 'format': {
         const [, amount, decimals = '8'] = args;
         if (!amount) {
-          console.error('Usage: format <amount> [decimals]');
-          process.exit(1);
+          failWithHelp('format', 'missing required <amount> argument');
         }
         console.log(formatAmount(amount, { decimals: parseInt(decimals) }));
         break;
@@ -3293,8 +3674,7 @@ async function main(): Promise<void> {
       case 'base58-encode': {
         const [, hex] = args;
         if (!hex) {
-          console.error('Usage: base58-encode <hex>');
-          process.exit(1);
+          failWithHelp('base58-encode', 'missing required <hex> argument');
         }
         console.log(base58Encode(hex));
         break;
@@ -3303,8 +3683,7 @@ async function main(): Promise<void> {
       case 'base58-decode': {
         const [, str] = args;
         if (!str) {
-          console.error('Usage: base58-decode <string>');
-          process.exit(1);
+          failWithHelp('base58-decode', 'missing required <string> argument');
         }
         const bytes = base58Decode(str);
         console.log(Buffer.from(bytes).toString('hex'));
@@ -3411,9 +3790,7 @@ async function main(): Promise<void> {
         // Collect message: everything after recipient that isn't a flag
         const message = messageParts.filter(p => !p.startsWith('--')).join(' ');
         if (!recipient || !message) {
-          console.error('Usage: dm <@nametag|pubkey> <message>');
-          console.error('  Example: npm run cli -- dm @alice "Hello!"');
-          process.exit(1);
+          failWithHelp('dm', 'missing required <@nametag|pubkey> <message> arguments');
         }
 
         const sphere = await getSphere();
@@ -3463,9 +3840,7 @@ async function main(): Promise<void> {
       case 'dm-history': {
         const [, peer] = args;
         if (!peer) {
-          console.error('Usage: dm-history <@nametag|pubkey> [--limit <n>]');
-          console.error('  Example: npm run cli -- dm-history @alice --limit 20');
-          process.exit(1);
+          failWithHelp('dm-history', 'missing required <@nametag|pubkey> argument');
         }
 
         const limitIndex = args.indexOf('--limit');
@@ -3479,8 +3854,7 @@ async function main(): Promise<void> {
         if (peer.startsWith('@')) {
           const resolved = await sphere.resolve(peer);
           if (!resolved) {
-            console.error(`Could not resolve ${peer}`);
-            process.exit(1);
+            failWithHelp('dm-history', `could not resolve ${peer}`);
           }
           peerPubkey = resolved.chainPubkey;
         }
@@ -3511,9 +3885,7 @@ async function main(): Promise<void> {
       case 'group-create': {
         const groupName = args[1];
         if (!groupName) {
-          console.error('Usage: group-create <name> [--description <text>] [--private]');
-          console.error('  Example: npm run cli -- group-create "Trading Chat" --description "Discuss trades"');
-          process.exit(1);
+          failWithHelp('group-create', 'missing required <name> argument');
         }
 
         const descIndex = args.indexOf('--description');
@@ -3523,8 +3895,7 @@ async function main(): Promise<void> {
         const sphere = await getSphere();
 
         if (!sphere.groupChat) {
-          console.error('Group chat module not available.');
-          process.exit(1);
+          failWithHelp('group-create', 'group chat module not available');
         }
 
         await sphere.groupChat.connect();
@@ -3552,8 +3923,7 @@ async function main(): Promise<void> {
         const sphere = await getSphere();
 
         if (!sphere.groupChat) {
-          console.error('Group chat module not available.');
-          process.exit(1);
+          failWithHelp(command!, 'group chat module not available');
         }
 
         await sphere.groupChat.connect();
@@ -3582,8 +3952,7 @@ async function main(): Promise<void> {
         const sphere = await getSphere();
 
         if (!sphere.groupChat) {
-          console.error('Group chat module not available.');
-          process.exit(1);
+          failWithHelp(command!, 'group chat module not available');
         }
 
         await sphere.groupChat.connect();
@@ -3616,9 +3985,7 @@ async function main(): Promise<void> {
       case 'group-join': {
         const groupId = args[1];
         if (!groupId) {
-          console.error('Usage: group-join <groupId> [--invite <code>]');
-          console.error('  Example: npm run cli -- group-join tradingchat');
-          process.exit(1);
+          failWithHelp('group-join', 'missing required <groupId> argument');
         }
 
         const inviteIndex = args.indexOf('--invite');
@@ -3627,8 +3994,7 @@ async function main(): Promise<void> {
         const sphere = await getSphere();
 
         if (!sphere.groupChat) {
-          console.error('Group chat module not available.');
-          process.exit(1);
+          failWithHelp(command!, 'group chat module not available');
         }
 
         await sphere.groupChat.connect();
@@ -3647,16 +4013,13 @@ async function main(): Promise<void> {
       case 'group-leave': {
         const groupId = args[1];
         if (!groupId) {
-          console.error('Usage: group-leave <groupId>');
-          console.error('  Example: npm run cli -- group-leave tradingchat');
-          process.exit(1);
+          failWithHelp('group-leave', 'missing required <groupId> argument');
         }
 
         const sphere = await getSphere();
 
         if (!sphere.groupChat) {
-          console.error('Group chat module not available.');
-          process.exit(1);
+          failWithHelp(command!, 'group chat module not available');
         }
 
         await sphere.groupChat.connect();
@@ -3686,9 +4049,7 @@ async function main(): Promise<void> {
         const msgContent = msgParts.join(' ');
 
         if (!groupId || !msgContent) {
-          console.error('Usage: group-send <groupId> <message> [--reply <eventId>]');
-          console.error('  Example: npm run cli -- group-send tradingchat "Hello everyone!"');
-          process.exit(1);
+          failWithHelp('group-send', 'missing required <groupId> <message> arguments');
         }
 
         const replyIndex = args.indexOf('--reply');
@@ -3697,8 +4058,7 @@ async function main(): Promise<void> {
         const sphere = await getSphere();
 
         if (!sphere.groupChat) {
-          console.error('Group chat module not available.');
-          process.exit(1);
+          failWithHelp(command!, 'group chat module not available');
         }
 
         await sphere.groupChat.connect();
@@ -3719,9 +4079,7 @@ async function main(): Promise<void> {
       case 'group-messages': {
         const groupId = args[1];
         if (!groupId) {
-          console.error('Usage: group-messages <groupId> [--limit <n>]');
-          console.error('  Example: npm run cli -- group-messages tradingchat --limit 20');
-          process.exit(1);
+          failWithHelp('group-messages', 'missing required <groupId> argument');
         }
 
         const limitIndex = args.indexOf('--limit');
@@ -3730,8 +4088,7 @@ async function main(): Promise<void> {
         const sphere = await getSphere();
 
         if (!sphere.groupChat) {
-          console.error('Group chat module not available.');
-          process.exit(1);
+          failWithHelp(command!, 'group chat module not available');
         }
 
         await sphere.groupChat.connect();
@@ -3769,16 +4126,13 @@ async function main(): Promise<void> {
       case 'group-members': {
         const groupId = args[1];
         if (!groupId) {
-          console.error('Usage: group-members <groupId>');
-          console.error('  Example: npm run cli -- group-members tradingchat');
-          process.exit(1);
+          failWithHelp('group-members', 'missing required <groupId> argument');
         }
 
         const sphere = await getSphere();
 
         if (!sphere.groupChat) {
-          console.error('Group chat module not available.');
-          process.exit(1);
+          failWithHelp(command!, 'group chat module not available');
         }
 
         await sphere.groupChat.connect();
@@ -3807,24 +4161,20 @@ async function main(): Promise<void> {
       case 'group-info': {
         const groupId = args[1];
         if (!groupId) {
-          console.error('Usage: group-info <groupId>');
-          console.error('  Example: npm run cli -- group-info tradingchat');
-          process.exit(1);
+          failWithHelp('group-info', 'missing required <groupId> argument');
         }
 
         const sphere = await getSphere();
 
         if (!sphere.groupChat) {
-          console.error('Group chat module not available.');
-          process.exit(1);
+          failWithHelp(command!, 'group chat module not available');
         }
 
         await sphere.groupChat.connect();
         const group = sphere.groupChat.getGroup(groupId);
 
         if (!group) {
-          console.error(`Group "${groupId}" not found. You may need to join it first.`);
-          process.exit(1);
+          failWithHelp('group-info', `group "${groupId}" not found — you may need to join it first`);
         }
 
         const myRole = sphere.groupChat.getCurrentUserRole(groupId);
@@ -3850,15 +4200,13 @@ async function main(): Promise<void> {
       case 'market-post': {
         const description = args[1];
         if (!description) {
-          console.error('Usage: market-post <description> --type <type> [--category <cat>] [--price <n>] [--currency <code>] [--location <loc>] [--contact <handle>] [--expires <days>]');
-          process.exit(1);
+          failWithHelp('market-post', 'missing required <description> argument');
         }
 
         const typeIndex = args.indexOf('--type');
         const intentType = typeIndex !== -1 ? args[typeIndex + 1] : undefined;
         if (!intentType) {
-          console.error('Error: --type <type> is required (buy, sell, service, announcement, other)');
-          process.exit(1);
+          failWithHelp('market-post', '--type <type> is required (buy, sell, service, announcement, other)');
         }
 
         const categoryIndex = args.indexOf('--category');
@@ -3882,8 +4230,7 @@ async function main(): Promise<void> {
         const sphere = await getSphere();
 
         if (!sphere.market) {
-          console.error('Market module not available.');
-          process.exit(1);
+          failWithHelp('market-post', 'market module not available');
         }
 
         const result = await sphere.market.postIntent({
@@ -3908,8 +4255,7 @@ async function main(): Promise<void> {
       case 'market-search': {
         const query = args[1];
         if (!query) {
-          console.error('Usage: market-search <query> [--type <type>] [--category <cat>] [--min-price <n>] [--max-price <n>] [--min-score <0-1>] [--location <loc>] [--limit <n>]');
-          process.exit(1);
+          failWithHelp('market-search', 'missing required <query> argument');
         }
 
         const typeIndex = args.indexOf('--type');
@@ -3936,8 +4282,7 @@ async function main(): Promise<void> {
         const sphere = await getSphere();
 
         if (!sphere.market) {
-          console.error('Market module not available.');
-          process.exit(1);
+          failWithHelp(command!, 'market module not available');
         }
 
         const result = await sphere.market.search(query, {
@@ -3979,8 +4324,7 @@ async function main(): Promise<void> {
         const sphere = await getSphere();
 
         if (!sphere.market) {
-          console.error('Market module not available.');
-          process.exit(1);
+          failWithHelp(command!, 'market module not available');
         }
 
         const intents = await sphere.market.getMyIntents();
@@ -4000,15 +4344,13 @@ async function main(): Promise<void> {
       case 'market-close': {
         const intentId = args[1];
         if (!intentId) {
-          console.error('Usage: market-close <intentId>');
-          process.exit(1);
+          failWithHelp('market-close', 'missing required <intentId> argument');
         }
 
         const sphere = await getSphere();
 
         if (!sphere.market) {
-          console.error('Market module not available.');
-          process.exit(1);
+          failWithHelp(command!, 'market module not available');
         }
 
         await sphere.market.closeIntent(intentId);
@@ -4023,8 +4365,7 @@ async function main(): Promise<void> {
         const sphere = await getSphere();
 
         if (!sphere.market) {
-          console.error('Market module not available.');
-          process.exit(1);
+          failWithHelp(command!, 'market module not available');
         }
 
         if (useRest) {
@@ -4082,13 +4423,11 @@ async function main(): Promise<void> {
       case 'invoice-create': {
         const sphere = await getSphere();
         if (!sphere.accounting) {
-          console.error('Accounting module not enabled. Initialize with accounting support.');
-          process.exit(1);
+          failWithHelp('invoice-create', 'accounting module not enabled — initialize with accounting support');
         }
 
         // Parse options
         const targetIdx = args.indexOf('--target');
-        const assetIdx = args.indexOf('--asset');
         const nftIdx = args.indexOf('--nft');
         const dueIdx = args.indexOf('--due');
         const memoIdx = args.indexOf('--memo');
@@ -4107,31 +4446,30 @@ async function main(): Promise<void> {
             const msg = err instanceof Error ? err.message : String(err);
             // Sanitize: only show whether it was a file read or JSON parse error
             if (msg.includes('ENOENT')) {
-              console.error(`File not found: "${termsFile}"`);
+              failWithHelp('invoice-create', `file not found: "${termsFile}"`);
             } else if (msg.includes('EACCES') || msg.includes('EPERM')) {
-              console.error(`Access denied: "${termsFile}"`);
+              failWithHelp('invoice-create', `access denied: "${termsFile}"`);
             } else if (msg.includes('Unexpected token') || msg.includes('JSON')) {
-              console.error(`Invalid JSON in terms file "${termsFile}"`);
+              failWithHelp('invoice-create', `invalid JSON in terms file "${termsFile}"`);
             } else {
-              console.error(`Failed to read terms file "${termsFile}"`);
+              failWithHelp('invoice-create', `failed to read terms file "${termsFile}"`);
             }
-            process.exit(1);
           }
           let result;
           try {
             result = await sphere.accounting.createInvoice(stripDangerousKeys(termsJson) as CreateInvoiceRequest);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
-            console.error(`Failed to create invoice from terms file: ${msg}`);
-            process.exit(1);
+            failWithHelp('invoice-create', `failed to create invoice from terms file: ${msg}`);
           }
-          console.log('Invoice created:');
-          console.log(JSON.stringify(result, null, 2));
+          formatOutput(result as unknown as Record<string, unknown>, 'invoice-create-result', 'Invoice created:');
         } else {
-          // Build from individual options
+          // Build from individual options.
+          // Canonical asset input (issue #32): each `--asset` consumes the
+          // next two argv tokens — `--asset <amount> <coin>`. Multiple
+          // `--asset` flags allowed for multi-asset invoices.
           if (targetIdx === -1 || !args[targetIdx + 1]) {
-            console.error('Usage: invoice-create --target <address> --asset "<amount> <coin>" [--nft <id>] [--due <ISO-date>] [--memo <text>] [--delivery <method>] [--terms <json-file>]');
-            process.exit(1);
+            failWithHelp('invoice-create', '--target <address> is required');
           }
           let targetAddress = args[targetIdx + 1];
           // Accept `@nametag` (and chain-pubkey / alpha1...) as targets for
@@ -4144,41 +4482,46 @@ async function main(): Promise<void> {
           if (!targetAddress.startsWith('DIRECT://')) {
             const resolved = await sphere.resolve(targetAddress);
             if (!resolved || !resolved.directAddress) {
-              console.error(
-                `Could not resolve target "${targetAddress}" to a DIRECT:// address. ` +
-                  'Provide an @nametag, chain pubkey, alpha1 address, or a DIRECT:// address.',
+              failWithHelp(
+                'invoice-create',
+                `could not resolve target "${targetAddress}" to a DIRECT:// address — provide an @nametag, chain pubkey, alpha1 address, or a DIRECT:// address`,
               );
-              process.exit(1);
             }
             targetAddress = resolved.directAddress;
           }
           const nftId = nftIdx !== -1 ? args[nftIdx + 1] : undefined;
           const dueDate = dueIdx !== -1 ? new Date(args[dueIdx + 1]).getTime() : undefined;
           if (dueDate !== undefined && isNaN(dueDate)) {
-            console.error('Invalid due date format. Use ISO-8601, e.g. 2026-12-31');
-            process.exit(1);
+            failWithHelp('invoice-create', 'invalid due date format — use ISO-8601, e.g. 2026-12-31');
           }
           const memo = memoIdx !== -1 ? args[memoIdx + 1] : undefined;
           const delivery = deliveryIdx !== -1 ? args[deliveryIdx + 1] : undefined;
 
           const assets: InvoiceRequestedAsset[] = [];
-          if (assetIdx !== -1 && args[assetIdx + 1]) {
-            const parsed = parseAssetArg(args[assetIdx + 1]);
-            if (!/^[1-9][0-9]*$/.test(parsed.amount)) {
-              console.error(`Invalid amount "${parsed.amount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
-              process.exit(1);
+          // Collect ALL `--asset <amount> <coin>` occurrences (multi-asset).
+          for (let i = 0; i < args.length; i++) {
+            if (args[i] !== '--asset') continue;
+            const pair = consumeAssetPair(args, i + 1);
+            if (!pair) {
+              failWithHelp('invoice-create', '--asset expects two positional tokens: --asset <amount> <coin>');
+            }
+            if (!/^[1-9][0-9]*$/.test(pair.amount)) {
+              failWithHelp('invoice-create', `invalid amount "${pair.amount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
             }
             // AccountingModule.createInvoice validates coinId as
             // /^[A-Za-z0-9]+$/ with length ≤20 — i.e. it expects the
             // human-readable symbol (UCT, USDU, ...), NOT the 64-char
             // hex token-type id that `payments.send` uses. resolveCoin
-            // is still useful to fail fast on unknown symbols (it
-            // exits non-zero before invoice mint), but we hand the
-            // SYMBOL through to the SDK.
-            const { symbol: resolvedSymbol } = resolveCoin(parsed.coin);
-            assets.push({ coin: [resolvedSymbol, parsed.amount] });
-          } else if (nftId) {
+            // fails fast on unknown symbols; we hand the SYMBOL through.
+            const { symbol: resolvedSymbol } = resolveCoin(pair.coin);
+            assets.push({ coin: [resolvedSymbol, pair.amount] });
+          }
+          // NFT input — collect when no --asset was provided.
+          if (assets.length === 0 && nftId) {
             assets.push({ nft: { tokenId: nftId } });
+          }
+          if (assets.length === 0) {
+            failWithHelp('invoice-create', 'at least one --asset <amount> <coin> or --nft <tokenId> is required');
           }
 
           const request: CreateInvoiceRequest = {
@@ -4188,8 +4531,7 @@ async function main(): Promise<void> {
             deliveryMethods: delivery ? [delivery] : undefined,
           };
           const result = await sphere.accounting.createInvoice(request);
-          console.log('Invoice created:');
-          console.log(JSON.stringify(result, null, 2));
+          formatOutput(result as unknown as Record<string, unknown>, 'invoice-create-result', 'Invoice created:');
         }
 
         await syncAfterWrite(sphere);
@@ -4200,32 +4542,29 @@ async function main(): Promise<void> {
       case 'invoice-import': {
         const tokenFile = args[1];
         if (!tokenFile) {
-          console.error('Usage: invoice-import <token-file>');
-          process.exit(1);
+          failWithHelp('invoice-import', 'missing required <token-file> argument');
         }
 
         const sphere = await getSphere();
         if (!sphere.accounting) {
-          console.error('Accounting module not enabled.');
-          process.exit(1);
+          failWithHelp('invoice-import', 'accounting module not enabled');
         }
 
         let tokenJson: unknown;
         try {
           tokenJson = JSON.parse(fs.readFileSync(path.resolve(tokenFile), 'utf8'));
         } catch (err: unknown) {
-          // W23-R2 fix: Sanitize error messages to avoid leaking file system paths
+          // Sanitize error messages to avoid leaking file system paths
           const code = (err as NodeJS.ErrnoException)?.code;
           if (code === 'ENOENT') {
-            console.error(`Token file not found: "${tokenFile}"`);
+            failWithHelp('invoice-import', `token file not found: "${tokenFile}"`);
           } else if (code === 'EACCES') {
-            console.error(`Permission denied reading: "${tokenFile}"`);
+            failWithHelp('invoice-import', `permission denied reading: "${tokenFile}"`);
           } else if (err instanceof SyntaxError) {
-            console.error(`Invalid JSON in token file: "${tokenFile}"`);
+            failWithHelp('invoice-import', `invalid JSON in token file: "${tokenFile}"`);
           } else {
-            console.error(`Failed to read token file: "${tokenFile}"`);
+            failWithHelp('invoice-import', `failed to read token file: "${tokenFile}"`);
           }
-          process.exit(1);
         }
 
         let terms;
@@ -4233,51 +4572,31 @@ async function main(): Promise<void> {
           terms = await sphere.accounting.importInvoice(stripDangerousKeys(tokenJson) as TxfToken);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          console.error(`Failed to import invoice: ${msg}`);
-          process.exit(1);
+          failWithHelp('invoice-import', `failed to import invoice: ${msg}`);
         }
-        console.log('Invoice imported:');
-        console.log(JSON.stringify(terms, null, 2));
+        formatOutput(terms as unknown as Record<string, unknown>, 'invoice-import-result', 'Invoice imported:');
 
         await closeSphere();
         break;
       }
 
       case 'invoice-deliver': {
-        // sphere invoice deliver <id-or-prefix> [--to <recipient>...] [--memo <text>]
-        //
         // Ships a previously-minted invoice to its targets (default) or to
         // an explicit recipient list via the SDK's deliverInvoice() —
         // packages the invoice token into a UXF bundle and sends it inside
         // an `invoice_delivery:` NIP-17 DM. Per-recipient outcome is
-        // surfaced as JSON for scripting (manual-test-full-recovery.sh §C
-        // calls this between `invoice create` and Bob's `invoice pay`).
+        // surfaced via formatOutput so `--json` works for scripting
+        // (manual-test-full-recovery.sh §C calls this between `invoice
+        // create` and Bob's `invoice pay`).
         const idOrPrefix = args[1];
         if (!idOrPrefix) {
-          console.error('Usage: invoice-deliver <id-or-prefix> [--to <recipient>...] [--memo <text>]');
-          process.exit(1);
+          failWithHelp('invoice-deliver', 'missing required <id-or-prefix> argument');
         }
 
         const sphere = await getSphere();
-        if (!sphere.accounting) {
-          console.error('Accounting module not enabled. Initialize with accounting support.');
-          process.exit(1);
-        }
         await ensureSync(sphere, 'full');
 
-        // Prefix-match against the local invoice ledger so callers can use
-        // any unambiguous prefix (parallel to invoice-pay).
-        const allInvoices = await sphere.accounting.getInvoices();
-        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
-        if (matched.length === 0) {
-          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
-          process.exit(1);
-        }
-        if (matched.length > 1) {
-          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
-          process.exit(1);
-        }
-        const invoiceId = matched[0].invoiceId;
+        const invoiceId = await resolveInvoiceId(sphere, idOrPrefix, 'invoice-deliver');
 
         // Collect every `--to <recipient>` flag (repeatable). When absent,
         // the SDK defaults to every non-self target from the invoice terms.
@@ -4298,20 +4617,15 @@ async function main(): Promise<void> {
 
         let result;
         try {
-          result = await sphere.accounting.deliverInvoice(invoiceId, optionsMut as Parameters<typeof sphere.accounting.deliverInvoice>[1]);
+          result = await sphere.accounting!.deliverInvoice(
+            invoiceId,
+            optionsMut as Parameters<NonNullable<typeof sphere.accounting>['deliverInvoice']>[1],
+          );
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          console.error(`Failed to deliver invoice: ${msg}`);
-          // process.exit(1) below throws an ExitSignal which the outer
-          // catch in main() converts into a real exit. The `return` is
-          // unreachable but kept as a defensive marker so a future
-          // refactor of the wrapper cannot silently reintroduce the
-          // fall-through that #21 / #226 fixed.
-          process.exit(1);
-          return;
+          failWithHelp('invoice-deliver', `failed to deliver invoice: ${msg}`);
         }
-        console.log('Invoice delivery result:');
-        console.log(JSON.stringify(result, null, 2));
+        formatOutput(result as unknown as Record<string, unknown>, 'generic', 'Invoice delivery result:');
 
         if (result.failed > 0) {
           // Non-zero exit so shell scripts can distinguish full success
@@ -4329,8 +4643,7 @@ async function main(): Promise<void> {
       case 'invoice-list': {
         const sphere = await getSphere();
         if (!sphere.accounting) {
-          console.error('Accounting module not enabled.');
-          process.exit(1);
+          failWithHelp('invoice-list', 'accounting module not enabled');
         }
         // Invoice listing surfaces invoice tokens, including those received
         // cross-device via Profile/IPFS sync. 'nostr' only pulls inbox DMs
@@ -4353,8 +4666,7 @@ async function main(): Promise<void> {
           const stateValues = stateFilter.split(',').map(s => s.trim());
           const invalid = stateValues.filter(s => !validStates.has(s));
           if (invalid.length > 0) {
-            console.error(`Invalid state(s): ${invalid.join(', ')}. Valid: ${[...validStates].join(', ')}`);
-            process.exit(1);
+            failWithHelp('invoice-list', `invalid state(s): ${invalid.join(', ')} (valid: ${[...validStates].join(', ')})`);
           }
           optionsMut['state'] = stateValues.length === 1 ? stateValues[0] : stateValues;
         }
@@ -4370,6 +4682,8 @@ async function main(): Promise<void> {
 
         if (invoices.length === 0) {
           console.log('No invoices found.');
+        } else if (jsonMode) {
+          formatOutput(invoices, 'generic', `Invoices (${invoices.length}):`);
         } else {
           console.log(`Invoices (${invoices.length}):`);
           console.log('─'.repeat(60));
@@ -4391,15 +4705,10 @@ async function main(): Promise<void> {
       case 'invoice-status': {
         const idOrPrefix = args[1];
         if (!idOrPrefix) {
-          console.error('Usage: invoice-status <id-or-prefix>');
-          process.exit(1);
+          failWithHelp('invoice-status', 'missing required <id-or-prefix> argument');
         }
 
         const sphere = await getSphere();
-        if (!sphere.accounting) {
-          console.error('Accounting module not enabled.');
-          process.exit(1);
-        }
         // Per-target balance is computed from on-chain payment attribution,
         // which requires the IPFS / Profile pointer pull — not just the
         // Nostr inbox. 'nostr' mode skips that pull, so on a fresh device
@@ -4407,22 +4716,9 @@ async function main(): Promise<void> {
         // when the invoice exists on another peer (issue sphere-cli#24).
         await ensureSync(sphere, 'full');
 
-        // Resolve ID from prefix
-        const allInvoices = await sphere.accounting.getInvoices();
-        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
-        if (matched.length === 0) {
-          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
-          process.exit(1);
-        }
-        if (matched.length > 1) {
-          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices. Use more characters.`);
-          process.exit(1);
-        }
-        const invoiceId = matched[0].invoiceId;
-
-        const status = await sphere.accounting.getInvoiceStatus(invoiceId);
-        console.log('Invoice Status:');
-        console.log(JSON.stringify(status, null, 2));
+        const invoiceId = await resolveInvoiceId(sphere, idOrPrefix, 'invoice-status');
+        const status = await sphere.accounting!.getInvoiceStatus(invoiceId);
+        formatOutput(status as unknown as Record<string, unknown>, 'invoice-status', 'Invoice Status:');
 
         await closeSphere();
         break;
@@ -4431,31 +4727,15 @@ async function main(): Promise<void> {
       case 'invoice-close': {
         const idOrPrefix = args[1];
         if (!idOrPrefix) {
-          console.error('Usage: invoice-close <id-or-prefix>');
-          process.exit(1);
+          failWithHelp('invoice-close', 'missing required <id-or-prefix> argument');
         }
 
         const sphere = await getSphere();
         await ensureSync(sphere, 'full');
-        if (!sphere.accounting) {
-          console.error('Accounting module not enabled.');
-          process.exit(1);
-        }
 
-        const allInvoices = await sphere.accounting.getInvoices();
-        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
-        if (matched.length === 0) {
-          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
-          process.exit(1);
-        }
-        if (matched.length > 1) {
-          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
-          process.exit(1);
-        }
-        const invoiceId = matched[0].invoiceId;
-
+        const invoiceId = await resolveInvoiceId(sphere, idOrPrefix, 'invoice-close');
         const autoReturn = args.includes('--auto-return');
-        await sphere.accounting.closeInvoice(invoiceId, autoReturn ? { autoReturn: true } : undefined);
+        await sphere.accounting!.closeInvoice(invoiceId, autoReturn ? { autoReturn: true } : undefined);
         console.log(`Invoice ${invoiceId} closed.${autoReturn ? ' Auto-return triggered.' : ''}`);
 
         await syncAfterWrite(sphere);
@@ -4466,30 +4746,14 @@ async function main(): Promise<void> {
       case 'invoice-cancel': {
         const idOrPrefix = args[1];
         if (!idOrPrefix) {
-          console.error('Usage: invoice-cancel <id-or-prefix>');
-          process.exit(1);
+          failWithHelp('invoice-cancel', 'missing required <id-or-prefix> argument');
         }
 
         const sphere = await getSphere();
         await ensureSync(sphere, 'full');
-        if (!sphere.accounting) {
-          console.error('Accounting module not enabled.');
-          process.exit(1);
-        }
 
-        const allInvoices = await sphere.accounting.getInvoices();
-        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
-        if (matched.length === 0) {
-          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
-          process.exit(1);
-        }
-        if (matched.length > 1) {
-          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
-          process.exit(1);
-        }
-        const invoiceId = matched[0].invoiceId;
-
-        await sphere.accounting.cancelInvoice(invoiceId);
+        const invoiceId = await resolveInvoiceId(sphere, idOrPrefix, 'invoice-cancel');
+        await sphere.accounting!.cancelInvoice(invoiceId);
         console.log(`Invoice ${invoiceId} cancelled.`);
 
         await syncAfterWrite(sphere);
@@ -4500,53 +4764,34 @@ async function main(): Promise<void> {
       case 'invoice-pay': {
         const idOrPrefix = args[1];
         if (!idOrPrefix) {
-          console.error('Usage: invoice-pay <id-or-prefix> [--amount <value>] [--target-index <n>]');
-          process.exit(1);
+          failWithHelp('invoice-pay', 'missing required <id-or-prefix> argument');
         }
 
         const sphere = await getSphere();
-        if (!sphere.accounting) {
-          console.error('Accounting module not enabled.');
-          process.exit(1);
-        }
         await ensureSync(sphere, 'full');
 
-        const allInvoices = await sphere.accounting.getInvoices();
-        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
-        if (matched.length === 0) {
-          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
-          process.exit(1);
-        }
-        if (matched.length > 1) {
-          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
-          process.exit(1);
-        }
-        const invoiceId = matched[0].invoiceId;
-
+        const invoiceId = await resolveInvoiceId(sphere, idOrPrefix, 'invoice-pay');
         const amountIdx2 = args.indexOf('--amount');
         const targetIndexIdx = args.indexOf('--target-index');
 
         const rawTargetIdx = targetIndexIdx !== -1 ? args[targetIndexIdx + 1] : undefined;
         const targetIndex = rawTargetIdx !== undefined ? parseInt(rawTargetIdx, 10) : 0;
         if (isNaN(targetIndex) || targetIndex < 0) {
-          console.error('--target-index must be a non-negative integer');
-          process.exit(1);
+          failWithHelp('invoice-pay', '--target-index must be a non-negative integer');
         }
 
         const payParamsMut: Record<string, unknown> = { targetIndex };
         if (amountIdx2 !== -1 && args[amountIdx2 + 1]) {
           const rawAmount = args[amountIdx2 + 1];
           if (!/^[1-9][0-9]*$/.test(rawAmount!)) {
-            console.error(`Invalid amount "${rawAmount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
-            process.exit(1);
+            failWithHelp('invoice-pay', `invalid amount "${rawAmount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
           }
           payParamsMut['amount'] = rawAmount;
         }
         const payParams = payParamsMut as unknown as PayInvoiceParams;
 
-        const result = await sphere.accounting.payInvoice(invoiceId, payParams);
-        console.log('Payment result:');
-        console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
+        const result = await sphere.accounting!.payInvoice(invoiceId, payParams);
+        formatOutput({ id: result.id, status: result.status }, 'invoice-pay-result', 'Payment result:');
 
         await syncAfterWrite(sphere);
         await closeSphere();
@@ -4556,135 +4801,47 @@ async function main(): Promise<void> {
       case 'invoice-return': {
         const idOrPrefix = args[1];
         if (!idOrPrefix) {
-          console.error('Usage: invoice-return <id-or-prefix> --recipient <address> --asset "<amount> <coin>"');
-          process.exit(1);
+          failWithHelp('invoice-return', 'missing required <id-or-prefix> argument');
         }
 
         const sphere = await getSphere();
         await ensureSync(sphere, 'full');
-        if (!sphere.accounting) {
-          console.error('Accounting module not enabled.');
-          process.exit(1);
-        }
 
-        const allInvoices = await sphere.accounting.getInvoices();
-        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
-        if (matched.length === 0) {
-          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
-          process.exit(1);
-        }
-        if (matched.length > 1) {
-          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
-          process.exit(1);
-        }
-        const invoiceId = matched[0].invoiceId;
-
+        const invoiceId = await resolveInvoiceId(sphere, idOrPrefix, 'invoice-return');
         const recipientIdx = args.indexOf('--recipient');
         const assetIdx3 = args.indexOf('--asset');
 
         if (recipientIdx === -1 || !args[recipientIdx + 1]) {
-          console.error('--recipient <address> is required for invoice-return');
-          process.exit(1);
+          failWithHelp('invoice-return', '--recipient <address> is required');
         }
 
-        let returnAmount: string;
-        let returnCoinId: string;
-
-        if (assetIdx3 !== -1 && args[assetIdx3 + 1]) {
-          const parsed = parseAssetArg(args[assetIdx3 + 1]);
-          returnAmount = parsed.amount;
-          // Same SDK convention as invoice-create — the AccountingModule's
-          // ReturnPaymentParams.coinId is the symbol (UCT, USDU, ...), not
-          // the 64-char hex. resolveCoin still validates that the symbol
-          // is known to the TokenRegistry.
-          returnCoinId = resolveCoin(parsed.coin).symbol;
-        } else {
-          console.error('--asset "<amount> <coin>" is required for invoice-return');
-          process.exit(1);
+        // Canonical asset input (issue #32): --asset <amount> <coin>
+        if (assetIdx3 === -1) {
+          failWithHelp('invoice-return', '--asset <amount> <coin> is required');
         }
-
-        if (!/^[1-9][0-9]*$/.test(returnAmount)) {
-          console.error(`Invalid amount "${returnAmount}" — must be a positive integer string (smallest unit, no leading zeros, e.g. 1000000)`);
-          process.exit(1);
+        const pair = consumeAssetPair(args, assetIdx3 + 1);
+        if (!pair) {
+          failWithHelp('invoice-return', '--asset expects two positional tokens: --asset <amount> <coin>');
         }
+        if (!/^[1-9][0-9]*$/.test(pair.amount)) {
+          failWithHelp('invoice-return', `invalid amount "${pair.amount}" — must be a positive integer string (smallest unit, no leading zeros, e.g. 1000000)`);
+        }
+        // Same SDK convention as invoice-create — the AccountingModule's
+        // ReturnPaymentParams.coinId is the symbol (UCT, USDU, ...), not
+        // the 64-char hex. resolveCoin still validates that the symbol
+        // is known to the TokenRegistry.
+        const returnCoinId = resolveCoin(pair.coin).symbol;
 
         const returnParams: ReturnPaymentParams = {
           recipient: args[recipientIdx + 1],
-          amount: returnAmount,
+          amount: pair.amount,
           coinId: returnCoinId,
         };
 
-        const result = await sphere.accounting.returnInvoicePayment(invoiceId, returnParams);
-        console.log('Return payment result:');
-        console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
+        const result = await sphere.accounting!.returnInvoicePayment(invoiceId, returnParams);
+        formatOutput({ id: result.id, status: result.status }, 'invoice-return-result', 'Return payment result:');
 
         await syncAfterWrite(sphere);
-        await closeSphere();
-        break;
-      }
-
-      case 'invoice-receipts': {
-        const idOrPrefix = args[1];
-        if (!idOrPrefix) {
-          console.error('Usage: invoice-receipts <id-or-prefix>');
-          process.exit(1);
-        }
-
-        const sphere = await getSphere();
-        if (!sphere.accounting) {
-          console.error('Accounting module not enabled.');
-          process.exit(1);
-        }
-
-        const allInvoices = await sphere.accounting.getInvoices();
-        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
-        if (matched.length === 0) {
-          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
-          process.exit(1);
-        }
-        if (matched.length > 1) {
-          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
-          process.exit(1);
-        }
-        const invoiceId = matched[0].invoiceId;
-
-        const result = await sphere.accounting.sendInvoiceReceipts(invoiceId);
-        console.log('Receipts result:');
-        console.log(JSON.stringify(result, null, 2));
-
-        await closeSphere();
-        break;
-      }
-
-      case 'invoice-notices': {
-        const idOrPrefix = args[1];
-        if (!idOrPrefix) {
-          console.error('Usage: invoice-notices <id-or-prefix>');
-          process.exit(1);
-        }
-
-        const sphere = await getSphere();
-        if (!sphere.accounting) {
-          console.error('Accounting module not enabled.');
-          process.exit(1);
-        }
-
-        const allInvoices = await sphere.accounting.getInvoices();
-        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
-        if (matched.length === 0) {
-          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
-          process.exit(1);
-        }
-        if (matched.length > 1) {
-          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
-          process.exit(1);
-        }
-        const invoiceId = matched[0].invoiceId;
-
-        const result = await sphere.accounting.sendCancellationNotices(invoiceId);
-        console.log('Cancellation notices result:');
-        console.log(JSON.stringify(result, null, 2));
-
         await closeSphere();
         break;
       }
@@ -4692,28 +4849,23 @@ async function main(): Promise<void> {
       case 'invoice-auto-return': {
         const sphere = await getSphere();
         if (!sphere.accounting) {
-          console.error('Accounting module not enabled.');
-          process.exit(1);
+          failWithHelp('invoice-auto-return', 'accounting module not enabled');
         }
 
         const enableFlag = args.includes('--enable');
         const disableFlag = args.includes('--disable');
         const invoiceIdx = args.indexOf('--invoice');
-        // W7-R17 fix: Validate --invoice has a following argument
         if (invoiceIdx !== -1 && !args[invoiceIdx + 1]) {
-          console.error('--invoice requires an invoice ID');
-          process.exit(1);
+          failWithHelp('invoice-auto-return', '--invoice requires an invoice ID');
         }
         const specificInvoice = invoiceIdx !== -1 ? args[invoiceIdx + 1] : undefined;
 
         if (!enableFlag && !disableFlag) {
           // Show current settings
           const settings = sphere.accounting.getAutoReturnSettings();
-          console.log('Auto-return settings:');
-          console.log(JSON.stringify(settings, null, 2));
+          formatOutput(settings as unknown as Record<string, unknown>, 'invoice-auto-return', 'Auto-return settings:');
         } else if (enableFlag && disableFlag) {
-          console.error('Cannot use both --enable and --disable');
-          process.exit(1);
+          failWithHelp('invoice-auto-return', 'cannot use both --enable and --disable');
         } else {
           const enabled = enableFlag;
           const invoiceId = specificInvoice ?? '*';
@@ -4726,38 +4878,51 @@ async function main(): Promise<void> {
         break;
       }
 
+      case 'invoice-receipts': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          failWithHelp('invoice-receipts', 'missing required <id-or-prefix> argument');
+        }
+
+        const sphere = await getSphere();
+        const invoiceId = await resolveInvoiceId(sphere, idOrPrefix, 'invoice-receipts');
+        const result = await sphere.accounting!.sendInvoiceReceipts(invoiceId);
+        formatOutput(result as unknown as Record<string, unknown>, 'invoice-receipts-result', 'Receipts result:');
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-notices': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          failWithHelp('invoice-notices', 'missing required <id-or-prefix> argument');
+        }
+
+        const sphere = await getSphere();
+        const invoiceId = await resolveInvoiceId(sphere, idOrPrefix, 'invoice-notices');
+        const result = await sphere.accounting!.sendCancellationNotices(invoiceId);
+        formatOutput(result as unknown as Record<string, unknown>, 'invoice-notices-result', 'Cancellation notices result:');
+
+        await closeSphere();
+        break;
+      }
+
       case 'invoice-transfers': {
         const idOrPrefix = args[1];
         if (!idOrPrefix) {
-          console.error('Usage: invoice-transfers <id-or-prefix>');
-          process.exit(1);
+          failWithHelp('invoice-transfers', 'missing required <id-or-prefix> argument');
         }
 
         const sphere = await getSphere();
         await ensureSync(sphere, 'full');
-        if (!sphere.accounting) {
-          console.error('Accounting module not enabled.');
-          process.exit(1);
-        }
+        const invoiceId = await resolveInvoiceId(sphere, idOrPrefix, 'invoice-transfers');
 
-        const allInvoices = await sphere.accounting.getInvoices();
-        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
-        if (matched.length === 0) {
-          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
-          process.exit(1);
-        }
-        if (matched.length > 1) {
-          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
-          process.exit(1);
-        }
-        const invoiceId = matched[0].invoiceId;
-
-        const transfers = sphere.accounting.getRelatedTransfers(invoiceId);
+        const transfers = sphere.accounting!.getRelatedTransfers(invoiceId);
         if (transfers.length === 0) {
           console.log('No related transfers found.');
         } else {
-          console.log(`Related transfers (${transfers.length}):`);
-          console.log(JSON.stringify(transfers, null, 2));
+          formatOutput(transfers as unknown[], 'invoice-transfers', `Related transfers (${transfers.length}):`);
         }
 
         await closeSphere();
@@ -4767,35 +4932,21 @@ async function main(): Promise<void> {
       case 'invoice-export': {
         const idOrPrefix = args[1];
         if (!idOrPrefix) {
-          console.error('Usage: invoice-export <id-or-prefix>');
-          process.exit(1);
+          failWithHelp('invoice-export', 'missing required <id-or-prefix> argument');
         }
 
         const sphere = await getSphere();
-        if (!sphere.accounting) {
-          console.error('Accounting module not enabled.');
-          process.exit(1);
-        }
-
-        const allInvoices = await sphere.accounting.getInvoices();
-        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
-        if (matched.length === 0) {
-          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
-          process.exit(1);
-        }
-        if (matched.length > 1) {
-          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
-          process.exit(1);
-        }
-        const invoiceId = matched[0].invoiceId;
+        const invoiceId = await resolveInvoiceId(sphere, idOrPrefix, 'invoice-export');
 
         // Get the invoice ref via getInvoice
-        const invoiceRef = sphere.accounting.getInvoice(invoiceId);
+        const invoiceRef = sphere.accounting!.getInvoice(invoiceId);
         if (!invoiceRef) {
-          console.error(`Invoice ${invoiceId} not found in memory.`);
-          process.exit(1);
+          failWithHelp('invoice-export', `invoice ${invoiceId} not found in memory`);
         }
 
+        // Exported file is always JSON — this is a wire-format dump, not a
+        // human-readable status display, so it stays as JSON regardless of
+        // the global --json flag.
         const outFile = `invoice-${invoiceId.slice(0, 8)}.json`;
         writeAtomic(outFile, JSON.stringify(invoiceRef, null, 2));
         console.log(`Invoice exported to: ${outFile}`);
@@ -4807,22 +4958,19 @@ async function main(): Promise<void> {
       case 'invoice-parse-memo': {
         const memoStr = args[1];
         if (!memoStr) {
-          console.error('Usage: invoice-parse-memo <memo-string>');
-          process.exit(1);
+          failWithHelp('invoice-parse-memo', 'missing required <memo-string> argument');
         }
 
         const sphere = await getSphere();
         if (!sphere.accounting) {
-          console.error('Accounting module not enabled.');
-          process.exit(1);
+          failWithHelp('invoice-parse-memo', 'accounting module not enabled');
         }
 
         const parsed = sphere.accounting.parseInvoiceMemo(memoStr);
         if (!parsed) {
           console.log('Not a valid invoice memo.');
         } else {
-          console.log('Parsed invoice memo:');
-          console.log(JSON.stringify(parsed, null, 2));
+          formatOutput(parsed as unknown as Record<string, unknown>, 'invoice-memo', 'Parsed invoice memo:');
         }
 
         await closeSphere();
@@ -4839,26 +4987,27 @@ async function main(): Promise<void> {
         const timeoutIdx = args.indexOf('--timeout');
         const messageIdx = args.indexOf('--message');
 
-        // Combined format: --offer "<amount> <coin>" --want "<amount> <coin>"
+        // Canonical asset input (issue #32): two-token positional form
+        //   --offer <amount> <coin>   --want <amount> <coin>
         const offerIdx = args.indexOf('--offer');
         const wantIdx = args.indexOf('--want');
 
-        if (toIdx === -1 || !args[toIdx + 1] ||
-            offerIdx === -1 || !args[offerIdx + 1] || args[offerIdx + 1].startsWith('--') ||
-            wantIdx === -1 || !args[wantIdx + 1] || args[wantIdx + 1].startsWith('--')) {
-          console.error('Usage: swap-propose --to <recipient> --offer "<amount> <coin>" --want "<amount> <coin>" [--escrow <address>] [--timeout <seconds>] [--message <text>]');
-          process.exit(1);
+        if (toIdx === -1 || !args[toIdx + 1]) {
+          failWithHelp('swap-propose', '--to <recipient> is required');
         }
-
-        const offer = parseAssetArg(args[offerIdx + 1]);
-        const want = parseAssetArg(args[wantIdx + 1]);
+        if (offerIdx === -1 || wantIdx === -1) {
+          failWithHelp('swap-propose', '--offer <amount> <coin> and --want <amount> <coin> are required');
+        }
+        const offer = consumeAssetPair(args, offerIdx + 1);
+        const want = consumeAssetPair(args, wantIdx + 1);
+        if (!offer) failWithHelp('swap-propose', '--offer expects two positional tokens: --offer <amount> <coin>');
+        if (!want)  failWithHelp('swap-propose', '--want expects two positional tokens: --want <amount> <coin>');
 
         let timeout = 3600;
         if (timeoutIdx !== -1 && args[timeoutIdx + 1]) {
           timeout = parseInt(args[timeoutIdx + 1], 10);
           if (isNaN(timeout) || timeout < 60 || timeout > 86400) {
-            console.error('--timeout must be an integer between 60 and 86400 seconds');
-            process.exit(1);
+            failWithHelp('swap-propose', '--timeout must be an integer between 60 and 86400 seconds');
           }
         }
 
@@ -4866,8 +5015,7 @@ async function main(): Promise<void> {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const swapModule = (sphere as any).swap;
         if (!swapModule) {
-          console.error('Swap module not enabled. Initialize with swap support.');
-          process.exit(1);
+          failWithHelp('swap-propose', 'swap module not enabled — initialize with swap support');
         }
 
         // Resolve coin symbols and convert human-readable amounts to smallest units
@@ -4877,12 +5025,10 @@ async function main(): Promise<void> {
         const offerSmallest = toSmallestUnit(offer.amount, offerCoin.decimals);
         const wantSmallest = toSmallestUnit(want.amount, wantCoin.decimals);
         if (offerSmallest <= 0n) {
-          console.error(`Invalid offer amount "${offer.amount}" — must be a positive number`);
-          process.exit(1);
+          failWithHelp('swap-propose', `invalid offer amount "${offer.amount}" — must be a positive number`);
         }
         if (wantSmallest <= 0n) {
-          console.error(`Invalid want amount "${want.amount}" — must be a positive number`);
-          process.exit(1);
+          failWithHelp('swap-propose', `invalid want amount "${want.amount}" — must be a positive number`);
         }
 
         const escrow = escrowIdx !== -1 ? args[escrowIdx + 1] : undefined;
@@ -4900,8 +5046,7 @@ async function main(): Promise<void> {
         };
 
         const result = await swapModule.proposeSwap(deal, message ? { message } : undefined);
-        console.log('Swap proposed:');
-        console.log(JSON.stringify({
+        formatOutput({
           swap_id: result.swapId,
           counterparty: args[toIdx + 1],
           offer: `${offer.amount} ${offerCoin.symbol}`,
@@ -4909,7 +5054,7 @@ async function main(): Promise<void> {
           escrow: deal.escrowAddress ?? '(config default)',
           timeout: timeout,
           status: result.swap?.progress ?? 'proposed',
-        }, null, 2));
+        }, 'generic', 'Swap proposed:');
 
         await closeSphere();
         break;
@@ -4924,8 +5069,7 @@ async function main(): Promise<void> {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const swapModule = (sphere as any).swap;
         if (!swapModule) {
-          console.error('Swap module not enabled.');
-          process.exit(1);
+          failWithHelp(command!, 'swap module not enabled');
         }
         await ensureSync(sphere, 'nostr');
 
@@ -5035,8 +5179,7 @@ async function main(): Promise<void> {
       case 'swap-accept': {
         const swapIdArg = args[1];
         if (!swapIdArg) {
-          console.error('Usage: swap-accept <swap_id_or_prefix> [--deposit] [--no-wait]');
-          process.exit(1);
+          failWithHelp('swap-accept', 'missing required <swap_id_or_prefix> argument');
         }
 
         const depositFlag = args.includes('--deposit');
@@ -5046,8 +5189,7 @@ async function main(): Promise<void> {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const swapModule = (sphere as any).swap;
         if (!swapModule) {
-          console.error('Swap module not enabled.');
-          process.exit(1);
+          failWithHelp(command!, 'swap module not enabled');
         }
         await ensureSync(sphere, 'nostr');
 
@@ -5139,28 +5281,24 @@ async function main(): Promise<void> {
       case 'swap-ping': {
         const escrowAddr = args[1];
         if (!escrowAddr) {
-          console.error('Usage: swap-ping <@nametag_or_address>');
-          process.exit(1);
+          failWithHelp('swap-ping', 'missing required <@nametag_or_address> argument');
         }
 
         const sphere = await getSphere();
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const swapModule = (sphere as any).swap;
         if (!swapModule) {
-          console.error('Swap module not enabled.');
           await closeSphere();
-          process.exit(1);
+          failWithHelp('swap-ping', 'swap module not enabled');
         }
         await ensureSync(sphere, 'nostr');
 
         try {
           const pong = await swapModule.pingEscrow(escrowAddr);
-          console.log('Escrow is online:');
-          console.log(JSON.stringify(pong, null, 2));
+          formatOutput(pong as unknown as Record<string, unknown>, 'swap-ping', 'Escrow is online:');
         } catch (err) {
-          console.error('Escrow ping failed:', err instanceof Error ? err.message : err);
           await closeSphere();
-          process.exit(1);
+          failWithHelp('swap-ping', `escrow ping failed: ${err instanceof Error ? err.message : err}`);
         }
 
         await closeSphere();
@@ -5170,8 +5308,7 @@ async function main(): Promise<void> {
       case 'swap-status': {
         const swapIdArg = args[1];
         if (!swapIdArg) {
-          console.error('Usage: swap-status <swap_id_or_prefix> [--query-escrow]');
-          process.exit(1);
+          failWithHelp('swap-status', 'missing required <swap_id_or_prefix> argument');
         }
 
         const queryEscrow = args.includes('--query-escrow');
@@ -5180,21 +5317,18 @@ async function main(): Promise<void> {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const swapModule = (sphere as any).swap;
         if (!swapModule) {
-          console.error('Swap module not enabled.');
-          process.exit(1);
+          failWithHelp(command!, 'swap module not enabled');
         }
         await ensureSync(sphere, 'nostr');
 
         const swapId = swapModule.resolveSwapId(swapIdArg);
         const status = await swapModule.getSwapStatus(swapId, queryEscrow ? { queryEscrow: true } : undefined);
-        console.log('Swap Status:');
-        console.log(JSON.stringify(status, null, 2));
+        formatOutput(status as Record<string, unknown>, 'swap-status', 'Swap Status:');
 
         if (status.depositInvoiceId && sphere.accounting) {
           try {
             const invoiceStatus = await sphere.accounting.getInvoiceStatus(status.depositInvoiceId);
-            console.log('\nDeposit Invoice Status:');
-            console.log(JSON.stringify(invoiceStatus, null, 2));
+            formatOutput(invoiceStatus as unknown as Record<string, unknown>, 'invoice-status', '\nDeposit Invoice Status:');
           } catch {
             // Non-fatal: invoice may not be imported yet
           }
@@ -5207,16 +5341,14 @@ async function main(): Promise<void> {
       case 'swap-deposit': {
         const swapIdArg = args[1];
         if (!swapIdArg) {
-          console.error('Usage: swap-deposit <swap_id_or_prefix>');
-          process.exit(1);
+          failWithHelp('swap-deposit', 'missing required <swap_id_or_prefix> argument');
         }
 
         const sphere = await getSphere();
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const swapModule = (sphere as any).swap;
         if (!swapModule) {
-          console.error('Swap module not enabled.');
-          process.exit(1);
+          failWithHelp(command!, 'swap module not enabled');
         }
         await ensureSync(sphere, 'full');
 
@@ -5270,8 +5402,7 @@ async function main(): Promise<void> {
         }
 
         const result = await swapModule.deposit(swapId);
-        console.log('Deposit result:');
-        console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
+        formatOutput({ id: result.id, status: result.status }, 'transfer-result', 'Deposit result:');
 
         // Wait for background tasks (e.g., change token creation from instant split)
         await sphere.payments.waitForPendingOperations();
@@ -5283,16 +5414,14 @@ async function main(): Promise<void> {
       case 'swap-reject': {
         const swapIdArg = args[1];
         if (!swapIdArg) {
-          console.error('Usage: swap-reject <swap_id_or_prefix> [reason]');
-          process.exit(1);
+          failWithHelp('swap-reject', 'missing required <swap_id_or_prefix> argument');
         }
 
         const sphere = await getSphere();
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const swapModule = (sphere as any).swap;
         if (!swapModule) {
-          console.error('Swap module not enabled.');
-          process.exit(1);
+          failWithHelp(command!, 'swap module not enabled');
         }
         await ensureSync(sphere, 'nostr');
 
@@ -5310,16 +5439,14 @@ async function main(): Promise<void> {
       case 'swap-cancel': {
         const swapIdArg = args[1];
         if (!swapIdArg) {
-          console.error('Usage: swap-cancel <swap_id_or_prefix>');
-          process.exit(1);
+          failWithHelp('swap-cancel', 'missing required <swap_id_or_prefix> argument');
         }
 
         const sphere = await getSphere();
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const swapModule = (sphere as any).swap;
         if (!swapModule) {
-          console.error('Swap module not enabled.');
-          process.exit(1);
+          failWithHelp(command!, 'swap module not enabled');
         }
         await ensureSync(sphere, 'nostr');
 
@@ -5345,9 +5472,7 @@ async function main(): Promise<void> {
             await statusDaemon(args.slice(2));
             break;
           default:
-            console.error(`Unknown daemon sub-command: ${sub}`);
-            console.error('Usage: daemon start|stop|status');
-            process.exit(1);
+            failWithHelp('daemon', `unknown daemon sub-command: "${sub}"`);
         }
         break;
       }
@@ -5355,13 +5480,7 @@ async function main(): Promise<void> {
       case 'completions': {
         const shell = args[1];
         if (!shell || !['bash', 'zsh', 'fish'].includes(shell)) {
-          console.error('Usage: completions <bash|zsh|fish>');
-          console.error('Generate shell completion script for tab-completion.');
-          console.error('\nSetup:');
-          console.error('  sphere-cli completions bash >> ~/.bashrc');
-          console.error('  sphere-cli completions zsh > ~/.zsh/completions/_sphere-cli');
-          console.error('  sphere-cli completions fish > ~/.config/fish/completions/sphere-cli.fish');
-          process.exit(1);
+          failWithHelp('completions', `missing or invalid shell argument — must be one of: bash, zsh, fish`);
         }
         switch (shell) {
           case 'bash': console.log(generateBashCompletions()); break;
@@ -5372,8 +5491,8 @@ async function main(): Promise<void> {
       }
 
       default:
-        console.error('Unknown command:', command);
-        console.error('Run with --help for usage');
+        console.error(`Unknown command: ${command}\n`);
+        console.error('Run "sphere help" for a list of all commands or "sphere <command> --help" for command-specific help.');
         process.exit(1);
     }
   } catch (e) {
@@ -5414,6 +5533,7 @@ function getCompletionCommands(): CompletionCommand[] {
       { name: 'use', description: 'Switch to a wallet profile' },
       { name: 'current', description: 'Show active profile' },
       { name: 'delete', description: 'Delete a wallet profile' },
+      { name: 'migrate', description: 'Import a legacy wallet into Profile storage', flags: ['--apply'] },
     ]},
     { name: 'balance', description: 'Show L3 token balance', flags: ['--finalize', '--no-sync'] },
     { name: 'tokens', description: 'List all tokens', flags: ['--no-sync'] },

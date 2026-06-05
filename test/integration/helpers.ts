@@ -2,7 +2,7 @@
  * Shared helpers for sphere-cli integration tests against real infrastructure.
  */
 
-import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import {
   mkdtempSync,
   rmSync,
@@ -103,16 +103,42 @@ function shredAllActive(): void {
 // produce a failed-test JSON report, and an extra handler calling
 // process.exit(1) would truncate that output. The `exit` handler below
 // still runs on vitest's natural shutdown and shreds any lingering envs.
-process.once('exit', shredAllActive);
-process.once('SIGINT', () => { shredAllActive(); process.exit(130); });
-process.once('SIGTERM', () => { shredAllActive(); process.exit(143); });
+//
+// Guard against double-registration: vitest may evaluate this module
+// more than once per worker (test-file isolation + module cache).
+// Without the guard, three handlers per file × N files trips Node's
+// default MaxListeners=10 warning. The flag lives on a global symbol
+// so it survives any per-import scope.
+const HANDLERS_REGISTERED = Symbol.for('sphere-cli-it-helpers-handlers-registered');
+if (!(globalThis as Record<symbol, unknown>)[HANDLERS_REGISTERED]) {
+  (globalThis as Record<symbol, unknown>)[HANDLERS_REGISTERED] = true;
+  process.once('exit', shredAllActive);
+  process.once('SIGINT', () => { shredAllActive(); process.exit(130); });
+  process.once('SIGTERM', () => { shredAllActive(); process.exit(143); });
+}
+
+/**
+ * Options for `createSphereEnv`.
+ */
+export interface CreateSphereEnvOptions {
+  /**
+   * Extra env vars to merge into the spawned CLI's env (overlaid on top
+   * of the allowlist + CI / FORCE_COLOR). Use sparingly — the env
+   * surface is intentionally narrow to avoid leaking parent state into
+   * child processes. Justified for things like `SPHERE_NOSTR_RELAYS`
+   * (override the network's default relay set when the test wants to
+   * point wallets at a local Docker relay) or `UNICITY_API_KEY`
+   * (forwarded explicitly when set).
+   */
+  readonly extraEnv?: Readonly<Record<string, string>>;
+}
 
 /**
  * Create an isolated sphere-cli profile rooted in a fresh 0700 tmp directory.
  * The CLI reads `./.sphere-cli/config.json` relative to cwd, so we set
  * cwd to the tmp home when invoking and pre-seed a testnet config.
  */
-export function createSphereEnv(label: string): SphereEnv {
+export function createSphereEnv(label: string, opts?: CreateSphereEnvOptions): SphereEnv {
   const home = mkdtempSync(join(tmpdir(), `${TMP_PREFIX}${label}-`));
   // Lock permissions to owner-only BEFORE writing anything. Testnet keys
   // are still secp256k1 material; don't leave a readable wallet on a
@@ -152,6 +178,12 @@ export function createSphereEnv(label: string): SphereEnv {
   if (typeof process.env['UNICITY_API_KEY'] === 'string') {
     env['UNICITY_API_KEY'] = process.env['UNICITY_API_KEY'];
   }
+  // Caller-supplied overlay. Applied LAST so it can override defaults.
+  // Used by the swap e2e suite to inject SPHERE_NOSTR_RELAYS pointing at
+  // a local Docker relay alongside the testnet relay.
+  if (opts?.extraEnv) {
+    for (const [k, v] of Object.entries(opts.extraEnv)) env[k] = v;
+  }
 
   return { home, env };
 }
@@ -180,6 +212,65 @@ export function runSphere(
     input: opts?.input,
     timeout: opts?.timeoutMs ?? 90_000,
     killSignal: 'SIGKILL',
+  });
+}
+
+/**
+ * Promise-based variant of {@link runSphere}. Use this when a test
+ * needs to run multiple CLI invocations concurrently — e.g., driving
+ * both peers' `swap deposit` commands in parallel so escrow sees both
+ * deposits land within the same polling window.
+ *
+ * Returns the same shape as `runSphere` (`SpawnSyncReturns<string>`)
+ * so callers can read `.status`, `.stdout`, `.stderr` identically.
+ * Internally uses `child_process.spawn` + Promise resolution; on
+ * timeout the process is SIGKILL'd and the returned object carries
+ * `signal: 'SIGKILL'` matching the sync wrapper's behaviour.
+ */
+export function runSphereAsync(
+  env: SphereEnv,
+  args: string[],
+  opts?: { input?: string; timeoutMs?: number },
+): Promise<SpawnSyncReturns<string>> {
+  return new Promise((resolve) => {
+    const child = spawn('node', [BIN_PATH, ...args], {
+      cwd: env.home,
+      env: env.env,
+    });
+
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    child.stdout?.on('data', (b: Buffer) => out.push(b));
+    child.stderr?.on('data', (b: Buffer) => err.push(b));
+
+    let timer: NodeJS.Timeout | null = null;
+    let timedOut = false;
+    const timeoutMs = opts?.timeoutMs ?? 90_000;
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        // Matching runSphere's killSignal: SIGKILL so a hung child
+        // holding open Nostr WebSockets can't outlive the budget.
+        child.kill('SIGKILL');
+      }, timeoutMs);
+    }
+
+    child.on('close', (status, signal) => {
+      if (timer) clearTimeout(timer);
+      resolve({
+        pid: child.pid ?? 0,
+        output: [null, Buffer.concat(out).toString('utf8'), Buffer.concat(err).toString('utf8')],
+        stdout: Buffer.concat(out).toString('utf8'),
+        stderr: Buffer.concat(err).toString('utf8'),
+        status,
+        signal: timedOut ? 'SIGKILL' : signal,
+      });
+    });
+
+    if (opts?.input !== undefined && child.stdin) {
+      child.stdin.write(opts.input);
+      child.stdin.end();
+    }
   });
 }
 

@@ -7,6 +7,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
+import { readPidFile, isDaemonProcessAlive } from './daemon.js';
+import { getDefaultPidFile } from './daemon-config.js';
 // `encrypt`, `decrypt`, `hexToWIF`, `generatePrivateKey`, and
 // `generateAddressFromMasterKey` are no longer top-level exports of
 // @unicitylabs/sphere-sdk — they live in the L1 (alpha-chain) namespace
@@ -22,7 +24,12 @@ import { isValidPrivateKey, base58Encode, base58Decode } from '@unicitylabs/sphe
 import { toSmallestUnit, toHumanReadable, formatAmount } from '@unicitylabs/sphere-sdk';
 import { getPublicKey } from '@unicitylabs/sphere-sdk';
 import { Sphere } from '@unicitylabs/sphere-sdk';
-import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+import { createNodeProviders, FileTokenStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs';
+import { importLegacyTokens } from '@unicitylabs/sphere-sdk/profile';
+import {
+  buildSphereProviders,
+  detectWalletKind,
+} from '../shared/sphere-providers.js';
 import { TokenRegistry } from '@unicitylabs/sphere-sdk';
 import { TokenValidator } from '@unicitylabs/sphere-sdk';
 import { tokenToTxf } from '@unicitylabs/sphere-sdk';
@@ -197,6 +204,36 @@ let sphereInstance: Sphere | null = null;
 let noNostrGlobal = false;
 
 /**
+ * Sentinel thrown by the `process.exit` interceptor in `main()` so the
+ * caller's synchronous control flow unwinds instead of continuing past
+ * the exit call.
+ *
+ * Background: the interceptor needs to destroy the Sphere instance
+ * (Nostr relays, IPFS handles, SQLite connections) BEFORE the real
+ * `process.exit`. Cleanup is async, so the wrapper used to return
+ * `undefined` after scheduling `inst.destroy().finally(originalExit)`.
+ * That left the calling line of code to continue executing — e.g.
+ * `process.exit(1)` after a "no invoice found" check fell through to
+ * `matched[0].invoiceId`, which crashed with "Cannot read properties of
+ * undefined" (see issue #21).
+ *
+ * Throwing this sentinel synchronously unwinds back to the outer
+ * try/catch in `main()`, which then awaits cleanup and calls the
+ * original `process.exit` with the requested code.
+ *
+ * Deliberately NOT extending `Error` so inner `catch (err)` blocks that
+ * test `err instanceof Error` (the common pattern in this file) do not
+ * classify it as a normal error worth logging. In practice every inner
+ * catch in this file either (a) re-calls `process.exit(N)` — which
+ * re-throws an ExitSignal and propagates correctly — or (b) sits over a
+ * try body that does no `process.exit` itself, so a thrown ExitSignal
+ * cannot reach it.
+ */
+class ExitSignal {
+  constructor(public readonly code: number) {}
+}
+
+/**
  * Create a no-op transport that does nothing.
  * Used with --no-nostr to prove IPFS-only recovery.
  */
@@ -219,16 +256,92 @@ function createNoopTransport(): TransportProvider {
   };
 }
 
+/**
+ * Issue #247 short-term gate — refuse to open a Sphere instance when a
+ * sphere daemon is running against the same wallet directory.
+ *
+ * Background: the daemon at `daemon.ts:711` parks the event loop forever
+ * with OrbitDB / Helia open. LevelDB takes a POSIX advisory file lock
+ * (`fcntl(F_SETLK)`) on `<dataDir>/orbitdb/<dbAddress>/_index/LOCK` and
+ * on `<dataDir>/datastore/LOCK`. The lease is held until SIGTERM. A
+ * second process opening the same directory hits `LEVEL_LOCKED` →
+ * `Database is not open`, and the PR #245/#246 3-attempt retry can
+ * never succeed because the contention isn't transient.
+ *
+ * The proper fix is a daemon-as-broker IPC surface (#247 long-term).
+ * This short-term gate detects the live-daemon case at CLI entry, exits
+ * with EX_TEMPFAIL, and tells the operator how to proceed.
+ *
+ * Skipped when the current process IS the daemon (PID match) — `daemon
+ * start` itself calls getSphere via the runDaemon callback to acquire
+ * its OrbitDB handle, and that path is the legitimate owner.
+ */
+function checkNoLiveDaemonOrExit(): void {
+  const pidFile = getDefaultPidFile();
+  const pidData = readPidFile(pidFile);
+  if (!pidData) return;
+  if (pidData.pid === process.pid) return; // we ARE the daemon
+  if (!isDaemonProcessAlive(pidData.pid)) return; // stale PID file
+  process.stderr.write(
+    `\nA sphere daemon is running (pid=${pidData.pid}) and holds the wallet's\n` +
+      `OrbitDB / Helia directory lock. CLI commands that open the wallet would\n` +
+      `fail with "Database is not open" after the bounded retry budget.\n\n` +
+      `Stop the daemon first:\n` +
+      `  sphere daemon stop\n\n` +
+      `Then re-run your command. (#247 follow-up will add a daemon-broker IPC\n` +
+      `surface so CLI commands can coexist with a running daemon.)\n`,
+  );
+  process.exit(75); // EX_TEMPFAIL — caller can retry after stopping the daemon.
+}
+
 async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; nametag?: string }): Promise<Sphere> {
   if (sphereInstance) return sphereInstance;
 
+  // Issue #247 — refuse to open Sphere when a daemon already holds the
+  // OrbitDB / Helia directory lock. Skipped when our own PID owns the
+  // PID file (i.e. `daemon start` calling back into getSphere).
+  checkNoLiveDaemonOrExit();
+
   const config = loadConfig();
-  const providers = createNodeProviders({
-    network: config.network,
-    dataDir: config.dataDir,
+
+  // Issue #23 — guard data-mutating bootstrap against legacy file-storage
+  // wallets. The deprecated IPNS-based `IpfsStorageProvider` path is gone;
+  // Profile (OrbitDB + aggregator pointer + IPFS CAR) replaces it. A
+  // wallet minted before the migration has `wallet.json` but no
+  // `${dataDir}/orbitdb/` — booting Profile against that dataDir would
+  // start a fresh empty Profile and silently leave the user's token
+  // state in the legacy files. Instead, exit with EX_TEMPFAIL and tell
+  // the user to run `sphere wallet migrate`, which imports the legacy
+  // token state into Profile non-destructively (via the SDK's
+  // `importLegacyTokens`).
+  //
+  // Suppress the gate when the caller is supplying a mnemonic — those
+  // flows (`init --mnemonic`, `wallet recover`) are meant to seed a new
+  // wallet against the configured dataDir, so detection of pre-existing
+  // legacy data would be a false positive against the very state the
+  // user is replacing.
+  const isSeedingFromMnemonic =
+    typeof options?.mnemonic === 'string' && options.mnemonic.length > 0;
+  if (!isSeedingFromMnemonic) {
+    const kind = detectWalletKind(config.dataDir);
+    if (kind === 'legacy') {
+      process.stderr.write(
+        `\nLegacy wallet detected at ${config.dataDir} (file storage + IPNS sync).\n` +
+          'This CLI no longer boots the deprecated IpfsStorageProvider path.\n\n' +
+          'Migrate non-destructively to the new Profile storage:\n' +
+          '  npm run cli -- wallet migrate          # dry-run summary first\n' +
+          '  npm run cli -- wallet migrate --apply  # commit the import\n\n' +
+          'See GitHub sphere-cli#23 for the migration rationale.\n',
+      );
+      process.exit(75); // EX_TEMPFAIL — caller can retry after migrating.
+    }
+  }
+
+  const providers = buildSphereProviders({
+    network:   config.network,
+    dataDir:   config.dataDir,
     tokensDir: config.tokensDir,
-    tokenSync: { ipfs: { enabled: true } },
-    market: true,
+    market:    true,
     groupChat: true,
   });
 
@@ -249,10 +362,9 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
 
   sphereInstance = result.sphere;
 
-  // Attach IPFS storage provider for sync if available
-  if (providers.ipfsTokenStorage) {
-    await sphereInstance.addTokenStorageProvider(providers.ipfsTokenStorage);
-  }
+  // The deprecated `addTokenStorageProvider(ipfsTokenStorage)` call that
+  // used to live here is GONE — Profile's OrbitDB replication subsumes
+  // what IpfsStorageProvider was doing.
 
   return sphereInstance;
 }
@@ -483,7 +595,7 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       'npm run cli -- wallet delete myprofile',
     ],
     notes: [
-      'Subcommands: list, create, use, current, delete',
+      'Subcommands: list, create, use, current, delete, migrate',
       'Use "help wallet <subcommand>" for detailed help on each.',
     ],
   },
@@ -530,6 +642,23 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     ],
     notes: [
       'Cannot delete the currently active profile. Switch to a different profile first.',
+    ],
+  },
+  'wallet migrate': {
+    usage: 'wallet migrate [--apply]',
+    description:
+      'Import a legacy file-storage wallet into the new Profile storage (OrbitDB + aggregator pointer + IPFS CAR). ' +
+      'Non-destructive: legacy files are NOT removed. Defaults to a dry-run summary. Pass `--apply` to commit.',
+    flags: [
+      { flag: '--apply', description: 'Commit the import (otherwise dry-run summary only)' },
+    ],
+    examples: [
+      'npm run cli -- wallet migrate',
+      'npm run cli -- wallet migrate --apply',
+    ],
+    notes: [
+      'Auto-detects the wallet kind from the dataDir layout (`orbitdb/` subdir = already on Profile).',
+      'Replaces the deprecated `IpfsStorageProvider` path; see GitHub sphere-cli#23.',
     ],
   },
 
@@ -1551,17 +1680,25 @@ export async function legacyMain(argv: string[]): Promise<void> {
 async function main(): Promise<void> {
   // Intercept process.exit() so we tear down the Sphere instance (Nostr
   // relays, IPFS handles, SQLite connections) before the process dies.
-  // Inside command handlers there are ~25 `process.exit(1)` calls that
+  // Inside command handlers there are ~180 `process.exit(N)` calls that
   // would otherwise skip finally blocks and leak resources.
+  //
+  // We CANNOT return synchronously from this wrapper after scheduling
+  // an async destroy — the caller's next statement would still run and
+  // typically crashes when it dereferences a result that should have
+  // been "guarded" by the exit (e.g. invoice-status calling
+  // `matched[0].invoiceId` after `process.exit(1)` on an empty array;
+  // see issue #21).
+  //
+  // Instead we throw an `ExitSignal` sentinel. The outer try/catch in
+  // this function awaits `closeSphere()` and then calls `originalExit`
+  // with the requested code. When no Sphere instance is loaded (early
+  // arg-validation paths) we fall straight through to `originalExit`,
+  // matching the previous synchronous behaviour.
   const originalExit = process.exit.bind(process);
   process.exit = ((code?: number) => {
     if (sphereInstance) {
-      const inst = sphereInstance;
-      sphereInstance = null;
-      inst.destroy()
-        .catch(() => { /* best-effort cleanup */ })
-        .finally(() => originalExit(code));
-      return undefined as never;
+      throw new ExitSignal((code as number) ?? 0);
     }
     return originalExit(code);
   }) as typeof process.exit;
@@ -1765,17 +1902,44 @@ async function main(): Promise<void> {
         }
 
         const config = loadConfig();
-        const providers = createNodeProviders({
-          network: config.network,
-          dataDir: config.dataDir,
-          tokensDir: config.tokensDir,
-        });
+
+        // Issue #23 — clear path depends on the wallet kind:
+        //   - 'legacy' or 'fresh' → use the legacy provider bundle.
+        //     Booting Profile here would needlessly spin up OrbitDB
+        //     (and depend on libp2p peer connectivity) only to wipe
+        //     empty state.
+        //   - 'profile' → use the Profile provider bundle. Profile's
+        //     local-cache layer is a FileStorageProvider against the
+        //     same wallet.json, so its `clear()` removes the legacy
+        //     wallet.json too. Token storage (OrbitDB) is wiped via
+        //     the Profile token storage's `clear()`.
+        //
+        // Post-migrate wallets fall under 'profile' — any legacy
+        // tokensDir contents that survived the migration are NOT
+        // cleared by Profile's wipe. Users with such residue can `rm
+        // -rf` the tokensDir manually; an automated cleanup belongs
+        // to a follow-up archive flag, not the destructive clear.
+        const kind = detectWalletKind(config.dataDir);
+        const providers = kind === 'profile'
+          ? buildSphereProviders({
+              network:   config.network,
+              dataDir:   config.dataDir,
+              tokensDir: config.tokensDir,
+            })
+          : createNodeProviders({
+              network:   config.network,
+              dataDir:   config.dataDir,
+              tokensDir: config.tokensDir,
+            });
 
         await providers.storage.connect();
         await providers.tokenStorage.initialize();
 
         console.log('Clearing all wallet data...');
-        await Sphere.clear({ storage: providers.storage, tokenStorage: providers.tokenStorage });
+        await Sphere.clear({
+          storage: providers.storage,
+          tokenStorage: providers.tokenStorage,
+        });
         console.log('All wallet data cleared.');
 
         await providers.storage.disconnect();
@@ -1818,19 +1982,29 @@ async function main(): Promise<void> {
             }
 
             if (switchToProfile(profileName)) {
-              console.log(`✓ Switched to wallet profile: ${profileName}`);
+              // Issue sphere-sdk#282 Residual #2 — confirmation output
+              // goes to STDERR so that pipelines capturing the NEXT
+              // command's stdout (e.g. `sphere wallet use alice &&
+              // sphere balance > file`) don't accidentally include the
+              // wallet-use banner in the captured snapshot. Without
+              // this, the same logical command sequence produces
+              // different captured-stdout content depending on whether
+              // the harness redirects the `wallet use` invocation
+              // separately or groups it in a subshell — see the
+              // peer1-vs-peer2 asymmetry in `manual-test-full-recovery.sh`.
+              console.error(`✓ Switched to wallet profile: ${profileName}`);
 
               // Show wallet status
               try {
                 const sphere = await getSphere();
                 const identity = sphere.identity;
                 if (identity) {
-                  console.log(`  Nametag:  ${identity.nametag || '(not set)'}`);
-                  console.log(`  L1 Addr:  ${identity.l1Address}`);
+                  console.error(`  Nametag:  ${identity.nametag || '(not set)'}`);
+                  console.error(`  L1 Addr:  ${identity.l1Address}`);
                 }
                 await closeSphere();
               } catch {
-                console.log('  (wallet not initialized in this profile)');
+                console.error('  (wallet not initialized in this profile)');
               }
             } else {
               console.error(`Profile "${profileName}" not found.`);
@@ -1952,6 +2126,203 @@ async function main(): Promise<void> {
             break;
           }
 
+          // Issue #23 — non-destructive import of legacy file-storage
+          // token state into the new Profile-backed wallet. Mirrors the
+          // sphere-sdk `importLegacyTokens` helper's semantics (always
+          // explicit, idempotent, leaves the source untouched).
+          //
+          // Default is dry-run: prints what *would* happen but writes
+          // nothing. Pass `--apply` to actually import. Legacy files
+          // stay on disk afterwards — the user removes them via
+          // `wallet clear` (which wipes everything) or by hand. A
+          // future PR can add an `--archive` flag if usage feedback
+          // demands it.
+          case 'migrate': {
+            const apply = args.includes('--apply');
+            const config = loadConfig();
+
+            const kind = detectWalletKind(config.dataDir);
+            if (kind === 'fresh') {
+              console.log(`No wallet found at ${config.dataDir} — nothing to migrate.`);
+              break;
+            }
+            if (kind === 'profile') {
+              console.log(
+                `Wallet at ${config.dataDir} is already on the Profile path ` +
+                  `(\`orbitdb/\` subdir present). Nothing to migrate.`,
+              );
+              break;
+            }
+
+            // ------------------------------------------------------
+            // DRY RUN — strictly side-effect-free w.r.t. Profile.
+            //
+            // Boot Sphere with the LEGACY provider bundle (no
+            // Profile), with the Nostr transport stubbed to a noop
+            // so we don't open relay sockets just to enumerate
+            // local files. Sphere.init loads the identity from
+            // wallet.json and propagates it onto
+            // `legacyProviders.tokenStorage`, which is exactly the
+            // shape `importLegacyTokens` reads from. The `orbitdb/`
+            // subdir is NOT created on this path — re-classifying
+            // the wallet after a dry-run still returns 'legacy'.
+            //
+            // The dry-run branch of `importLegacyTokens` does NOT
+            // touch `targetPayments`; cast `null` through `unknown`
+            // to satisfy the TS signature without constructing a
+            // PaymentsModule. If the SDK ever uses targetPayments in
+            // its dry-run path, that change surfaces here as a
+            // crash with a useful TypeError instead of a silent
+            // semantic drift.
+            // ------------------------------------------------------
+            if (!apply) {
+              console.log(`Legacy wallet at ${config.dataDir} — dry-run inventory...`);
+
+              const legacyProviders = createNodeProviders({
+                network:   config.network,
+                dataDir:   config.dataDir,
+                tokensDir: config.tokensDir,
+              });
+
+              const { sphere: legacySphere } = await Sphere.init({
+                ...legacyProviders,
+                transport: createNoopTransport(),
+                autoGenerate: false,
+              });
+
+              try {
+                const dryRunResult = await importLegacyTokens(
+                  legacyProviders.tokenStorage,
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  null as any,
+                  { dryRun: true },
+                );
+
+                console.log('');
+                console.log(`Legacy token inventory at ${config.tokensDir}:`);
+                console.log(`  Tokens found:      ${dryRunResult.tokensFound}`);
+                console.log(`  Forks skipped:     ${dryRunResult.forksSkipped} (not imported by design)`);
+                if (dryRunResult.error) {
+                  console.log(`  Source error:      ${dryRunResult.error}`);
+                }
+                console.log('');
+                console.log('This was a dry run. To commit the import, re-run with `--apply`:');
+                console.log('  npm run cli -- wallet migrate --apply');
+              } finally {
+                await legacySphere.destroy();
+              }
+              break;
+            }
+
+            // ------------------------------------------------------
+            // APPLY — boot Profile and import via `importLegacyTokens`.
+            //
+            // The Profile factory wraps the same FileStorageProvider
+            // that the legacy bundle uses, so wallet.json (identity /
+            // mnemonic / tracked addresses) is preserved across the
+            // boot. After this point, `orbitdb/` exists on disk and
+            // detectWalletKind will return 'profile' on subsequent
+            // calls.
+            // ------------------------------------------------------
+            console.log(`Legacy wallet at ${config.dataDir} — applying migration...`);
+
+            const providers = buildSphereProviders({
+              network:   config.network,
+              dataDir:   config.dataDir,
+              tokensDir: config.tokensDir,
+              market:    true,
+              groupChat: true,
+            });
+            const initProviders = noNostrGlobal
+              ? { ...providers, transport: createNoopTransport() }
+              : providers;
+
+            const { sphere } = await Sphere.init({
+              ...initProviders,
+              autoGenerate: false,
+              market: true,
+              groupChat: true,
+              accounting: true,
+              swap: true,
+            });
+
+            try {
+              const identity = sphere.identity;
+              if (!identity?.directAddress) {
+                console.error(
+                  'Migration aborted: Sphere booted but identity has no directAddress. ' +
+                    'wallet.json may be corrupted — back it up and re-run `sphere init`.',
+                );
+                process.exit(1);
+              }
+
+              // Source — the legacy `tokensDir/${addressId}/` layout.
+              // We construct a fresh FileTokenStorageProvider rather
+              // than reuse `createNodeProviders().tokenStorage` so the
+              // identity wiring is explicit and there's no second
+              // pass at the wallet.json file that might race the
+              // Profile's local cache.
+              const legacyTokenStorage = new FileTokenStorageProvider({
+                tokensDir: config.tokensDir,
+              });
+              // FileTokenStorageProvider's tokensDir resolver only
+              // touches `identity.directAddress`. The TS signature
+              // demands `FullIdentity` (incl. privateKey) — we cast a
+              // partial since the read path doesn't sign anything.
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              legacyTokenStorage.setIdentity(identity as any);
+              await legacyTokenStorage.initialize();
+
+              console.log('');
+              console.log('Applying migration...');
+              const applyResult = await importLegacyTokens(
+                legacyTokenStorage,
+                // The sphere-sdk tsup bundle declares `PaymentsModule`
+                // separately in `dist/index.d.ts` and `dist/profile/index.d.ts`.
+                // TypeScript treats them as nominally distinct because each has
+                // its own private members. The runtime class is the SAME — the
+                // duplication is a build artifact. Casting through unknown is
+                // the documented escape hatch until the SDK bundle layout is
+                // refactored to share types across subpaths.
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                sphere.payments as any,
+                { dryRun: false },
+              );
+
+              console.log('');
+              console.log('Migration complete:');
+              console.log(`  Imported:          ${applyResult.tokensAdded}`);
+              console.log(`  Skipped:           ${applyResult.tokensSkipped}` +
+                          ` (duplicates=${applyResult.skippedByCode.duplicate}` +
+                          `, tombstoned=${applyResult.skippedByCode.tombstoned}` +
+                          `, genesis-exists=${applyResult.skippedByCode['genesis-exists']}` +
+                          `, unknown=${applyResult.skippedByCode.unknown})`);
+              console.log(`  Rejected:          ${applyResult.tokensRejected}`);
+              console.log(`  Duration:          ${applyResult.durationMs} ms`);
+              if (applyResult.error) {
+                console.log(`  Error:             ${applyResult.error}`);
+              }
+              if (applyResult.tokensRejected > 0) {
+                console.log('');
+                console.log(`Rejection details (up to 100 shown, truncated=${applyResult.rejectionsTruncated}):`);
+                for (const r of applyResult.rejections) {
+                  console.log(`  - tokenId=${r.genesisTokenId} code=${r.code} reason=${r.reason}`);
+                }
+              }
+
+              console.log('');
+              console.log(
+                `Legacy files at ${config.tokensDir} were NOT removed. They are now redundant — ` +
+                  'delete them manually or run `wallet clear` for a full reset.',
+              );
+
+              await legacyTokenStorage.shutdown();
+            } finally {
+              await sphere.destroy();
+            }
+            break;
+          }
+
           default:
             console.error('Unknown wallet subcommand:', subCmd);
             console.log('\nUsage:');
@@ -1960,6 +2331,7 @@ async function main(): Promise<void> {
             console.log('  wallet create <name>     Create new profile');
             console.log('  wallet current           Show current profile');
             console.log('  wallet delete <name>     Delete profile');
+            console.log('  wallet migrate [--apply] Import legacy wallet into Profile storage');
             process.exit(1);
         }
         break;
@@ -3761,7 +4133,25 @@ async function main(): Promise<void> {
             console.error('Usage: invoice-create --target <address> --asset "<amount> <coin>" [--nft <id>] [--due <ISO-date>] [--memo <text>] [--delivery <method>] [--terms <json-file>]');
             process.exit(1);
           }
-          const targetAddress = args[targetIdx + 1];
+          let targetAddress = args[targetIdx + 1];
+          // Accept `@nametag` (and chain-pubkey / alpha1...) as targets for
+          // user convenience — symmetric with `payments send --recipient`.
+          // AccountingModule.createInvoice itself requires a canonical
+          // `DIRECT://` address because invoice terms commit (cryptographically
+          // bind) the recipient identity, so we resolve once here before
+          // constructing the request. The resolved address is what gets baked
+          // into the invoice's signed terms.
+          if (!targetAddress.startsWith('DIRECT://')) {
+            const resolved = await sphere.resolve(targetAddress);
+            if (!resolved || !resolved.directAddress) {
+              console.error(
+                `Could not resolve target "${targetAddress}" to a DIRECT:// address. ` +
+                  'Provide an @nametag, chain pubkey, alpha1 address, or a DIRECT:// address.',
+              );
+              process.exit(1);
+            }
+            targetAddress = resolved.directAddress;
+          }
           const nftId = nftIdx !== -1 ? args[nftIdx + 1] : undefined;
           const dueDate = dueIdx !== -1 ? new Date(args[dueIdx + 1]).getTime() : undefined;
           if (dueDate !== undefined && isNaN(dueDate)) {
@@ -3778,8 +4168,15 @@ async function main(): Promise<void> {
               console.error(`Invalid amount "${parsed.amount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
               process.exit(1);
             }
-            const { coinId: resolvedCoinId } = resolveCoin(parsed.coin);
-            assets.push({ coin: [resolvedCoinId, parsed.amount] });
+            // AccountingModule.createInvoice validates coinId as
+            // /^[A-Za-z0-9]+$/ with length ≤20 — i.e. it expects the
+            // human-readable symbol (UCT, USDU, ...), NOT the 64-char
+            // hex token-type id that `payments.send` uses. resolveCoin
+            // is still useful to fail fast on unknown symbols (it
+            // exits non-zero before invoice mint), but we hand the
+            // SYMBOL through to the SDK.
+            const { symbol: resolvedSymbol } = resolveCoin(parsed.coin);
+            assets.push({ coin: [resolvedSymbol, parsed.amount] });
           } else if (nftId) {
             assets.push({ nft: { tokenId: nftId } });
           }
@@ -3846,13 +4243,101 @@ async function main(): Promise<void> {
         break;
       }
 
+      case 'invoice-deliver': {
+        // sphere invoice deliver <id-or-prefix> [--to <recipient>...] [--memo <text>]
+        //
+        // Ships a previously-minted invoice to its targets (default) or to
+        // an explicit recipient list via the SDK's deliverInvoice() —
+        // packages the invoice token into a UXF bundle and sends it inside
+        // an `invoice_delivery:` NIP-17 DM. Per-recipient outcome is
+        // surfaced as JSON for scripting (manual-test-full-recovery.sh §C
+        // calls this between `invoice create` and Bob's `invoice pay`).
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-deliver <id-or-prefix> [--to <recipient>...] [--memo <text>]');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled. Initialize with accounting support.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'full');
+
+        // Prefix-match against the local invoice ledger so callers can use
+        // any unambiguous prefix (parallel to invoice-pay).
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        // Collect every `--to <recipient>` flag (repeatable). When absent,
+        // the SDK defaults to every non-self target from the invoice terms.
+        const recipients: string[] = [];
+        for (let i = 0; i < args.length - 1; i++) {
+          if (args[i] === '--to') {
+            const v = args[i + 1];
+            if (typeof v === 'string' && v.length > 0) recipients.push(v);
+          }
+        }
+
+        const memoIdx3 = args.indexOf('--memo');
+        const memo = memoIdx3 !== -1 ? args[memoIdx3 + 1] : undefined;
+
+        const optionsMut: Record<string, unknown> = {};
+        if (recipients.length > 0) optionsMut['recipients'] = recipients;
+        if (memo !== undefined) optionsMut['memo'] = memo;
+
+        let result;
+        try {
+          result = await sphere.accounting.deliverInvoice(invoiceId, optionsMut as Parameters<typeof sphere.accounting.deliverInvoice>[1]);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Failed to deliver invoice: ${msg}`);
+          // process.exit(1) below throws an ExitSignal which the outer
+          // catch in main() converts into a real exit. The `return` is
+          // unreachable but kept as a defensive marker so a future
+          // refactor of the wrapper cannot silently reintroduce the
+          // fall-through that #21 / #226 fixed.
+          process.exit(1);
+          return;
+        }
+        console.log('Invoice delivery result:');
+        console.log(JSON.stringify(result, null, 2));
+
+        if (result.failed > 0) {
+          // Non-zero exit so shell scripts can distinguish full success
+          // from partial failure. The per-recipient detail above tells
+          // the operator which targets failed and why.
+          process.exit(2);
+          return;
+        }
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
       case 'invoice-list': {
         const sphere = await getSphere();
         if (!sphere.accounting) {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
-        await ensureSync(sphere, 'nostr');
+        // Invoice listing surfaces invoice tokens, including those received
+        // cross-device via Profile/IPFS sync. 'nostr' only pulls inbox DMs
+        // and skips the IPFS pull, so on a fresh device or after a wipe the
+        // list misses invoices that landed on another peer. Use 'full' to
+        // include the IPFS / Profile pointer pull (issue sphere-cli#24).
+        await ensureSync(sphere, 'full');
 
         const stateIdx = args.indexOf('--state');
         const limitIdx2 = args.indexOf('--limit');
@@ -3915,7 +4400,12 @@ async function main(): Promise<void> {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
-        await ensureSync(sphere, 'nostr');
+        // Per-target balance is computed from on-chain payment attribution,
+        // which requires the IPFS / Profile pointer pull — not just the
+        // Nostr inbox. 'nostr' mode skips that pull, so on a fresh device
+        // or after a wipe the status is stale / "No invoice found" even
+        // when the invoice exists on another peer (issue sphere-cli#24).
+        await ensureSync(sphere, 'full');
 
         // Resolve ID from prefix
         const allInvoices = await sphere.accounting.getInvoices();
@@ -4103,7 +4593,11 @@ async function main(): Promise<void> {
         if (assetIdx3 !== -1 && args[assetIdx3 + 1]) {
           const parsed = parseAssetArg(args[assetIdx3 + 1]);
           returnAmount = parsed.amount;
-          returnCoinId = resolveCoin(parsed.coin).coinId;
+          // Same SDK convention as invoice-create — the AccountingModule's
+          // ReturnPaymentParams.coinId is the symbol (UCT, USDU, ...), not
+          // the 64-char hex. resolveCoin still validates that the symbol
+          // is known to the TokenRegistry.
+          returnCoinId = resolveCoin(parsed.coin).symbol;
         } else {
           console.error('--asset "<amount> <coin>" is required for invoice-return');
           process.exit(1);
@@ -4883,9 +5377,17 @@ async function main(): Promise<void> {
         process.exit(1);
     }
   } catch (e) {
+    if (e instanceof ExitSignal) {
+      // Intentional `process.exit(N)` from a command handler. Cleanup and
+      // forward the requested code through the original (non-wrapped) exit
+      // so we don't re-enter this catch.
+      await closeSphere().catch(() => { /* best-effort cleanup */ });
+      originalExit(e.code);
+      return;
+    }
     console.error('Error:', e instanceof Error ? e.message : e);
     await closeSphere().catch(() => { /* best-effort cleanup */ });
-    process.exit(1);
+    originalExit(1);
   }
 }
 
@@ -4947,6 +5449,7 @@ function getCompletionCommands(): CompletionCommand[] {
     { name: 'group-members', description: 'List group members' },
     { name: 'group-info', description: 'Show group details' },
     { name: 'invoice-create', description: 'Create an invoice', flags: ['--target', '--asset', '--nft', '--due', '--memo', '--delivery', '--anonymous', '--terms'] },
+    { name: 'invoice-deliver', description: 'Deliver an existing invoice to its targets (UXF DM)', flags: ['--to', '--memo'] },
     { name: 'invoice-import', description: 'Import invoice from token file' },
     { name: 'invoice-list', description: 'List invoices', flags: ['--state', '--limit'] },
     { name: 'invoice-status', description: 'Show invoice status' },

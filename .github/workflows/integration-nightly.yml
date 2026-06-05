@@ -35,11 +35,15 @@ jobs:
           cache: npm
 
       # See ci.yml for the rationale behind the sibling-clone workaround.
-      # Kept identical here so a nightly run is hermetic w.r.t. ci.yml state.
+      # Kept identical here (same SHA pin) so a nightly run is hermetic
+      # w.r.t. ci.yml state — bump both together when needed.
       - name: Clone sphere-sdk sibling
+        env:
+          SPHERE_SDK_SHA: 02cb4550facae0bea58c3b04aceaf3059599464b
         run: |
-          git clone --depth 1 --branch refactor/extract-cli-to-sphere-cli \
-            https://github.com/unicity-sphere/sphere-sdk.git ../../sphere-sdk
+          git clone https://github.com/unicity-sphere/sphere-sdk.git ../../sphere-sdk
+          git -C ../../sphere-sdk fetch origin "$SPHERE_SDK_SHA" || true
+          git -C ../../sphere-sdk checkout --detach "$SPHERE_SDK_SHA"
 
       - name: Build sphere-sdk (required for file: dependency to resolve types)
         run: |

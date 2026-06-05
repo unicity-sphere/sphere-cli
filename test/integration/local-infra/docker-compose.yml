@@ -1,0 +1,69 @@
+# =============================================================================
+# Local infrastructure for sphere-cli swap e2e tests.
+#
+# Boots a local Nostr relay so the swap e2e suite can run against a
+# deterministic, in-process stack instead of the public testnet relay.
+# Useful when:
+#   - the public testnet relay's write path is degraded;
+#   - CI runs need reproducibility (no shared rate limits, no
+#     nametag collisions across concurrent jobs);
+#   - debugging the swap DM protocol against a SQLite-backed relay
+#     we can `docker exec sqlite3 ./events.db`.
+#
+# Source: ported from /home/vrogojin/trader-service/test/e2e-live/local-infra/
+# which itself was ported from /home/vrogojin/uxf/tests/e2e/local-infra/.
+#
+# Aggregator (L3) and IPFS gateway are NOT replaced — the public Unicity
+# testnet aggregator/IPFS are reliable enough, and the SDK has no
+# aggregator stub that would round-trip real inclusion proofs. The escrow
+# container and sphere-cli wallets continue to talk to:
+#   wss://goggregator-test.unicity.network
+#   https://unicity-ipfs1.dyndns.org
+#
+# Usage from the swap e2e suite:
+#   docker compose -f test/integration/local-infra/docker-compose.yml up -d
+#   …run tests with SPHERE_NOSTR_RELAYS pointed at ws://<gateway>:7778
+#   docker compose -f test/integration/local-infra/docker-compose.yml down -v
+#
+# Versions are pinned. Update via the test harness so any change here is
+# paired with documented re-validation.
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Local Nostr relay — ghcr.io/unicitynetwork/unicity-tokens-relay
+  #
+  # The Unicity org publishes a built nostr-rs-relay image. Pinned to a
+  # specific SHA so unrelated relay updates don't silently change test
+  # behaviour. Bump this when validating against a newer relay release.
+  #
+  # We bind to port 7778 (not 7777) to avoid colliding with the
+  # trader-service e2e harness when both run in the same developer
+  # environment.
+  # ---------------------------------------------------------------------------
+  relay:
+    image: ghcr.io/unicitynetwork/unicity-tokens-relay:sha-1e1b544
+    container_name: sphere-cli-swap-relay
+    restart: unless-stopped
+    ports:
+      # Bind to ALL interfaces so the escrow container (running in its own
+      # Docker network) can reach the relay via the host bridge gateway IP
+      # (typically 172.17.0.1 on Linux Docker). The escrow-spawn helper
+      # detects this gateway at boot and passes it via UNICITY_RELAYS.
+      - "0.0.0.0:7778:8080"
+    volumes:
+      # Persist the SQLite event log between container restarts so a
+      # failing test can be post-mortemed via `docker exec sqlite3`.
+      # `down -v` wipes; plain `down` keeps for inspection.
+      - sphere-cli-swap-relay-data:/usr/src/app/db
+    healthcheck:
+      # NIP-11 info doc returns relay metadata on HTTP. A 200 response
+      # confirms the WebSocket listener (same handler) is up.
+      test: ["CMD-SHELL", "wget -q -O - --header='Accept: application/nostr+json' http://127.0.0.1:8080 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  sphere-cli-swap-relay-data:

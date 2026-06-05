@@ -42,7 +42,7 @@ interface PidFileData {
  * Parse a PID file. Handles both the new JSON format and the legacy plain-text
  * format (just a number). Returns null on parse failure or missing file.
  */
-function readPidFile(pidFile: string): PidFileData | null {
+export function readPidFile(pidFile: string): PidFileData | null {
   let raw: string;
   try {
     raw = fs.readFileSync(pidFile, 'utf8').trim();
@@ -81,7 +81,7 @@ function readPidFile(pidFile: string): PidFileData | null {
  * Returns false for dead PIDs and for PIDs that are alive but clearly not ours
  * (i.e. PID reuse case).
  */
-function isDaemonProcessAlive(pid: number): boolean {
+export function isDaemonProcessAlive(pid: number): boolean {
   if (!isProcessAlive(pid)) return false;
   // Best-effort PID reuse detection via /proc/<pid>/comm (Linux only).
   try {
@@ -442,9 +442,13 @@ let verboseMode = false;
 function log(message: string): void {
   const line = message.startsWith('[') ? message : `[${new Date().toISOString()}] ${message}`;
   if (logStream) {
+    // In forked mode the WriteStream IS the log destination — avoid
+    // double-writing via the (now-redirected) console.log which also
+    // forwards to the same stream.
     logStream.write(line + '\n');
+  } else {
+    console.log(line);
   }
-  console.log(line);
 }
 
 // =============================================================================
@@ -569,8 +573,23 @@ export async function runDaemon(
       throw e;
     }
 
-    // Disconnect from parent
-    if (process.disconnect) process.disconnect();
+    // Disconnect from parent's IPC channel if one exists. The parent's
+    // detachDaemon call passes 'ipc' in stdio (Fix issue #19) so the channel
+    // is normally open here; the `process.connected` guard handles the
+    // edge case of running with a non-IPC stdio (test harnesses, manual
+    // invocation of `daemon start --_forked`). Calling `process.disconnect()`
+    // without a live channel throws "IPC channel is not open", which under
+    // `stdio: 'ignore'` would crash the child silently with no log trail.
+    //
+    // The try/catch handles a residual race: the parent's child.disconnect()
+    // closes the channel at the OS layer, but the JS 'disconnect' event
+    // (which flips process.connected to false) is async — there's a microtask
+    // window where process.connected reads true while the underlying channel
+    // is already torn down, in which case disconnect() throws. Swallowing
+    // here is correct: the goal state (channel closed) already holds.
+    if (process.connected && process.disconnect) {
+      try { process.disconnect(); } catch { /* already torn down by parent */ }
+    }
 
     // Restore on exit for cleanup logging
     process.on('exit', () => {
@@ -697,14 +716,21 @@ export async function runDaemon(
 // =============================================================================
 
 function detachDaemon(args: string[], flags: DaemonFlags): void {
-  // Build the resolved config just to get the PID file path
+  // Resolve config once so we have BOTH the PID file path (for the advisory
+  // already-running check below) AND the log file path (so we can open it in
+  // the parent and inherit the fd into the child — see fork() call below).
   let pidFile: string;
+  let logFile: string;
   try {
     const rawConfig = buildConfigFromFlags(flags);
     const config = resolveConfig(rawConfig);
     pidFile = config.pidFile;
+    logFile = config.logFile;
   } catch {
     pidFile = getDefaultPidFile();
+    // Match the default emitted by the success message below so the operator
+    // sees a consistent path. resolveConfig() would normally produce this.
+    logFile = '.sphere-cli/daemon.log';
   }
 
   // Check if already running. Note: this check is advisory only — the forked
@@ -723,22 +749,43 @@ function detachDaemon(args: string[], flags: DaemonFlags): void {
   // Build child args: replace --detach with --_forked, keep everything else
   const childArgs = ['daemon', 'start', '--_forked', ...args.filter(a => a !== '--detach')];
 
-  // Fork the child process
+  // Fix issue #19: Open the log file in the parent and pass its fd as the
+  // child's stdout and stderr. The previous `stdio: 'ignore'` discarded both
+  // streams, so any failure between fork() and the child's first WriteStream
+  // flush — including the silent crash from `process.disconnect()` throwing
+  // on a missing IPC channel — was invisible: no log, no PID-file cleanup,
+  // just a stale pid. With the fd inherited at OS level, any thrown error,
+  // uncaught exception, or stderr emission lands in the log file before any
+  // Node-level streaming machinery is required.
+  //
+  // The 'ipc' entry is required by child_process.fork() (Node throws
+  // "Forked processes must have an IPC channel" without it). The parent
+  // does not send messages over the channel — it exists solely to satisfy
+  // fork's contract. The child's runDaemon() calls process.disconnect()
+  // (guarded on process.connected) to release the channel from the child's
+  // event loop after PID-file write.
+  ensureDir(logFile);
+  const logFd = fs.openSync(logFile, 'a');
+  fs.writeSync(
+    logFd,
+    `[${new Date().toISOString()}] sphere daemon: forking child (parent PID ${process.pid})\n`,
+  );
   const child = fork(process.argv[1], childArgs, {
     detached: true,
-    stdio: 'ignore',
+    stdio: ['ignore', logFd, logFd, 'ipc'],
   });
+  // Child has inherited its own copy of the fd; close the parent's reference.
+  fs.closeSync(logFd);
 
+  // Don't keep the parent alive waiting for the child. We also disconnect
+  // the parent's end of the IPC channel so process.exit(0) below doesn't
+  // need to forcibly tear down a live handle.
   child.unref();
+  if (child.connected) child.disconnect();
 
   console.log(`Daemon started in background (PID ${child.pid})`);
   console.log(`PID file: ${pidFile}`);
-
-  if (flags.logFile) {
-    console.log(`Log file: ${flags.logFile}`);
-  } else {
-    console.log('Log file: .sphere-cli/daemon.log');
-  }
+  console.log(`Log file: ${logFile}`);
 
   process.exit(0);
 }

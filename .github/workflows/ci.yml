@@ -41,22 +41,30 @@ jobs:
         # integrity — a branch pointer can be force-pushed or rebased,
         # silently changing the code CI builds against.
         #
-        # This SHA is the tip of sphere-sdk `main` ("merge: PR #395 #394
-        # automated CID delivery re-enabled + 512 KiB inline cap + demo
-        # playbook"). That commit exports the symbols `src/shared/sphere-
-        # providers.ts` consumes from `@unicitylabs/sphere-sdk/impl/nodejs`:
-        # `createUxfCarPublisher`, `DEFAULT_IPFS_GATEWAYS`,
-        # `PublishToIpfsCallback`. It also exposes `AccountingModule.
-        # deliverInvoice`, which `invoice-deliver` (PR #18 / issue #226)
-        # calls. Pinning to `main` (rather than the previous integration-
-        # branch tip 02cb4550) avoids the "unable to read tree" failure
-        # when an integration tip is rebased away.
+        # This SHA is the tip of sphere-sdk `main` (PR #402 / #401 — invoice
+        # OUTBOX verifier wiring on top of PR #400 / #397's route-invoice-
+        # delivery-through-the-token-pipeline architectural fix).
+        #
+        # Why this matters for sphere-cli: #397 replaces the bespoke
+        # `invoice_delivery:` NIP-17 DM with the standard TOKEN_TRANSFER
+        # pipeline (Nostr kind 31113). The `manual-test-accounting-
+        # roundtrip.sh` soak (and any cross-device invoice consumer) only
+        # works against this new pipeline; the prior pin (3f3dadf, the
+        # CID-delivery merge BEFORE #397) leaves the receiver decoder
+        # unable to ingest invoice DMs. Local repro: alice's `invoice
+        # list` returns "No invoices found" forever even though bob's
+        # `invoice deliver` reports `sent: 1, failed: 0`.
+        #
+        # This SHA also keeps the exports `src/shared/sphere-providers.ts`
+        # consumes (`createUxfCarPublisher`, `DEFAULT_IPFS_GATEWAYS`,
+        # `PublishToIpfsCallback`) and `AccountingModule.deliverInvoice`
+        # that `invoice-deliver` (PR #18 / issue #226) calls.
         #
         # Bump this SHA when a new sphere-sdk commit is required; remove
         # this whole workaround once sphere-sdk publishes v0.7.1+ to npm
         # with the post-extraction exports.
         env:
-          SPHERE_SDK_SHA: 3f3dadf9d03eb29db87f062921751f24bfefdec8
+          SPHERE_SDK_SHA: d9498445e96be63f6a474f2607372eb4c16247d2
         run: |
           git clone https://github.com/unicity-sphere/sphere-sdk.git ../../sphere-sdk
           # The pinned SHA may not be on a branch tip after future merges;

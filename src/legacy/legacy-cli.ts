@@ -4499,22 +4499,33 @@ async function main(): Promise<void> {
 
           const assets: InvoiceRequestedAsset[] = [];
           // Collect ALL `--asset <amount> <coin>` occurrences (multi-asset).
+          // Canonical UX (#32): the amount is in HUMAN-READABLE units (e.g.
+          // "7 UCT" = 7 whole UCT, "0.5 BTC" = 0.5 BTC), matching what
+          // `payments send` accepts. Convert to smallest-unit integers here
+          // before handing off to the SDK; AccountingModule.createInvoice
+          // itself treats the amount as a raw atom count (decimals: 0).
           for (let i = 0; i < args.length; i++) {
             if (args[i] !== '--asset') continue;
             const pair = consumeAssetPair(args, i + 1);
             if (!pair) {
               failWithHelp('invoice-create', '--asset expects two positional tokens: --asset <amount> <coin>');
             }
-            if (!/^[1-9][0-9]*$/.test(pair.amount)) {
-              failWithHelp('invoice-create', `invalid amount "${pair.amount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
+            // resolveCoin fails fast on unknown symbols. Use it for both the
+            // canonical symbol (handed to the SDK) and the decimals (used
+            // for the human → smallest unit conversion).
+            const { symbol: resolvedSymbol, decimals } = resolveCoin(pair.coin);
+            let smallest: bigint;
+            try {
+              smallest = toSmallestUnit(pair.amount, decimals);
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              failWithHelp('invoice-create', `invalid amount "${pair.amount}" — ${msg}`);
             }
-            // AccountingModule.createInvoice validates coinId as
-            // /^[A-Za-z0-9]+$/ with length ≤20 — i.e. it expects the
-            // human-readable symbol (UCT, USDU, ...), NOT the 64-char
-            // hex token-type id that `payments.send` uses. resolveCoin
-            // fails fast on unknown symbols; we hand the SYMBOL through.
-            const { symbol: resolvedSymbol } = resolveCoin(pair.coin);
-            assets.push({ coin: [resolvedSymbol, pair.amount] });
+            if (smallest <= 0n) {
+              failWithHelp('invoice-create', `invalid amount "${pair.amount}" — must be positive`);
+            }
+            // SDK convention: coin: [symbol, smallest-unit-as-decimal-string].
+            assets.push({ coin: [resolvedSymbol, smallest.toString()] });
           }
           // NFT input — collect when no --asset was provided.
           if (assets.length === 0 && nftId) {
@@ -4823,19 +4834,27 @@ async function main(): Promise<void> {
         if (!pair) {
           failWithHelp('invoice-return', '--asset expects two positional tokens: --asset <amount> <coin>');
         }
-        if (!/^[1-9][0-9]*$/.test(pair.amount)) {
-          failWithHelp('invoice-return', `invalid amount "${pair.amount}" — must be a positive integer string (smallest unit, no leading zeros, e.g. 1000000)`);
+        // Canonical UX (#32): amount is in HUMAN units (e.g. "100 UCT" = 100
+        // whole UCT). Convert to smallest-unit integer before handing off to
+        // the SDK. Same SDK convention as invoice-create — the
+        // AccountingModule's ReturnPaymentParams.coinId is the symbol
+        // (UCT, USDU, ...), not the 64-char hex.
+        const { symbol: returnSymbol, decimals: returnDecimals } = resolveCoin(pair.coin);
+        let returnSmallest: bigint;
+        try {
+          returnSmallest = toSmallestUnit(pair.amount, returnDecimals);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          failWithHelp('invoice-return', `invalid amount "${pair.amount}" — ${msg}`);
         }
-        // Same SDK convention as invoice-create — the AccountingModule's
-        // ReturnPaymentParams.coinId is the symbol (UCT, USDU, ...), not
-        // the 64-char hex. resolveCoin still validates that the symbol
-        // is known to the TokenRegistry.
-        const returnCoinId = resolveCoin(pair.coin).symbol;
+        if (returnSmallest <= 0n) {
+          failWithHelp('invoice-return', `invalid amount "${pair.amount}" — must be positive`);
+        }
 
         const returnParams: ReturnPaymentParams = {
           recipient: args[recipientIdx + 1],
-          amount: pair.amount,
-          coinId: returnCoinId,
+          amount: returnSmallest.toString(),
+          coinId: returnSymbol,
         };
 
         const result = await sphere.accounting!.returnInvoicePayment(invoiceId, returnParams);

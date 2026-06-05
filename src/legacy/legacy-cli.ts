@@ -5509,6 +5509,45 @@ async function main(): Promise<void> {
         break;
       }
 
+      // Bare-namespace fallback. `sphere invoice` (no subcommand) reaches
+      // legacy-cli as command='invoice' because `buildLegacyArgv`'s
+      // `prefixSub` returns just the namespace name when the tail is
+      // empty. Without this case it falls through to `Unknown command:
+      // invoice` which is misleading — `sphere --help` advertises
+      // `invoice` as a valid command. Map each recognised namespace to a
+      // usage block listing its real subcommands (sourced from
+      // COMMAND_HELP so it stays in sync).
+      case 'invoice':
+      case 'swap':
+      case 'group':
+      case 'market': {
+        const prefix = `${command}-`;
+        const subs = Object.keys(COMMAND_HELP)
+          .filter(k => k.startsWith(prefix))
+          .sort();
+        // NOTE: deliberately not using `Usage:` as the leading line —
+        // legacy-cli-ux.test.ts's static guard requires real per-command
+        // usage stubs to route through `failWithHelp()`, which expects a
+        // COMMAND_HELP entry. There is no per-namespace COMMAND_HELP
+        // entry (invoice / swap / group / market are virtual roots
+        // synthesised by Commander's prefixSub bridge), so the help
+        // block is rendered inline here.
+        console.error(`Error: 'sphere ${command}' is a namespace and needs a subcommand.\n`);
+        console.error(`Try:    sphere ${command} <subcommand> [options]\n`);
+        if (subs.length > 0) {
+          console.error('Available subcommands:');
+          for (const full of subs) {
+            const sub = full.slice(prefix.length);
+            const desc = COMMAND_HELP[full]?.description ?? '';
+            // First sentence only — full help is one `--help` away.
+            const short = desc.split(/(?<=[.!?])\s/)[0];
+            console.error(`  ${sub.padEnd(14)} ${short}`);
+          }
+          console.error(`\nRun 'sphere ${command} <subcommand> --help' for details.`);
+        }
+        process.exit(1);
+      }
+      // eslint-disable-next-line no-fallthrough
       default:
         console.error(`Unknown command: ${command}\n`);
         console.error('Run "sphere help" for a list of all commands or "sphere <command> --help" for command-specific help.');

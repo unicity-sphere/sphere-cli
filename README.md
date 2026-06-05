@@ -77,6 +77,78 @@ infrastructure:
 Each test creates a throwaway wallet in `/tmp` so runs are fully isolated and
 never touch real funds. Skip with `SKIP_INTEGRATION=1` when offline.
 
+## UX — canonical conventions (issue #32)
+
+Every `sphere` command follows the same input/output rules so muscle memory
+transfers across the surface.
+
+### Asset input — `<amount> <coin>` (two positional tokens)
+
+```bash
+sphere payments send @bob 100.5 UCT
+sphere invoice  create --target @alice --asset 1000000 UCT
+sphere invoice  create --target @alice --asset 1000000 UCT --asset 500000 USDU
+sphere invoice  return <id> --recipient @bob --asset 100000 UCT
+sphere swap     propose --to @bob --offer 10 UCT --want 5 USDU
+```
+
+`--asset`, `--offer`, and `--want` each consume the **next two argv tokens**
+(amount, then coin). No quoted compound form (`--asset "10 UCT"`) is accepted
+— that legacy shape has been removed.
+
+### Output — human-readable by default, `--json` for scripts
+
+```bash
+sphere invoice status <id>          # labelled block, easy to read
+sphere invoice status <id> --json   # raw JSON (machine-parseable)
+```
+
+`--json` is a global flag that any command honours.
+
+### Help — `--help` works for every command and subcommand
+
+```bash
+sphere --help                       # top-level usage summary
+sphere help                         # same
+sphere help send                    # detailed help for one command
+sphere wallet --help                # namespace-level help
+sphere wallet create --help         # sub-subcommand help
+sphere invoice deliver --help
+```
+
+On invalid input (missing flag, bad value, unknown subcommand) the CLI prints
+`Error: <message>` followed by the full help block for the closest command —
+never a one-line `Usage:` stub.
+
+## Shell completion
+
+`sphere completions <bash|zsh|fish>` emits a completion script. Pick the
+install path that matches your environment:
+
+```bash
+# Bash, no-sudo (recommended)
+mkdir -p ~/.local/share/bash-completion/completions
+sphere completions bash > ~/.local/share/bash-completion/completions/sphere
+
+# Bash, system-wide (requires sudo)
+sudo sh -c "sphere completions bash > /etc/bash_completion.d/sphere"
+
+# Zsh
+mkdir -p ~/.zsh/completions
+sphere completions zsh > ~/.zsh/completions/_sphere
+# Add to ~/.zshrc:
+#   fpath=(~/.zsh/completions $fpath)
+#   autoload -Uz compinit && compinit
+
+# Fish
+sphere completions fish > ~/.config/fish/completions/sphere.fish
+```
+
+Re-source your shell rc (`source ~/.bashrc`) or open a new terminal to pick
+up the completions. The completion script is regenerated from the same
+command table the CLI dispatcher uses; an internal test
+(`legacy-cli-ux.test.ts`) keeps the two in lockstep.
+
 ## Design principles
 
 1. **DM-native.** All controller → manager and controller → tenant traffic goes

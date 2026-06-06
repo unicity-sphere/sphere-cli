@@ -48,9 +48,9 @@ describe.skipIf(integrationSkip)('sphere-cli integration — DM round-trip (real
       throw new Error('wallet init failed; cannot proceed with DM tests');
     }
 
-    // Identity JSON is emitted as pretty-printed JSON inside the init output.
-    // Extract directAddress with a lenient regex (order-independent of other fields).
-    const match = init.stdout.match(/"directAddress":\s*"(DIRECT:\/\/[0-9a-fA-F]+)"/);
+    // Canonical UX init emits `  directAddress : DIRECT://...` as a
+    // labelled line inside the identity block.
+    const match = init.stdout.match(/directAddress\s*:\s*(DIRECT:\/\/[0-9a-fA-F]+)/);
     if (!match) throw new Error(`directAddress not found in init output:\n${init.stdout}`);
     directAddress = match[1]!;
   }, 180_000);

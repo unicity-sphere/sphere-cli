@@ -37,6 +37,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   createSphereEnv,
   destroySphereEnv,
+  expectUsageHint,
   runSphere,
   type SphereEnv,
 } from './helpers.js';
@@ -113,8 +114,7 @@ describe('sphere-cli — crypto/util arg validation (offline)', () => {
   ])('`sphere crypto %s` with no args prints usage and exits non-zero', (sub, legacyName) => {
     const r = runSphere(env, ['crypto', sub], { timeoutMs: 15_000 });
     expect(r.status).not.toBe(0);
-    const out = `${r.stdout}\n${r.stderr}`;
-    expect(out).toMatch(new RegExp(`Usage:\\s*${legacyName}|usage:\\s*${legacyName}`, 'i'));
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, legacyName);
   });
 
   it.each([
@@ -124,8 +124,7 @@ describe('sphere-cli — crypto/util arg validation (offline)', () => {
   ])('`sphere util %s` with no args prints usage and exits non-zero', (sub, legacyName) => {
     const r = runSphere(env, ['util', sub], { timeoutMs: 15_000 });
     expect(r.status).not.toBe(0);
-    const out = `${r.stdout}\n${r.stderr}`;
-    expect(out).toMatch(new RegExp(`Usage:\\s*${legacyName}|usage:\\s*${legacyName}`, 'i'));
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, legacyName);
   });
 
   it('`sphere crypto encrypt foo` (missing password) prints usage and exits non-zero', () => {
@@ -133,8 +132,7 @@ describe('sphere-cli — crypto/util arg validation (offline)', () => {
     // also hits the pre-getSphere() guard.
     const r = runSphere(env, ['crypto', 'encrypt', 'foo'], { timeoutMs: 15_000 });
     expect(r.status).not.toBe(0);
-    const out = `${r.stdout}\n${r.stderr}`;
-    expect(out).toMatch(/Usage:\s*encrypt|usage:\s*encrypt/i);
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, 'encrypt');
   });
 });
 
@@ -187,17 +185,21 @@ describe('sphere-cli — crypto behaviour (offline)', () => {
   it('`sphere crypto validate-key <hex>` accepts a valid private key', () => {
     const r = runSphere(env, ['crypto', 'validate-key', TEST_PRIVKEY]);
     expect(r.status).toBe(0);
-    // Output is JSON: {"valid":true,"length":64}
-    expect(r.stdout).toMatch(/"valid":\s*true/);
-    expect(r.stdout).toMatch(/"length":\s*64/);
+    // Canonical-UX output is human-friendly labelled blocks
+    //   `  valid  : true`
+    //   `  length : 64`
+    // Pad-aware regex (zero-or-more whitespace around `:`) so future
+    // alignment tweaks don't rip these out.
+    expect(r.stdout).toMatch(/valid\s*:\s*true/);
+    expect(r.stdout).toMatch(/length\s*:\s*64/);
   });
 
   it('`sphere crypto validate-key not-hex` rejects an invalid key', () => {
     // Per the help text: "Exits with code 0 if valid, 1 if invalid."
-    // So we expect non-zero exit AND a "valid":false JSON.
+    // So we expect non-zero exit AND `valid : false` in the output.
     const r = runSphere(env, ['crypto', 'validate-key', 'not-hex']);
     expect(r.status).not.toBe(0);
-    expect(r.stdout).toMatch(/"valid":\s*false/);
+    expect(r.stdout).toMatch(/valid\s*:\s*false/);
   });
 
   it('`sphere crypto hex-to-wif` produces a stable WIF for the test private key', () => {
@@ -274,17 +276,17 @@ describe('sphere-cli — util behaviour (offline)', () => {
   });
 
   it('`sphere crypto encrypt` / `decrypt` roundtrips a string with a password', () => {
-    // Pin the AES envelope: encrypt produces a JSON-quoted base64 blob
+    // Pin the AES envelope: encrypt produces a base64 blob
     // ("U2FsdGVkX1+..."), decrypt restores the original plaintext.
     // Failure mode pinned by a regression: a change in the cipher,
     // salt format, or PBKDF2 iteration count would either fail the
     // decrypt or yield a different plaintext.
     //
-    // IMPORTANT: decrypt's first positional MUST be the JSON-quoted
-    // form ("U2Fsd..."), not the bare base64. The handler runs
-    // JSON.parse on argv[1] to extract the string. Stripping the
-    // surrounding quotes here would make decrypt fail with
-    // "Unexpected token 'U', ... is not valid JSON".
+    // Canonical UX: `crypto encrypt` emits bare base64 (no JSON
+    // wrapping) so `crypto encrypt foo pw | crypto decrypt - pw`
+    // pipelines naturally. `crypto decrypt` accepts both the bare form
+    // AND the JSON-quoted legacy form, so scripts piping `--json`
+    // output continue to work.
     const plaintext = 'integration-test-secret';
     const password = 'p4ssw0rd-test';
     const enc = runSphere(env, ['crypto', 'encrypt', plaintext, password]);
@@ -293,9 +295,9 @@ describe('sphere-cli — util behaviour (offline)', () => {
     expect(ciphertext.length).toBeGreaterThan(2);
     // OpenSSL-compatible AES envelope starts with the magic "Salted__"
     // header, base64-encoded as "U2FsdGVkX1" (zero-pad). Pin the prefix
-    // (inside the quote) so a switch to a non-OpenSSL-compatible scheme
-    // breaks compat-hungry downstream tooling.
-    expect(ciphertext).toMatch(/^"U2FsdGVkX1/);
+    // so a switch to a non-OpenSSL-compatible scheme breaks
+    // compat-hungry downstream tooling.
+    expect(ciphertext).toMatch(/^U2FsdGVkX1/);
 
     const dec = runSphere(env, ['crypto', 'decrypt', ciphertext, password]);
     expect(dec.status).toBe(0);

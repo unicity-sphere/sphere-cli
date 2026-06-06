@@ -62,6 +62,7 @@ import { join } from 'node:path';
 import {
   createSphereEnv,
   destroySphereEnv,
+  expectUsageHint,
   runSphere,
   integrationSkip,
   type SphereEnv,
@@ -120,13 +121,10 @@ describe('sphere-cli — wallet profile arg validation (offline)', () => {
   ])('`sphere %s` prints usage and exits non-zero', (_label, argv, hint) => {
     const r = runSphere(env, argv, { timeoutMs: 15_000 });
     expect(r.status).not.toBe(0);
-    const out = `${r.stdout}\n${r.stderr}`;
-    // Each handler prints "Usage: <hint> <name>" to stderr (~lines
-    // 1815, 1845, 1935). Match the hint without binding to the
-    // example-suffix wording.
-    expect(out, `${hint} should show usage hint`).toMatch(
-      new RegExp(`Usage:\\s*${hint}\\s*<name>`, 'i'),
-    );
+    // Each handler prints "Usage: npm run cli -- <hint> <name>" to
+    // stderr (~lines 1815, 1845, 1935). Match the hint without binding
+    // to the example-suffix wording.
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, hint, '<name>');
   });
 
   it('`sphere wallet create !invalid` rejects names with disallowed characters', () => {
@@ -148,7 +146,9 @@ describe('sphere-cli — wallet profile arg validation (offline)', () => {
     const r = runSphere(env, ['wallet', 'bogus-sub'], { timeoutMs: 15_000 });
     expect(r.status).not.toBe(0);
     const out = `${r.stdout}\n${r.stderr}`;
-    expect(out).toMatch(/Unknown wallet subcommand:\s*bogus-sub/i);
+    // Canonical UX wraps the rejected subcommand in quotes:
+    //   `unknown wallet subcommand: "bogus-sub"`.
+    expect(out).toMatch(/unknown wallet subcommand:\s*"?bogus-sub"?/i);
   });
 });
 
@@ -311,7 +311,9 @@ describe.skipIf(integrationSkip)(
       }
       expect(init.status).toBe(0);
 
-      const match = init.stdout.match(/"directAddress":\s*"(DIRECT:\/\/[0-9a-fA-F]+)"/);
+      // Canonical UX init emits a labelled identity block:
+      //   `  directAddress : DIRECT://...`
+      const match = init.stdout.match(/directAddress\s*:\s*(DIRECT:\/\/[0-9a-fA-F]+)/);
       expect(match, `directAddress not in alice init:\n${init.stdout}`).toBeTruthy();
       directAddrAlice = match![1]!;
 
@@ -334,7 +336,7 @@ describe.skipIf(integrationSkip)(
       }
       expect(init.status).toBe(0);
 
-      const match = init.stdout.match(/"directAddress":\s*"(DIRECT:\/\/[0-9a-fA-F]+)"/);
+      const match = init.stdout.match(/directAddress\s*:\s*(DIRECT:\/\/[0-9a-fA-F]+)/);
       expect(match, `directAddress not in bob init:\n${init.stdout}`).toBeTruthy();
       directAddrBob = match![1]!;
 

@@ -1709,6 +1709,18 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
     ],
   },
+  'swap-ping': {
+    usage: 'swap-ping <@nametag_or_address>',
+    description: 'Ping an escrow service to verify it is online and reachable via the configured transport.',
+    examples: [
+      'npm run cli -- swap-ping @escrow',
+      'npm run cli -- swap-ping DIRECT://0000abcd...',
+    ],
+    notes: [
+      'Accepts an @nametag, DIRECT://… address, or any other identifier swap-propose accepts.',
+      'On success, prints the escrow\'s pong response (transport pubkey, capabilities).',
+    ],
+  },
 
   'swap-reject': {
     usage: 'swap-reject <swap_id_or_prefix> [reason]',
@@ -3533,9 +3545,21 @@ async function main(): Promise<void> {
       case 'decrypt': {
         const [, encrypted, password] = args;
         if (!encrypted || !password) {
-          failWithHelp('decrypt', 'missing required <encrypted-json> <password> arguments');
+          failWithHelp('decrypt', 'missing required <encrypted> <password> arguments');
         }
-        const encryptedData = JSON.parse(encrypted);
+        // Accept both shapes: bare base64 (what `crypto encrypt` now
+        // emits under canonical UX) and JSON-quoted base64 (legacy
+        // wrapper, kept for backward compat with scripts that pipe
+        // `encrypt --json` output). Trying JSON.parse first preserves
+        // the legacy roundtrip; falling back to the raw string makes
+        // the natural `crypto encrypt | xargs crypto decrypt` pipeline
+        // work without manual quoting.
+        let encryptedData: string;
+        if (encrypted.startsWith('"') && encrypted.endsWith('"')) {
+          encryptedData = JSON.parse(encrypted) as string;
+        } else {
+          encryptedData = encrypted;
+        }
         const result = decrypt(encryptedData, password);
         console.log(result);
         break;
@@ -4961,6 +4985,30 @@ async function main(): Promise<void> {
           if (explicitRecipient) {
             sdkOptions.recipient = await resolveRecipientToDirect(sphere, explicitRecipient, 'invoice-return');
           }
+
+          // Snapshot per-sender balances BEFORE the SDK call. The SDK drains
+          // `senderBalances[].netBalance` as it refunds, so re-reading status
+          // afterwards produces `amount: 0` rows (issue #40 item #1). Mirror
+          // the SDK's iteration order + filters so plan[i] ↔ results[i].
+          const statusBefore = await sphere.accounting!.getInvoiceStatus(invoiceId);
+          const plan: Array<{ recipient: string; coinId: string; netBalance: string }> = [];
+          for (const target of statusBefore.targets) {
+            for (const ca of target.coinAssets) {
+              const [coinId] = ca.coin;
+              for (const sb of ca.senderBalances) {
+                let bal: bigint;
+                try {
+                  bal = BigInt(sb.netBalance);
+                } catch {
+                  continue;
+                }
+                if (bal <= 0n) continue;
+                if (sdkOptions.recipient !== undefined && sb.senderAddress !== sdkOptions.recipient) continue;
+                plan.push({ recipient: sb.senderAddress, coinId, netBalance: sb.netBalance });
+              }
+            }
+          }
+
           const results = await sphere.accounting!.returnAllInvoicePayments(invoiceId, sdkOptions);
           if (results.length === 0) {
             const reason = explicitRecipient
@@ -4968,31 +5016,20 @@ async function main(): Promise<void> {
               : `no refundable balance found on invoice ${invoiceId.slice(0, 16)}… — nothing to return`;
             failWithHelp('invoice-return', reason);
           }
-          // The SDK returns TransferResult per row but doesn't echo back the
-          // (recipient, amount, coin) tuple — re-attach those from status so
-          // the human renderer can show what got refunded where.
-          const status = await sphere.accounting!.getInvoiceStatus(invoiceId);
+
           const refundRows: Array<Record<string, unknown>> = [];
-          let cursor = 0;
-          for (const target of status.targets) {
-            for (const ca of target.coinAssets) {
-              const [coinId] = ca.coin;
-              const { decimals } = resolveCoin(coinId);
-              for (const sb of ca.senderBalances) {
-                // Skip rows that returnAllInvoicePayments wouldn't have
-                // refunded (zero balance, or recipient filter).
-                if (sdkOptions.recipient !== undefined && sb.senderAddress !== sdkOptions.recipient) continue;
-                if (cursor >= results.length) break;
-                const result = results[cursor++];
-                refundRows.push({
-                  id: result.id,
-                  status: result.status,
-                  recipient: sb.senderAddress,
-                  amount: toHumanReadable(sb.netBalance, decimals),
-                  coin: coinId,
-                });
-              }
-            }
+          const rowCount = Math.min(plan.length, results.length);
+          for (let i = 0; i < rowCount; i++) {
+            const row = plan[i];
+            const result = results[i];
+            const { decimals } = resolveCoin(row.coinId);
+            refundRows.push({
+              id: result.id,
+              status: result.status,
+              recipient: row.recipient,
+              amount: toHumanReadable(row.netBalance, decimals),
+              coin: row.coinId,
+            });
           }
           formatOutput(
             { refunds: refundRows } as Record<string, unknown>,
@@ -5787,6 +5824,7 @@ function getCompletionCommands(): CompletionCommand[] {
     { name: 'swap-accept', description: 'Accept a swap deal', flags: ['--deposit', '--no-wait'] },
     { name: 'swap-status', description: 'Show swap status', flags: ['--query-escrow'] },
     { name: 'swap-deposit', description: 'Deposit into a swap' },
+    { name: 'swap-ping', description: 'Ping an escrow service' },
     { name: 'swap-reject', description: 'Reject a swap proposal' },
     { name: 'swap-cancel', description: 'Cancel a swap' },
     { name: 'market-post', description: 'Post a market intent', flags: ['--type', '--category', '--price', '--currency', '--location', '--contact', '--expires'] },

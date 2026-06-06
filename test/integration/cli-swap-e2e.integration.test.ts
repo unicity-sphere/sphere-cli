@@ -104,7 +104,7 @@ async function provisionWallet(opts: {
       `stderr: ${init.stderr.slice(0, 800)}`,
     );
   }
-  const addrMatch = init.stdout.match(/"directAddress":\s*"(DIRECT:\/\/[0-9a-fA-F]+)"/);
+  const addrMatch = init.stdout.match(/directAddress\s*:\s*(DIRECT:\/\/[0-9a-fA-F]+)/);
   if (!addrMatch) {
     throw new Error(`[${opts.label}] directAddress not found in init output`);
   }

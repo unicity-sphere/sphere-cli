@@ -46,6 +46,7 @@ import { randomBytes } from 'node:crypto';
 import {
   createSphereEnv,
   destroySphereEnv,
+  expectUsageHint,
   runSphere,
   integrationSkip,
   type SphereEnv,
@@ -122,14 +123,11 @@ describe('sphere-cli — nametag arg validation (offline)', () => {
     // empty.
     expect(r.status).not.toBe(0);
 
-    const out = `${r.stdout}\n${r.stderr}`;
-    // The legacy CLI prints "Usage: <legacy-name> <name>" to stderr.
-    // If a refactor moves the arg check below getSphere(), this regex
-    // flips red (the user would instead see "No wallet exists ..." or
-    // similar wallet-load output).
-    expect(out, `${legacyName} should show usage hint`).toMatch(
-      new RegExp(`Usage:\\s*${legacyName}\\s*<name>`, 'i'),
-    );
+    // The legacy CLI prints "Usage: npm run cli -- <legacy-name>
+    // <name>" to stderr. If a refactor moves the arg check below
+    // getSphere(), this helper flips red (the user would instead see
+    // "No wallet exists ..." or similar wallet-load output).
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, legacyName, '<name>');
   });
 });
 
@@ -154,7 +152,7 @@ describe.skipIf(integrationSkip)(
       }
       // Sanity-check the wallet has a directAddress — confirms init
       // completed and we have an identity to bind the nametag to.
-      expect(init.stdout).toMatch(/"directAddress":\s*"DIRECT:\/\/[0-9a-fA-F]+"/);
+      expect(init.stdout).toMatch(/directAddress\s*:\s*DIRECT:\/\/[0-9a-fA-F]+/);
     }, 180_000);
 
     afterAll(() => { if (env) destroySphereEnv(env); });

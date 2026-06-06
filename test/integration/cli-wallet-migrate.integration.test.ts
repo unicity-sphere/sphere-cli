@@ -139,7 +139,7 @@ describe.skipIf(integrationSkip)(
         // legacy step — we'll assert the migrate-applied wallet
         // re-derives the same directAddress so identity continuity
         // across the migration is visible at the test layer.
-        const m = init.stdout.match(/"directAddress":\s*"(DIRECT:\/\/[0-9a-fA-F]+)"/);
+        const m = init.stdout.match(/directAddress\s*:\s*(DIRECT:\/\/[0-9a-fA-F]+)/);
         expect(m, `directAddress not in init output:\n${init.stdout}`).toBeTruthy();
         directAddress = m![1]!;
       }, 180_000);

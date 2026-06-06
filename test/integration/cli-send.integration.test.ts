@@ -114,7 +114,7 @@ describe.skipIf(integrationSkip)('sphere-cli integration — send end-to-end (re
     }
 
     // Reuse the same extraction shape as cli-dm.integration.test.ts.
-    const match = init.stdout.match(/"directAddress":\s*"(DIRECT:\/\/[0-9a-fA-F]+)"/);
+    const match = init.stdout.match(/directAddress\s*:\s*(DIRECT:\/\/[0-9a-fA-F]+)/);
     if (!match) throw new Error(`directAddress not found in init output:\n${init.stdout}`);
     directAddress = match[1]!;
   }, 180_000);
@@ -224,7 +224,7 @@ describe.skipIf(integrationSkip || !FUNDED_MNEMONIC)(
         throw new Error('receiver wallet init failed');
       }
 
-      const match = initReceiver.stdout.match(/"directAddress":\s*"(DIRECT:\/\/[0-9a-fA-F]+)"/);
+      const match = initReceiver.stdout.match(/directAddress\s*:\s*(DIRECT:\/\/[0-9a-fA-F]+)/);
       if (!match) throw new Error(`receiver directAddress not found in init output`);
       receiverDirectAddress = match[1]!;
     }, 360_000);

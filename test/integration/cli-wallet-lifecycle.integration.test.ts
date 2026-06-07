@@ -289,10 +289,20 @@ describe.skipIf(integrationSkip)(
     afterAll(() => { if (env) destroySphereEnv(env); });
 
     it(`\`sphere init --nametag ${nametag}\` mints the nametag during wallet creation`, () => {
+      // Budget rationale (issue #42 acceptance criterion 3):
+      // 240s → 180s. The slack was originally provisioned to absorb a
+      // stalled Nostr publish during `Sphere.init({ nametag })` — under
+      // sphere-sdk's pre-#42 in-band publish contract, a flaky
+      // `nostr-relay.testnet.unicity.network` could swallow 60s+ of
+      // the budget BEFORE the test could see the identity block.
+      // sphere-sdk #42's `publishMode: 'background'` default detaches
+      // that publish (see `Sphere.registerNametag` step 4), so the
+      // only in-band work left is the aggregator mint round-trip,
+      // which comfortably finishes inside 180s even under load.
       const r = runSphere(
         env,
         ['init', '--network', 'testnet', '--nametag', nametag],
-        { timeoutMs: 240_000 },
+        { timeoutMs: 180_000 },
       );
       if (r.status !== 0) {
         console.error('init --nametag failed', { stdout: r.stdout, stderr: r.stderr });
@@ -302,10 +312,17 @@ describe.skipIf(integrationSkip)(
       //   `  nametag       : @<name>`
       // (renderIdentity prepends `@` to the nametag value; absent
       // nametags show `(none)`).
+      //
+      // The `(none)` failure mode that originally motivated this test
+      // (issue #42) is foreclosed by sphere-sdk #42 — the SDK now
+      // updates `_identity.nametag` synchronously after the mint
+      // succeeds, BEFORE returning from `registerNametag`, so the
+      // CLI's `sphere.identity` read at `legacy-cli.ts:2294` always
+      // sees the just-claimed name.
       expect(r.stdout).toMatch(new RegExp(`nametag\\s*:\\s*@${nametag}`));
       // The wallet directory now exists on disk.
       expect(existsSync(join(env.home, '.sphere-cli', 'wallet.json'))).toBe(true);
-    }, 300_000);
+    }, 200_000);
 
     it('`sphere nametag my` reports the registered nametag after init --nametag', () => {
       // Re-verify via a different code path: read the nametag via the

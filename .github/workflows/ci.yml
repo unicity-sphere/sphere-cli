@@ -71,7 +71,13 @@ jobs:
         # this whole workaround once sphere-sdk publishes v0.7.1+ to npm
         # with the post-extraction exports.
         env:
-          SPHERE_SDK_SHA: 0e3290a1e3f41e3d30ca9f6a02b304da507106c7
+          # Bumped past sphere-sdk PR #415 (issue #42) — `registerNametag`
+          # now publishes the Nostr binding fire-and-forget by default,
+          # so `Sphere.init({ nametag })` returns in mint-only time
+          # instead of blocking on a flaky / stalled relay. Required by
+          # the 180s timeout reduction in
+          # `cli-wallet-lifecycle.integration.test.ts` (this PR).
+          SPHERE_SDK_SHA: 8832a959cea0d29dda4d1086c84f31c1df508950
         run: |
           git clone https://github.com/unicity-sphere/sphere-sdk.git ../../sphere-sdk
           # The pinned SHA may not be on a branch tip after future merges;

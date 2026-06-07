@@ -100,14 +100,14 @@ describe('sphere-cli — config get/set (local, no network)', () => {
   beforeAll(() => { env = createSphereEnv('lifecycle-config'); });
   afterAll(() => { destroySphereEnv(env); });
 
-  it('`sphere config` (no args) prints the current configuration as JSON', () => {
+  it('`sphere config` (no args) prints the current configuration', () => {
     const r = runSphere(env, ['config'], { timeoutMs: 15_000 });
     expect(r.status).toBe(0);
-    // Output header + valid JSON body. The createSphereEnv helper
-    // seeded testnet into config.json, so the JSON should reflect
-    // that.
+    // Canonical UX output is labelled blocks
+    //   `  network   : testnet`
+    // Pad-aware regex tolerates future alignment tweaks.
     expect(r.stdout).toMatch(/Current Configuration:/);
-    expect(r.stdout).toMatch(/"network":\s*"testnet"/);
+    expect(r.stdout).toMatch(/network\s*:\s*testnet/);
   });
 
   it('`sphere config set network dev` mutates the network setting on disk', () => {
@@ -131,7 +131,9 @@ describe('sphere-cli — config get/set (local, no network)', () => {
     const r = runSphere(env, ['config', 'set', 'bogus-key', 'value'], { timeoutMs: 15_000 });
     expect(r.status).not.toBe(0);
     const out = `${r.stdout}\n${r.stderr}`;
-    expect(out).toMatch(/Unknown config key:\s*bogus-key/);
+    // Canonical UX wraps the rejected key in quotes:
+    //   `Unknown config key: "bogus-key" (valid keys: ...)`
+    expect(out).toMatch(/Unknown config key:\s*"?bogus-key"?/);
     // The hint enumerates valid keys (~line 1743). If a future
     // refactor adds a new valid key without updating the error
     // hint, that's a doc bug — pin the three current keys.
@@ -178,7 +180,7 @@ describe.skipIf(integrationSkip)(
       expect(mnemonicMatch, `mnemonic not in stdout:\n${init.stdout}`).toBeTruthy();
       capturedMnemonic = mnemonicMatch![1]!;
 
-      const addrMatch = init.stdout.match(/"directAddress":\s*"(DIRECT:\/\/[0-9a-fA-F]+)"/);
+      const addrMatch = init.stdout.match(/directAddress\s*:\s*(DIRECT:\/\/[0-9a-fA-F]+)/);
       expect(addrMatch, `directAddress not in stdout:\n${init.stdout}`).toBeTruthy();
       originalDirectAddress = addrMatch![1]!;
     }, 180_000);
@@ -248,7 +250,7 @@ describe.skipIf(integrationSkip)(
       }
       expect(reinit.status).toBe(0);
 
-      const addrMatch = reinit.stdout.match(/"directAddress":\s*"(DIRECT:\/\/[0-9a-fA-F]+)"/);
+      const addrMatch = reinit.stdout.match(/directAddress\s*:\s*(DIRECT:\/\/[0-9a-fA-F]+)/);
       expect(addrMatch, `directAddress not in reinit:\n${reinit.stdout}`).toBeTruthy();
       // THE DETERMINISM PIN: same mnemonic → same directAddress.
       // A regression in BIP-39 → seed → HD-path → secp256k1 → bech32
@@ -296,10 +298,11 @@ describe.skipIf(integrationSkip)(
         console.error('init --nametag failed', { stdout: r.stdout, stderr: r.stderr });
       }
       expect(r.status).toBe(0);
-      // The identity block (~line 1654) must include the registered
-      // nametag in the JSON output. If init succeeds but nametag mint
-      // fails silently, the field would be null/absent here.
-      expect(r.stdout).toMatch(new RegExp(`"nametag":\\s*"${nametag}"`));
+      // Canonical UX identity block (~line 1654) emits a labelled line
+      //   `  nametag       : @<name>`
+      // (renderIdentity prepends `@` to the nametag value; absent
+      // nametags show `(none)`).
+      expect(r.stdout).toMatch(new RegExp(`nametag\\s*:\\s*@${nametag}`));
       // The wallet directory now exists on disk.
       expect(existsSync(join(env.home, '.sphere-cli', 'wallet.json'))).toBe(true);
     }, 300_000);

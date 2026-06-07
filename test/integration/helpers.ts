@@ -2,6 +2,7 @@
  * Shared helpers for sphere-cli integration tests against real infrastructure.
  */
 
+import { expect } from 'vitest';
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import {
   mkdtempSync,
@@ -286,3 +287,43 @@ export const PUBLIC_TESTNET = {
  * Allows CI to opt out via `SKIP_INTEGRATION=1`.
  */
 export const integrationSkip = process.env['SKIP_INTEGRATION'] === '1';
+
+/** Escape regex metachars so a runtime string can be embedded in a regex. */
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Assert that `out` contains the help-block "Usage:" line for `cmdName`.
+ *
+ * Help blocks emit `Usage: npm run cli -- <cmd> [args...]` after PR #33's
+ * canonical-UX cutover (was `Usage: <cmd> [args...]`). Folding both forms
+ * into a single helper means a future format change (e.g. dropping the
+ * `npm run cli --` shim when sphere ships as a real binary in $PATH) is
+ * a one-line fix instead of a sweep across every integration suite.
+ *
+ * @param out         Combined stdout+stderr from `runSphere(...)`.
+ * @param cmdName     Legacy command name (e.g. `'invoice-close'`,
+ *                    `'wallet create'`). Matched literally — regex
+ *                    metacharacters are escaped. Internal whitespace is
+ *                    accepted as `\s+` so both `wallet create` and
+ *                    `wallet\screate` match the same line.
+ * @param positional  Optional positional pinned to follow the command
+ *                    (e.g. `'<name>'`, `'<index>'`). Used by guards that
+ *                    catch a refactor moving the arg check below the
+ *                    wallet load — pins the FULL usage line, not just the
+ *                    command echo.
+ */
+export function expectUsageHint(
+  out: string,
+  cmdName: string,
+  positional?: string,
+): void {
+  // Allow `\s+` between space-separated command parts so `wallet create`
+  // and `wallet\s\screate` both match. Internal whitespace in cmdName is
+  // collapsed to `\s+` before escaping.
+  const parts = cmdName.split(/\s+/).map(escapeRegex).join('\\s+');
+  const tail = positional ? `\\s*${escapeRegex(positional)}` : '';
+  const re = new RegExp(`Usage:\\s*(?:npm run cli -- )?${parts}${tail}`, 'i');
+  expect(out, `expected output to contain Usage hint for '${cmdName}', got:\n${out}`).toMatch(re);
+}

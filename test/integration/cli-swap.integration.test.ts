@@ -39,6 +39,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   createSphereEnv,
   destroySphereEnv,
+  expectUsageHint,
   runSphere,
   type SphereEnv,
 } from './helpers.js';
@@ -69,6 +70,7 @@ const SWAP_SUBCOMMANDS: ReadonlyArray<{
   { legacy: 'swap-accept',  mustMatch: [/<swap_id_or_prefix>/, /--deposit/, /--no-wait/] },
   { legacy: 'swap-status',  mustMatch: [/<swap_id_or_prefix>/, /--query-escrow/] },
   { legacy: 'swap-deposit', mustMatch: [/<swap_id_or_prefix>/] },
+  { legacy: 'swap-ping',    mustMatch: [/<@nametag_or_address>/] },
   { legacy: 'swap-reject',  mustMatch: [/<swap_id_or_prefix>/] },
   { legacy: 'swap-cancel',  mustMatch: [/<swap_id_or_prefix>/] },
 ];
@@ -100,17 +102,9 @@ describe('sphere-cli — swap command shape (offline)', () => {
     });
   }
 
-  it('`sphere payments help swap-ping` reports "no help available" (HELP_TEXT gap pin)', () => {
-    // swap-ping has no entry in the legacy HELP_TEXT map. This test PINS
-    // the current behavior so a future contributor who adds help to it
-    // sees the test flip and is prompted to add `swap-ping` to the
-    // SWAP_SUBCOMMANDS table above instead of silently breaking the
-    // "all swap commands have help" promise.
-    const r = runSphere(env, ['payments', 'help', 'swap-ping'], { timeoutMs: 15_000 });
-    expect(r.status).not.toBe(0);
-    const out = `${r.stdout}\n${r.stderr}`;
-    expect(out).toMatch(/No help available.*swap-ping/i);
-  });
+  // (PR for issue #40 item #2 filled the swap-ping HELP_TEXT gap and
+  // moved swap-ping into SWAP_SUBCOMMANDS above. The old "no help
+  // available" gap-pin test was removed since help is now present.)
 });
 
 describe('sphere-cli — swap arg validation (offline)', () => {
@@ -146,13 +140,11 @@ describe('sphere-cli — swap arg validation (offline)', () => {
     // $id is empty.
     expect(r.status).not.toBe(0);
 
-    const out = `${r.stdout}\n${r.stderr}`;
-    // The legacy CLI prints "Usage: <legacy-name> ..." to stderr. If a
-    // refactor moves the arg check below the wallet load, this regex
-    // flips red (the user would instead see "No wallet exists ...").
-    expect(out, `${sub} should show usage hint`).toMatch(
-      new RegExp(`Usage:\\s*${legacyName}|usage:\\s*${legacyName}`, 'i'),
-    );
+    // The legacy CLI prints "Usage: npm run cli -- <legacy-name> ..." to
+    // stderr. If a refactor moves the arg check below the wallet load,
+    // this helper flips red (the user would instead see "No wallet
+    // exists ...").
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, legacyName);
   });
 
   it('`sphere swap propose` with no flags prints usage and exits non-zero', () => {
@@ -162,8 +154,7 @@ describe('sphere-cli — swap arg validation (offline)', () => {
     // every branch of the guard at once.
     const r = runSphere(env, ['swap', 'propose'], { timeoutMs: 15_000 });
     expect(r.status).not.toBe(0);
-    const out = `${r.stdout}\n${r.stderr}`;
-    expect(out).toMatch(/Usage:\s*swap-propose|usage:\s*swap-propose/i);
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, 'swap-propose');
   });
 
   it('`sphere swap propose --to @bob --offer "10 UCT"` without --want fails arg-check', () => {
@@ -174,8 +165,7 @@ describe('sphere-cli — swap arg validation (offline)', () => {
       timeoutMs: 15_000,
     });
     expect(r.status).not.toBe(0);
-    const out = `${r.stdout}\n${r.stderr}`;
-    expect(out).toMatch(/Usage:\s*swap-propose|usage:\s*swap-propose/i);
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, 'swap-propose');
   });
 
   it('`sphere swap propose --to @bob --offer X --want Y --timeout 10` rejects out-of-range timeout', () => {
@@ -184,9 +174,13 @@ describe('sphere-cli — swap arg validation (offline)', () => {
     // Use `10` (below 60) to hit the validation. Use parseable assets so
     // the earlier coin resolution doesn't trip first — though even with
     // bogus assets, the timeout check fires first because it's syntactic.
+    // Canonical UX expects `--offer <amount> <coin>` as two positional
+    // tokens (PR #33). Passing them as a single quoted string would now
+    // trip the asset-pair guard before the --timeout validation, so we
+    // split each pair into separate argv entries.
     const r = runSphere(
       env,
-      ['swap', 'propose', '--to', '@bob', '--offer', '10 UCT', '--want', '20 USDU',
+      ['swap', 'propose', '--to', '@bob', '--offer', '10', 'UCT', '--want', '20', 'USDU',
        '--timeout', '10'],
       { timeoutMs: 15_000 },
     );

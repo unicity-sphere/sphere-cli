@@ -39,6 +39,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   createSphereEnv,
   destroySphereEnv,
+  expectUsageHint,
   runSphere,
   type SphereEnv,
 } from './helpers.js';
@@ -101,8 +102,7 @@ describe('sphere-cli — market arg validation (offline)', () => {
   ])('`sphere market %s` with no args prints usage and exits non-zero', (sub, legacyName) => {
     const r = runSphere(env, ['market', sub], { timeoutMs: 15_000 });
     expect(r.status).not.toBe(0);
-    const out = `${r.stdout}\n${r.stderr}`;
-    expect(out).toMatch(new RegExp(`Usage:\\s*${legacyName}|usage:\\s*${legacyName}`, 'i'));
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, legacyName);
   });
 
   it('`sphere market post "<desc>"` (missing --type) rejects with required-flag error', () => {

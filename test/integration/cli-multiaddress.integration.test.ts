@@ -63,6 +63,7 @@ import { join } from 'node:path';
 import {
   createSphereEnv,
   destroySphereEnv,
+  expectUsageHint,
   runSphere,
   integrationSkip,
   type SphereEnv,
@@ -119,10 +120,7 @@ describe('sphere-cli — multiaddress arg validation (offline)', () => {
   ])('`sphere %s` prints usage and exits non-zero', (_label, argv, legacyName) => {
     const r = runSphere(env, argv, { timeoutMs: 15_000 });
     expect(r.status).not.toBe(0);
-    const out = `${r.stdout}\n${r.stderr}`;
-    expect(out, `${legacyName} should show usage hint`).toMatch(
-      new RegExp(`Usage:\\s*${legacyName}\\s*<index>`, 'i'),
-    );
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, legacyName, '<index>');
   });
 
   it('`sphere payments switch abc` rejects non-numeric index with "Invalid index"', () => {
@@ -159,7 +157,7 @@ describe.skipIf(integrationSkip)(
         console.error('wallet init failed', { status: init.status, stdout: init.stdout, stderr: init.stderr });
         throw new Error('wallet init failed; cannot proceed with multiaddress lifecycle');
       }
-      const match = init.stdout.match(/"directAddress":\s*"(DIRECT:\/\/[0-9a-fA-F]+)"/);
+      const match = init.stdout.match(/directAddress\s*:\s*(DIRECT:\/\/[0-9a-fA-F]+)/);
       if (!match) throw new Error(`directAddress not found in init output:\n${init.stdout}`);
       directAddr0 = match[1]!;
     }, 180_000);

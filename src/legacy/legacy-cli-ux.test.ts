@@ -127,3 +127,52 @@ describe('issue #32 — UX consistency', () => {
     expect(SOURCE).toMatch(/args\.includes\('--help'\)\s*\|\|\s*args\.includes\('-h'\)/);
   });
 });
+
+describe('issue #40 item #1 — bulk-return amount display', () => {
+  // Static-analysis pin for the bulk-refund render bug:
+  //
+  //   `sphere invoice return <id>` (no flags / --recipient form) used to
+  //   call `getInvoiceStatus()` AFTER `returnAllInvoicePayments()`. By
+  //   that point the SDK had drained `senderBalances[].netBalance` to 0
+  //   (refunds had been issued), so every refund row in the rendered
+  //   output showed `amount: "0"`. Fix: snapshot status BEFORE the SDK
+  //   call so we render the actual refunded amounts.
+  //
+  //   Pin: inside the `case 'invoice-return':` block, the first
+  //   `getInvoiceStatus(` call must appear BEFORE the first
+  //   `returnAllInvoicePayments(` call. Source ordering reflects
+  //   execution ordering here — both are top-level `await`s, no
+  //   conditional skips between them.
+
+  it('getInvoiceStatus is called BEFORE returnAllInvoicePayments in invoice-return', () => {
+    const caseStart = SOURCE.indexOf("case 'invoice-return':");
+    expect(caseStart, "case 'invoice-return': not found").toBeGreaterThan(-1);
+
+    // Locate end of case — next top-level `case '...'` or `default:` token.
+    const after = SOURCE.slice(caseStart + 1);
+    const nextCaseRel = after.search(/\n {6}case '[^']+':|\n {6}default:/);
+    const caseEnd = nextCaseRel >= 0 ? caseStart + 1 + nextCaseRel : SOURCE.length;
+    const block = SOURCE.slice(caseStart, caseEnd);
+
+    // Match the actual `await sphere.accounting!.<method>(` call sites,
+    // not bare `<method>(` (would also match comment references like
+    // "iterates `getInvoiceStatus().senderBalances` internally").
+    const statusCallRe   = /await\s+sphere\.accounting!?\.getInvoiceStatus\s*\(/;
+    const returnAllRe    = /await\s+sphere\.accounting!?\.returnAllInvoicePayments\s*\(/;
+    const statusMatch    = statusCallRe.exec(block);
+    const returnAllMatch = returnAllRe.exec(block);
+
+    expect(
+      statusMatch,
+      'getInvoiceStatus() call missing from invoice-return — bulk-refund render needs the pre-refund snapshot.',
+    ).not.toBeNull();
+    expect(
+      returnAllMatch,
+      'returnAllInvoicePayments() call missing from invoice-return — Form B/C delegates to the SDK.',
+    ).not.toBeNull();
+    expect(
+      statusMatch!.index,
+      'getInvoiceStatus() must be called BEFORE returnAllInvoicePayments() so renderer shows pre-refund amounts (issue #40 item #1).',
+    ).toBeLessThan(returnAllMatch!.index);
+  });
+});

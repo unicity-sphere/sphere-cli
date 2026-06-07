@@ -39,6 +39,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   createSphereEnv,
   destroySphereEnv,
+  expectUsageHint,
   runSphere,
   type SphereEnv,
 } from './helpers.js';
@@ -108,8 +109,7 @@ describe('sphere-cli — group arg validation (offline)', () => {
   ])('`sphere group %s` with no args prints usage and exits non-zero', (sub, legacyName) => {
     const r = runSphere(env, ['group', sub], { timeoutMs: 15_000 });
     expect(r.status).not.toBe(0);
-    const out = `${r.stdout}\n${r.stderr}`;
-    expect(out).toMatch(new RegExp(`Usage:\\s*${legacyName}|usage:\\s*${legacyName}`, 'i'));
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, legacyName);
   });
 
   it('`sphere group send <groupId>` (missing message) prints usage and exits non-zero', () => {
@@ -117,7 +117,6 @@ describe('sphere-cli — group arg validation (offline)', () => {
     // hits the pre-getSphere() guard.
     const r = runSphere(env, ['group', 'send', '00deadbeef'], { timeoutMs: 15_000 });
     expect(r.status).not.toBe(0);
-    const out = `${r.stdout}\n${r.stderr}`;
-    expect(out).toMatch(/Usage:\s*group-send|usage:\s*group-send/i);
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, 'group-send');
   });
 });

@@ -46,6 +46,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   createSphereEnv,
   destroySphereEnv,
+  expectUsageHint,
   runSphere,
   integrationSkip,
   type SphereEnv,
@@ -138,21 +139,18 @@ describe('sphere-cli — invoice arg validation (offline)', () => {
     // $id is empty.
     expect(r.status).not.toBe(0);
 
-    const out = `${r.stdout}\n${r.stderr}`;
-    // The legacy CLI prints "Usage: <legacy-name> ..." to stderr. If a
-    // refactor moves the arg check below the wallet load, this regex
-    // flips red (the user would instead see "No wallet exists ...").
-    expect(out, `${sub} should show usage hint`).toMatch(
-      new RegExp(`Usage:\\s*${legacyName}|usage:\\s*${legacyName}`, 'i'),
-    );
+    // The legacy CLI prints "Usage: npm run cli -- <legacy-name> ..." to
+    // stderr. If a refactor moves the arg check below the wallet load,
+    // this helper flips red (the user would instead see "No wallet
+    // exists ...").
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, legacyName);
   });
 
   it('`sphere invoice parse-memo` with no memo prints usage and exits non-zero', () => {
     // parse-memo's case also validates `args[1]` before wallet load.
     const r = runSphere(env, ['invoice', 'parse-memo'], { timeoutMs: 15_000 });
     expect(r.status).not.toBe(0);
-    const out = `${r.stdout}\n${r.stderr}`;
-    expect(out).toMatch(/Usage:\s*invoice-parse-memo|usage:\s*invoice-parse-memo/i);
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, 'invoice-parse-memo');
   });
 });
 
@@ -170,7 +168,8 @@ describe.skipIf(integrationSkip)(
         console.error('wallet init failed', { status: init.status, stdout: init.stdout, stderr: init.stderr });
         throw new Error('wallet init failed; cannot proceed with invoice lifecycle tests');
       }
-      const match = init.stdout.match(/"directAddress":\s*"(DIRECT:\/\/[0-9a-fA-F]+)"/);
+      // Canonical UX init emits `  directAddress : DIRECT://...`.
+      const match = init.stdout.match(/directAddress\s*:\s*(DIRECT:\/\/[0-9a-fA-F]+)/);
       if (!match) throw new Error(`directAddress not found in init output:\n${init.stdout}`);
       directAddress = match[1]!;
     }, 180_000);
@@ -193,7 +192,10 @@ describe.skipIf(integrationSkip)(
 
       const r = runSphere(
         env,
-        ['invoice', 'create', '--target', directAddress!, '--asset', '1000000 UCT', '--memo', 'integration-test'],
+        // Canonical UX expects `--asset <amount> <coin>` as two positional
+        // tokens (PR #33). The quoted single-string form would trip the
+        // asset-pair guard before invoice-create can reach the SDK.
+        ['invoice', 'create', '--target', directAddress!, '--asset', '1000000', 'UCT', '--memo', 'integration-test'],
         { timeoutMs: 180_000 },
       );
 
@@ -201,11 +203,11 @@ describe.skipIf(integrationSkip)(
         console.error('invoice create failed', { stdout: r.stdout, stderr: r.stderr });
       }
       expect(r.status).toBe(0);
-      // Legacy CLI prints "Invoice created:" then the JSON.stringify of
-      // the result, which includes an `invoiceId` field. Extract it for
-      // the downstream status / close pins.
+      // Canonical UX prints "Invoice created:" then a labelled block:
+      //   `  invoiceId : <hex>`
+      // Extract the id for downstream status / close pins.
       expect(r.stdout).toMatch(/Invoice created:/);
-      const idMatch = r.stdout.match(/"invoiceId":\s*"([0-9a-fA-F]+)"/);
+      const idMatch = r.stdout.match(/invoiceId\s*:\s*([0-9a-fA-F]+)/);
       expect(idMatch, `invoiceId not found in output:\n${r.stdout}`).toBeTruthy();
       invoiceId = idMatch![1]!;
       // Invoice token id is hex, ≥ 64 chars (state-transition-sdk token
@@ -237,7 +239,8 @@ describe.skipIf(integrationSkip)(
       expect(r.status).toBe(0);
       expect(r.stdout).toMatch(/Invoice Status:/);
       // OPEN is the entry state — invoice was just minted, no payments yet.
-      expect(r.stdout).toMatch(/"state":\s*"OPEN"/);
+      // Canonical UX format: `  state     : OPEN`.
+      expect(r.stdout).toMatch(/state\s*:\s*OPEN/);
     }, 180_000);
 
     // Regression pin for sphere-cli #21: `sphere invoice status <prefix>` for
@@ -271,7 +274,9 @@ describe.skipIf(integrationSkip)(
       const r = runSphere(env, ['invoice', 'status', bogus], { timeoutMs: 120_000 });
 
       expect(r.status).toBe(1);
-      expect(r.stderr).toMatch(/No invoice found matching prefix:/);
+      // Case-insensitive — failWithHelp lowercases its prose:
+      //   `Error: no invoice found matching prefix: ...`
+      expect(r.stderr).toMatch(/no invoice found matching prefix:/i);
       // The crash signature from #21. If this match flips green, the
       // process.exit wrapper has regressed back to its pre-#21 form.
       const combined = `${r.stdout}\n${r.stderr}`;
@@ -310,7 +315,7 @@ describe.skipIf(integrationSkip)(
       // Verify the state transition stuck — `invoice status` now reports CLOSED.
       const status = runSphere(env, ['invoice', 'status', prefix], { timeoutMs: 120_000 });
       expect(status.status).toBe(0);
-      expect(status.stdout).toMatch(/"state":\s*"CLOSED"/);
+      expect(status.stdout).toMatch(/state\s*:\s*CLOSED/);
     }, 360_000);
   },
 );

@@ -45,6 +45,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   createSphereEnv,
   destroySphereEnv,
+  expectUsageHint,
   runSphere,
   integrationSkip,
   type SphereEnv,
@@ -92,8 +93,7 @@ describe('sphere-cli — asset-info arg validation (offline)', () => {
     // "did I type the right command" probe offline-fast for users.
     const r = runSphere(env, ['payments', 'asset-info'], { timeoutMs: 15_000 });
     expect(r.status).not.toBe(0);
-    const out = `${r.stdout}\n${r.stderr}`;
-    expect(out).toMatch(/Usage:\s*asset-info\s*<symbol\|name\|coinId>/i);
+    expectUsageHint(`${r.stdout}\n${r.stderr}`, 'asset-info', '<symbol|name|coinId>');
   });
 });
 
@@ -175,7 +175,10 @@ describe.skipIf(integrationSkip)(
       const r = runSphere(env, ['payments', 'asset-info', 'NOT_A_REAL_TOKEN_ZZZ'], { timeoutMs: 120_000 });
       expect(r.status).not.toBe(0);
       const out = `${r.stdout}\n${r.stderr}`;
-      expect(out).toMatch(/Asset not found/);
+      // Case-insensitive because failWithHelp lowercases its prose
+      // ("asset not found: ...") — the asserted invariant is the
+      // negative-lookup verdict reaching the user, not the casing.
+      expect(out).toMatch(/asset not found/i);
     }, 180_000);
   },
 );

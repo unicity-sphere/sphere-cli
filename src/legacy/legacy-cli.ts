@@ -116,6 +116,9 @@ type OutputShape =
   | 'swap-result'
   | 'swap-status'
   | 'swap-ping'
+  | 'swap-reject-result'
+  | 'swap-cancel-result'
+  | 'swap-wait-transition'
   | 'config'
   | 'nametag-info'
   | 'encrypt-result'
@@ -161,6 +164,9 @@ function renderHuman(payload: unknown, shape: OutputShape): void {
     case 'swap-result': return renderSwapResult(payload as Record<string, unknown>);
     case 'swap-status': return renderSwapStatus(payload as Record<string, unknown>);
     case 'swap-ping': return renderSwapPing(payload as Record<string, unknown>);
+    case 'swap-reject-result': return renderSwapTransitionResult(payload as Record<string, unknown>);
+    case 'swap-cancel-result': return renderSwapTransitionResult(payload as Record<string, unknown>);
+    case 'swap-wait-transition': return renderSwapWaitTransition(payload as Record<string, unknown>);
     case 'config': return renderKvBlock(payload as Record<string, unknown>);
     case 'nametag-info': return renderKvBlock(payload as Record<string, unknown>);
     case 'encrypt-result': return renderKvBlock(payload as Record<string, unknown>);
@@ -387,6 +393,33 @@ function renderSwapStatus(p: Record<string, unknown>): void {
 
 function renderSwapPing(p: Record<string, unknown>): void {
   renderKvBlock(p);
+}
+
+// Shared kv shape for both swap-reject and swap-cancel JSON-mode outputs.
+// Both emit { swap_id, prev_state, new_state, ... } and benefit from the
+// same prefix-truncated id rendering as the other swap blocks above.
+function renderSwapTransitionResult(p: Record<string, unknown>): void {
+  const id = String(p.swap_id ?? '(unknown)');
+  console.log(`  swap_id        : ${id.length > 16 ? `${id.slice(0, 16)}…` : id}`);
+  if (p.prev_state) console.log(`  prev_state     : ${p.prev_state}`);
+  if (p.new_state)  console.log(`  new_state      : ${p.new_state}`);
+  if (p.reason !== undefined && p.reason !== null && p.reason !== '') {
+    console.log(`  reason         : ${p.reason}`);
+  }
+  if (p.deposits_returned !== undefined) {
+    console.log(`  deposits_returned : ${p.deposits_returned}`);
+  }
+}
+
+// Streaming render for `swap-wait`: one short line per state transition.
+// JSON-mode emits raw JSON per transition (handled at the call site).
+function renderSwapWaitTransition(p: Record<string, unknown>): void {
+  const id = String(p.swap_id ?? '(unknown)');
+  const idShort = id.length > 8 ? id.slice(0, 8) : id;
+  const ts = (typeof p.ts === 'number' && p.ts > 0)
+    ? new Date(p.ts).toISOString().slice(11, 19)
+    : new Date().toISOString().slice(11, 19);
+  console.log(`[${ts}] swap ${idShort} → ${p.state ?? '(unknown)'}`);
 }
 
 function renderParseWalletResult(p: Record<string, unknown>): void {
@@ -1723,28 +1756,59 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
   },
 
   'swap-reject': {
-    usage: 'swap-reject <swap_id_or_prefix> [reason]',
+    usage: 'swap-reject <swap_id_or_prefix> [--reason "<text>"]',
     description: 'Reject an incoming swap proposal. Sends a rejection DM to the proposer and marks the swap as cancelled.',
+    flags: [
+      { flag: '--reason <text>', description: 'Optional human-readable reason (truncated to 256 chars; included in the rejection DM)' },
+    ],
     examples: [
       'npm run cli -- swap-reject 3611a464',
-      'npm run cli -- swap-reject 3611a464 "Price too high"',
+      'npm run cli -- swap-reject 3611a464 --reason "Price too high"',
+      'npm run cli -- swap-reject 3611a464 --reason "Price too high" --json',
     ],
     notes: [
       'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
-      'Only works on proposals you received (role: acceptor, progress: proposed).',
-      'The optional reason is included in the rejection DM sent to the proposer.',
+      'Acceptor-only: errors if invoked on a swap your wallet proposed (use `swap-cancel` instead).',
+      '--json emits { swap_id, prev_state, new_state, reason } for scripting.',
     ],
   },
   'swap-cancel': {
-    usage: 'swap-cancel <swap_id_or_prefix>',
-    description: 'Cancel a swap you proposed or accepted. Works before deposits are confirmed by the escrow.',
+    usage: 'swap-cancel <swap_id_or_prefix> [--timeout <seconds>]',
+    description: 'Cancel a swap you proposed or accepted. State-aware: refuses once payouts are concluding.',
+    flags: [
+      { flag: '--timeout <seconds>', description: 'When post-announce: max wall-clock to wait for escrow to return deposits before exiting (default 60, clamped [5, 86400])' },
+    ],
     examples: [
       'npm run cli -- swap-cancel 3611a464',
+      'npm run cli -- swap-cancel 3611a464 --timeout 120',
+      'npm run cli -- swap-cancel 3611a464 --json',
     ],
     notes: [
       'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
-      'Pre-deposit cancellation is local only (no escrow notification).',
-      'Post-deposit cancellation: escrow handles timeout and returns deposits automatically.',
+      'Pre-announce (state ∈ proposed/accepted): local-only transition, no escrow round-trip.',
+      'Post-announce (state ∈ announced/depositing/awaiting_counter): sends cancel DM to escrow, waits up to --timeout for `swap:deposit_returned`.',
+      'Concluding+ (state ∈ concluding/completed/cancelled/failed): refuses with a non-zero exit.',
+      '--json emits { swap_id, prev_state, new_state, deposits_returned } for scripting.',
+    ],
+  },
+  'swap-wait': {
+    usage: 'swap-wait <swap_id_or_prefix> [--state <name>] [--timeout <seconds>] [--exit-on-failure]',
+    description: 'Block until a swap reaches a target state (default: completed). Subscribes to swap:* events and exits when the swap settles or times out.',
+    flags: [
+      { flag: '--state <name>', description: 'Target progress state to wait for. One of: proposed, accepted, announced, depositing, awaiting_counter, concluding, completed, cancelled, failed (default: completed)' },
+      { flag: '--timeout <seconds>', description: 'Max wall-clock to wait (default 600, clamped [5, 86400]). Exits 124 on timeout.' },
+      { flag: '--exit-on-failure', description: 'Exit non-zero if the swap reaches a terminal-but-wrong state (cancelled/failed) before --state. Default: exit 0 with a printed state.' },
+    ],
+    examples: [
+      'npm run cli -- swap-wait 3611a464',
+      'npm run cli -- swap-wait 3611a464 --state completed --timeout 300 --exit-on-failure',
+      'npm run cli -- swap-wait 3611a464 --json',
+    ],
+    notes: [
+      'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
+      'Short-circuits with exit 0 if the swap is already in the target state at start.',
+      '--json emits one JSON line per state transition: { swap_id, state, ts }.',
+      'Exit codes: 0 = reached target (or terminal-but-wrong without --exit-on-failure); 1 = terminal-but-wrong with --exit-on-failure; 124 = wall-clock timeout.',
     ],
   },
 
@@ -2123,8 +2187,9 @@ SWAPS:
   swap-accept <id|prefix>            Accept a swap deal
   swap-status <id|prefix>            Show swap status
   swap-deposit <id|prefix>           Deposit into a swap
-  swap-reject <id|prefix> [reason]  Reject a swap proposal
-  swap-cancel <id|prefix>           Cancel a swap
+  swap-reject <id|prefix> [--reason] Reject a swap proposal (acceptor only)
+  swap-cancel <id|prefix>           Cancel a swap (state-aware)
+  swap-wait <id|prefix>             Block until a swap reaches a target state
 
 EVENT DAEMON:
   daemon start                      Start persistent event listener
@@ -5609,9 +5674,36 @@ async function main(): Promise<void> {
       }
 
       case 'swap-reject': {
+        // sphere-sdk#437 — acceptor-only swap rejection.
+        //
+        // Wire the SDK's `rejectSwap(swapId, reason?)`, but layer two CLI-side
+        // policies on top:
+        //   - Acceptor-only: a proposer who wants out should call `swap-cancel`
+        //     instead (they sent the proposal; rejecting their own proposal is
+        //     a UX dead-end). Enforced here, NOT in the SDK, because the SDK
+        //     method must remain usable for the proposal-side reject path
+        //     triggered indirectly (e.g., when local validation fails before
+        //     the deal is ever announced).
+        //   - Reason length cap (256 chars): protects the rejection DM payload
+        //     from arbitrary blow-up. Truncated with a stderr warning so a
+        //     misuse is visible without breaking the script.
         const swapIdArg = args[1];
         if (!swapIdArg) {
           failWithHelp('swap-reject', 'missing required <swap_id_or_prefix> argument');
+        }
+
+        const reasonIdx = args.indexOf('--reason');
+        let reason: string | undefined;
+        if (reasonIdx !== -1) {
+          const value = args[reasonIdx + 1];
+          if (value === undefined || value.startsWith('--')) {
+            failWithHelp('swap-reject', '--reason requires a value');
+          }
+          reason = value;
+          if (reason.length > 256) {
+            console.warn(`warning: --reason truncated from ${reason.length} to 256 chars`);
+            reason = reason.slice(0, 256);
+          }
         }
 
         const sphere = await getSphere();
@@ -5623,20 +5715,63 @@ async function main(): Promise<void> {
         await ensureSync(sphere, 'nostr');
 
         const swapId = swapModule.resolveSwapId(swapIdArg);
-        // Optional reason from remaining args
-        const reason = args.slice(2).filter((a: string) => !a.startsWith('--')).join(' ') || undefined;
+        const swap = await swapModule.getSwapStatus(swapId);
+        const prevState = swap?.progress ?? 'unknown';
+
+        if (swap?.role !== 'acceptor') {
+          console.error(
+            `Cannot reject: 'swap reject' is acceptor-only (this swap's local role is '${swap?.role ?? 'unknown'}'). ` +
+            `Use 'sphere swap cancel ${swapId.slice(0, 12)}' to cancel a proposal your wallet sent.`,
+          );
+          await closeSphere();
+          process.exit(1);
+        }
 
         await swapModule.rejectSwap(swapId, reason);
-        console.log(`Swap ${swapId.slice(0, 8)}... rejected.${reason ? ` Reason: ${reason}` : ''}`);
+        formatOutput({
+          swap_id: swapId,
+          prev_state: prevState,
+          new_state: 'cancelled',
+          reason: reason,
+        }, 'swap-reject-result', 'Swap rejected:');
 
         await closeSphere();
         break;
       }
 
       case 'swap-cancel': {
+        // sphere-sdk#437 — state-aware cancel wrapper around `cancelSwap`.
+        //
+        // The SDK's cancelSwap() emits `swap:cancelled` IMMEDIATELY (with
+        // depositsReturned=false) after sending the cancel DM to escrow. It
+        // does NOT wait for the escrow's deposit-return invoices to land.
+        // The CLI handles the wait, because soak scripts and presenters
+        // want a single command they can run and trust to be quiescent
+        // before they read post-cancel balances.
+        //
+        // State branches (mirrors §2.2 of issue #437):
+        //   - Pre-announce (proposed/accepted): pure-local transition, return
+        //     immediately. No deposits to wait for.
+        //   - Post-announce (announced/depositing/awaiting_counter): subscribe
+        //     to `swap:deposit_returned` BEFORE calling cancelSwap (avoids
+        //     race where the escrow's return arrives before our subscription
+        //     attaches), then call cancelSwap, then wait up to --timeout.
+        //   - Concluding+ (concluding/completed/cancelled/failed): refuse with
+        //     non-zero exit and a clear message. The SDK would also throw,
+        //     but its error code is opaque to operators.
         const swapIdArg = args[1];
         if (!swapIdArg) {
           failWithHelp('swap-cancel', 'missing required <swap_id_or_prefix> argument');
+        }
+
+        const timeoutIdx = args.indexOf('--timeout');
+        let timeoutSec = 60;
+        if (timeoutIdx !== -1) {
+          const parsed = parseInt(args[timeoutIdx + 1] ?? '', 10);
+          if (Number.isNaN(parsed)) {
+            failWithHelp('swap-cancel', '--timeout requires an integer value (seconds)');
+          }
+          timeoutSec = Math.max(5, Math.min(86400, parsed));
         }
 
         const sphere = await getSphere();
@@ -5648,10 +5783,277 @@ async function main(): Promise<void> {
         await ensureSync(sphere, 'nostr');
 
         const swapId = swapModule.resolveSwapId(swapIdArg);
-        await swapModule.cancelSwap(swapId);
-        console.log(`Swap ${swapId.slice(0, 8)}... cancelled.`);
+        const swap = await swapModule.getSwapStatus(swapId);
+        const prevState = swap?.progress ?? 'unknown';
+
+        // Concluding+: refuse — escrow is executing payouts; cancel is not safe.
+        if (prevState === 'concluding') {
+          console.error(`Cannot cancel: payouts are already in progress (state: concluding). The escrow will complete or time out on its own.`);
+          await closeSphere();
+          process.exit(1);
+        }
+        if (prevState === 'completed' || prevState === 'cancelled' || prevState === 'failed') {
+          console.error(`Cannot cancel: swap is already in terminal state '${prevState}'.`);
+          await closeSphere();
+          process.exit(1);
+        }
+
+        const isPreAnnounce = prevState === 'proposed' || prevState === 'accepted';
+
+        // Even at announced/depositing/awaiting_counter, we may have never
+        // submitted our own deposit (e.g. cancel-after-announce-before-pay).
+        // The SDK emits `swap:deposit_returned` only when an
+        // `invoice:return_received` event fires for the deposit invoice,
+        // and that only happens when there's actually something to return.
+        // If we never deposited, the wait would always burn the full
+        // --timeout and report `deposits_returned: false` confusingly.
+        // Skip the wait entirely in that case.
+        const hasLocalDeposit = !!swap?.localDepositTransferId;
+
+        if (isPreAnnounce || !hasLocalDeposit) {
+          await swapModule.cancelSwap(swapId);
+          formatOutput({
+            swap_id: swapId,
+            prev_state: prevState,
+            new_state: 'cancelled',
+            deposits_returned: false,
+          }, 'swap-cancel-result', 'Swap cancelled:');
+          await closeSphere();
+          break;
+        }
+
+        // Post-announce with local deposit in flight: subscribe FIRST, then
+        // cancel, then wait for the deposit return. Wrap in try/finally so a
+        // cancelSwap throw (TOCTOU — swap raced to `concluding` between the
+        // pre-gate check and gate acquisition) doesn't leak the listener and
+        // the timer into the event loop.
+        let depositsReturned = false;
+        const unsubs: Array<() => void> = [];
+        let returnTimer: ReturnType<typeof setTimeout> | undefined;
+        const returnSeen = new Promise<void>((resolve) => {
+          returnTimer = setTimeout(() => resolve(), timeoutSec * 1000);
+          unsubs.push(sphere.on('swap:deposit_returned', (e: { swapId: string }) => {
+            if (e.swapId === swapId) {
+              depositsReturned = true;
+              if (returnTimer) clearTimeout(returnTimer);
+              // First return is enough to record. Additional returns (multi-asset
+              // swaps) still arrive but don't change the boolean we report.
+              resolve();
+            }
+          }));
+        });
+
+        try {
+          await swapModule.cancelSwap(swapId);
+          await returnSeen;
+        } finally {
+          if (returnTimer) clearTimeout(returnTimer);
+          unsubs.forEach((u) => u());
+        }
+
+        formatOutput({
+          swap_id: swapId,
+          prev_state: prevState,
+          new_state: 'cancelled',
+          deposits_returned: depositsReturned,
+        }, 'swap-cancel-result', 'Swap cancelled:');
 
         await closeSphere();
+        break;
+      }
+
+      case 'swap-wait': {
+        // sphere-sdk#437 — block until a swap reaches a target state.
+        //
+        // Soaks/scripts need a primitive that exits when the swap settles,
+        // without polling `swap status` in a sleep loop. The SDK emits
+        // events for every progress transition; the CLI subscribes to all
+        // swap:* events for the given swapId and re-reads progress on each
+        // notification to detect transitions.
+        //
+        // Exit codes (load-bearing for scripts):
+        //   0   reached target state
+        //   0   reached a terminal-but-wrong state, --exit-on-failure NOT set
+        //   1   reached a terminal-but-wrong state, --exit-on-failure set
+        //   124 wall-clock timeout (matches GNU `timeout`)
+        const swapIdArg = args[1];
+        if (!swapIdArg) {
+          failWithHelp('swap-wait', 'missing required <swap_id_or_prefix> argument');
+        }
+
+        const VALID_STATES = new Set([
+          'proposed', 'accepted', 'announced', 'depositing', 'awaiting_counter',
+          'concluding', 'completed', 'cancelled', 'failed',
+        ]);
+        const TERMINAL_STATES = new Set(['completed', 'cancelled', 'failed']);
+
+        let targetState = 'completed';
+        const stateIdx = args.indexOf('--state');
+        if (stateIdx !== -1) {
+          const value = args[stateIdx + 1];
+          if (value === undefined || value.startsWith('--')) {
+            failWithHelp('swap-wait', '--state requires a value (e.g. completed, cancelled, announced)');
+          }
+          if (!VALID_STATES.has(value)) {
+            failWithHelp('swap-wait', `--state value '${value}' is not a valid swap progress state`);
+          }
+          targetState = value;
+        }
+
+        let timeoutSec = 600;
+        const timeoutIdx = args.indexOf('--timeout');
+        if (timeoutIdx !== -1) {
+          const parsed = parseInt(args[timeoutIdx + 1] ?? '', 10);
+          if (Number.isNaN(parsed)) {
+            failWithHelp('swap-wait', '--timeout requires an integer value (seconds)');
+          }
+          timeoutSec = Math.max(5, Math.min(86400, parsed));
+        }
+
+        const exitOnFailure = args.includes('--exit-on-failure');
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          failWithHelp(command!, 'swap module not enabled');
+        }
+        await ensureSync(sphere, 'nostr');
+
+        const swapId = swapModule.resolveSwapId(swapIdArg);
+
+        // Emit a transition record in the configured shape (JSON line or human).
+        //
+        // We bypass formatOutput() in jsonMode because this is a STREAMING
+        // surface — one compact JSON object per transition, terminated by a
+        // newline, so scripts can `read -r line` from stdout. formatOutput()
+        // would pretty-print with a 2-space indent, breaking line-oriented
+        // consumers. This is the same pattern operators expect from `tail -F`
+        // or `journalctl -f -o json`. Using process.stdout.write also keeps
+        // legacy-cli-ux.test.ts invariant #1 clean (the stringify-in-log
+        // idiom is forbidden for one-shot output; we route through formatOutput
+        // for those, and through process.stdout.write for streaming).
+        const emitTransition = (state: string): void => {
+          const payload = { swap_id: swapId, state, ts: Date.now() };
+          if (jsonMode) {
+            process.stdout.write(`${JSON.stringify(payload)}\n`);
+          } else {
+            renderSwapWaitTransition(payload);
+          }
+        };
+
+        // Short-circuit: read current state. If already in target, exit 0
+        // without subscribing. If already terminal-but-wrong, follow the
+        // --exit-on-failure rules below.
+        let currentState: string = (await swapModule.getSwapStatus(swapId))?.progress ?? 'unknown';
+        emitTransition(currentState);
+
+        const handleTerminalMismatch = async (): Promise<never> => {
+          await closeSphere();
+          process.exit(exitOnFailure ? 1 : 0);
+        };
+
+        if (currentState === targetState) {
+          await closeSphere();
+          process.exit(0);
+        }
+        if (TERMINAL_STATES.has(currentState)) {
+          await handleTerminalMismatch();
+        }
+
+        // Subscribe to every swap:* event. The SDK fires distinct events per
+        // transition (announced/concluding/etc.), but several non-state events
+        // also carry the swapId (deposit_sent, deposit_confirmed, payout_received).
+        // On any of them we re-read `progress` — that's the authoritative
+        // source for "did we transition?".
+        const SWAP_EVENTS = [
+          'swap:proposal_received', 'swap:proposed', 'swap:accepted', 'swap:rejected',
+          'swap:announced', 'swap:deposit_sent', 'swap:deposit_confirmed',
+          'swap:deposits_covered', 'swap:concluding', 'swap:payout_received',
+          'swap:completed', 'swap:cancelled', 'swap:failed', 'swap:deposit_returned',
+          'swap:bounce_received',
+        ] as const;
+
+        const unsubs: Array<() => void> = [];
+        const settled = new Promise<'target' | 'terminal' | 'timeout'>((resolve) => {
+          const timer = setTimeout(() => resolve('timeout'), timeoutSec * 1000);
+
+          // Single-flight drain: SDK events can arrive in bursts (e.g. an
+          // `invoice:payment` propagates through the SwapModule to fire
+          // `swap:deposit_confirmed` and then `swap:concluding` back-to-back).
+          // If we awaited `getSwapStatus()` once per event, two concurrent
+          // awaits could resume out-of-order and emit a backward-looking
+          // transition line ("→ concluding" then "→ depositing") even though
+          // the underlying state machine never went backward.
+          //
+          // Instead: one read in flight at a time. If another event arrives
+          // while we're awaiting, set `needsReread` and re-read once the
+          // current call returns. This eventual-consistency model preserves
+          // the canonical forward ordering of emitted transitions and keeps
+          // exit-code correctness (the loop runs until the state settles).
+          let inFlight = false;
+          let needsReread = false;
+
+          const drain = async (): Promise<void> => {
+            if (inFlight) { needsReread = true; return; }
+            inFlight = true;
+            try {
+              do {
+                needsReread = false;
+                const next: string = (await swapModule.getSwapStatus(swapId))?.progress ?? 'unknown';
+                if (next === currentState) continue;
+                currentState = next;
+                emitTransition(currentState);
+                if (currentState === targetState) {
+                  clearTimeout(timer);
+                  resolve('target');
+                  return;
+                }
+                if (TERMINAL_STATES.has(currentState)) {
+                  clearTimeout(timer);
+                  resolve('terminal');
+                  return;
+                }
+              } while (needsReread);
+            } finally {
+              inFlight = false;
+            }
+          };
+
+          const onEvent = (e: { swapId: string }): void => {
+            if (e.swapId !== swapId) return;
+            void drain();
+          };
+
+          for (const evt of SWAP_EVENTS) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            unsubs.push(sphere.on(evt as any, onEvent));
+          }
+
+          // Race guard: a transition could have fired between the short-circuit
+          // read at the top and the time our handlers attached. Drain once
+          // after subscription is live so the missed transition is recovered.
+          void drain();
+        });
+
+        const outcome = await settled;
+        unsubs.forEach((u) => u());
+
+        // ESLint can't tell that process.exit never returns, so we route every
+        // branch through a single `exitCode` and exit at the bottom — keeps the
+        // no-fallthrough rule happy without disabling the lint per-branch.
+        let exitCode: number;
+        if (outcome === 'target') {
+          exitCode = 0;
+        } else if (outcome === 'terminal') {
+          exitCode = exitOnFailure ? 1 : 0;
+        } else {
+          console.error(`swap-wait: timed out after ${timeoutSec}s in state '${currentState}' (waiting for '${targetState}')`);
+          exitCode = 124;
+        }
+        await closeSphere();
+        process.exit(exitCode);
+        // unreachable, but eslint's no-fallthrough rule doesn't model process.exit
         break;
       }
 
@@ -5825,8 +6227,9 @@ function getCompletionCommands(): CompletionCommand[] {
     { name: 'swap-status', description: 'Show swap status', flags: ['--query-escrow'] },
     { name: 'swap-deposit', description: 'Deposit into a swap' },
     { name: 'swap-ping', description: 'Ping an escrow service' },
-    { name: 'swap-reject', description: 'Reject a swap proposal' },
-    { name: 'swap-cancel', description: 'Cancel a swap' },
+    { name: 'swap-reject', description: 'Reject a swap proposal (acceptor only)', flags: ['--reason'] },
+    { name: 'swap-cancel', description: 'Cancel a swap (state-aware)', flags: ['--timeout'] },
+    { name: 'swap-wait', description: 'Block until a swap reaches a target state', flags: ['--state', '--timeout', '--exit-on-failure'] },
     { name: 'market-post', description: 'Post a market intent', flags: ['--type', '--category', '--price', '--currency', '--location', '--contact', '--expires'] },
     { name: 'market-search', description: 'Search market intents', flags: ['--type', '--category', '--min-price', '--max-price', '--limit'] },
     { name: 'market-my', description: 'List your intents' },

@@ -71,8 +71,21 @@ const SWAP_SUBCOMMANDS: ReadonlyArray<{
   { legacy: 'swap-status',  mustMatch: [/<swap_id_or_prefix>/, /--query-escrow/] },
   { legacy: 'swap-deposit', mustMatch: [/<swap_id_or_prefix>/] },
   { legacy: 'swap-ping',    mustMatch: [/<@nametag_or_address>/] },
-  { legacy: 'swap-reject',  mustMatch: [/<swap_id_or_prefix>/] },
-  { legacy: 'swap-cancel',  mustMatch: [/<swap_id_or_prefix>/] },
+  { legacy: 'swap-reject',  mustMatch: [/<swap_id_or_prefix>/, /--reason/] },
+  { legacy: 'swap-cancel',  mustMatch: [/<swap_id_or_prefix>/, /--timeout/] },
+  // sphere-sdk#437: new wait-for-state primitive replaces sleep-loops around
+  // `sphere swap status`. Pin the documented exit semantics + every flag.
+  {
+    legacy: 'swap-wait',
+    mustMatch: [
+      /<swap_id_or_prefix>/,
+      /--state/,
+      /--timeout/,
+      /--exit-on-failure/,
+      // Exit-code contract is part of the user-facing API for scripts; pin it.
+      /124/,
+    ],
+  },
 ];
 
 describe('sphere-cli — swap command shape (offline)', () => {
@@ -132,6 +145,8 @@ describe('sphere-cli — swap arg validation (offline)', () => {
     ['deposit', 'swap-deposit'],
     ['reject',  'swap-reject'],
     ['cancel',  'swap-cancel'],
+    // sphere-sdk#437: swap-wait has the same args[1] precheck as the rest.
+    ['wait',    'swap-wait'],
   ])('`sphere swap %s` with no swap_id prints usage and exits non-zero', (sub, legacyName) => {
     const r = runSphere(env, ['swap', sub], { timeoutMs: 15_000 });
 

@@ -5800,8 +5800,17 @@ async function main(): Promise<void> {
 
         const isPreAnnounce = prevState === 'proposed' || prevState === 'accepted';
 
-        if (isPreAnnounce) {
-          // Pre-announce: pure-local transition.
+        // Even at announced/depositing/awaiting_counter, we may have never
+        // submitted our own deposit (e.g. cancel-after-announce-before-pay).
+        // The SDK emits `swap:deposit_returned` only when an
+        // `invoice:return_received` event fires for the deposit invoice,
+        // and that only happens when there's actually something to return.
+        // If we never deposited, the wait would always burn the full
+        // --timeout and report `deposits_returned: false` confusingly.
+        // Skip the wait entirely in that case.
+        const hasLocalDeposit = !!swap?.localDepositTransferId;
+
+        if (isPreAnnounce || !hasLocalDeposit) {
           await swapModule.cancelSwap(swapId);
           formatOutput({
             swap_id: swapId,
@@ -5813,15 +5822,20 @@ async function main(): Promise<void> {
           break;
         }
 
-        // Post-announce: subscribe FIRST, then cancel, then wait for deposit_returned.
+        // Post-announce with local deposit in flight: subscribe FIRST, then
+        // cancel, then wait for the deposit return. Wrap in try/finally so a
+        // cancelSwap throw (TOCTOU — swap raced to `concluding` between the
+        // pre-gate check and gate acquisition) doesn't leak the listener and
+        // the timer into the event loop.
         let depositsReturned = false;
         const unsubs: Array<() => void> = [];
+        let returnTimer: ReturnType<typeof setTimeout> | undefined;
         const returnSeen = new Promise<void>((resolve) => {
-          const timer = setTimeout(() => resolve(), timeoutSec * 1000);
+          returnTimer = setTimeout(() => resolve(), timeoutSec * 1000);
           unsubs.push(sphere.on('swap:deposit_returned', (e: { swapId: string }) => {
             if (e.swapId === swapId) {
               depositsReturned = true;
-              clearTimeout(timer);
+              if (returnTimer) clearTimeout(returnTimer);
               // First return is enough to record. Additional returns (multi-asset
               // swaps) still arrive but don't change the boolean we report.
               resolve();
@@ -5829,9 +5843,13 @@ async function main(): Promise<void> {
           }));
         });
 
-        await swapModule.cancelSwap(swapId);
-        await returnSeen;
-        unsubs.forEach((u) => u());
+        try {
+          await swapModule.cancelSwap(swapId);
+          await returnSeen;
+        } finally {
+          if (returnTimer) clearTimeout(returnTimer);
+          unsubs.forEach((u) => u());
+        }
 
         formatOutput({
           swap_id: swapId,
@@ -5960,21 +5978,51 @@ async function main(): Promise<void> {
         const settled = new Promise<'target' | 'terminal' | 'timeout'>((resolve) => {
           const timer = setTimeout(() => resolve('timeout'), timeoutSec * 1000);
 
-          const onEvent = async (e: { swapId: string }): Promise<void> => {
+          // Single-flight drain: SDK events can arrive in bursts (e.g. an
+          // `invoice:payment` propagates through the SwapModule to fire
+          // `swap:deposit_confirmed` and then `swap:concluding` back-to-back).
+          // If we awaited `getSwapStatus()` once per event, two concurrent
+          // awaits could resume out-of-order and emit a backward-looking
+          // transition line ("→ concluding" then "→ depositing") even though
+          // the underlying state machine never went backward.
+          //
+          // Instead: one read in flight at a time. If another event arrives
+          // while we're awaiting, set `needsReread` and re-read once the
+          // current call returns. This eventual-consistency model preserves
+          // the canonical forward ordering of emitted transitions and keeps
+          // exit-code correctness (the loop runs until the state settles).
+          let inFlight = false;
+          let needsReread = false;
+
+          const drain = async (): Promise<void> => {
+            if (inFlight) { needsReread = true; return; }
+            inFlight = true;
+            try {
+              do {
+                needsReread = false;
+                const next: string = (await swapModule.getSwapStatus(swapId))?.progress ?? 'unknown';
+                if (next === currentState) continue;
+                currentState = next;
+                emitTransition(currentState);
+                if (currentState === targetState) {
+                  clearTimeout(timer);
+                  resolve('target');
+                  return;
+                }
+                if (TERMINAL_STATES.has(currentState)) {
+                  clearTimeout(timer);
+                  resolve('terminal');
+                  return;
+                }
+              } while (needsReread);
+            } finally {
+              inFlight = false;
+            }
+          };
+
+          const onEvent = (e: { swapId: string }): void => {
             if (e.swapId !== swapId) return;
-            const next: string = (await swapModule.getSwapStatus(swapId))?.progress ?? 'unknown';
-            if (next === currentState) return;
-            currentState = next;
-            emitTransition(currentState);
-            if (currentState === targetState) {
-              clearTimeout(timer);
-              resolve('target');
-              return;
-            }
-            if (TERMINAL_STATES.has(currentState)) {
-              clearTimeout(timer);
-              resolve('terminal');
-            }
+            void drain();
           };
 
           for (const evt of SWAP_EVENTS) {
@@ -5983,12 +6031,9 @@ async function main(): Promise<void> {
           }
 
           // Race guard: a transition could have fired between the short-circuit
-          // read at the top and the time our handlers attached. Re-query once
-          // after subscription is live and feed the result through the same
-          // path the event handler uses, so a missed transition is recovered.
-          // Synthesize an `e` with the right swapId so the dedup check inside
-          // onEvent doesn't accidentally skip the re-read.
-          void onEvent({ swapId });
+          // read at the top and the time our handlers attached. Drain once
+          // after subscription is live so the missed transition is recovered.
+          void drain();
         });
 
         const outcome = await settled;

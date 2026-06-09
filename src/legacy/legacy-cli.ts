@@ -1148,10 +1148,10 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
   },
   'topup': {
     usage: 'topup [<amount> <coin>]',
-    description: 'Request test tokens from the Unicity faucet. Without arguments, requests default amounts of all supported coins. With amount and coin, requests a specific coin.',
+    description: 'Mint test tokens locally (no external faucet service). Without arguments, mints default amounts of all default coins. With amount and coin, mints a specific coin.',
     flags: [
-      { flag: '<amount>', description: 'Amount to request (numeric)' },
-      { flag: '<coin>', description: 'Coin symbol (UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU, ALPHT) or faucet name (unicity, bitcoin, ethereum, solana, tether, usd-coin, unicity-usd)' },
+      { flag: '<amount>', description: 'Whole-coin amount to mint (numeric)' },
+      { flag: '<coin>', description: 'Coin symbol (UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU, ALPHT) or legacy faucet name (unicity, bitcoin, ethereum, solana, tether, usd-coin, unicity-usd)' },
     ],
     examples: [
       'npm run cli -- topup',
@@ -1160,13 +1160,13 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       'npm run cli -- topup 42 ETH',
     ],
     notes: [
-      'Requires a registered nametag. The faucet is only available on testnet.',
+      'Tokens are minted directly via the L3 aggregator — no nametag and no faucet HTTP service required.',
       'Also accessible as "top-up" or "faucet".',
     ],
   },
   'top-up': {
     usage: 'top-up [<amount> <coin>]',
-    description: 'Alias for "topup". Request test tokens from the Unicity faucet.',
+    description: 'Alias for "topup". Mint test tokens locally (no external faucet service).',
     examples: [
       'npm run cli -- top-up',
       'npm run cli -- top-up 2 BTC',
@@ -1177,7 +1177,7 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
   },
   'faucet': {
     usage: 'faucet [<amount> <coin>]',
-    description: 'Alias for "topup". Request test tokens from the Unicity faucet.',
+    description: 'Alias for "topup". Mint test tokens locally (no external faucet service).',
     examples: [
       'npm run cli -- faucet',
       'npm run cli -- faucet 100 ETH',
@@ -2121,7 +2121,7 @@ BALANCE & TOKENS:
   assets                            List all registered assets (coins & NFTs)
   asset-info <id>                   Show detailed info for an asset
   l1-balance                        L1 (ALPHA) balance
-  topup [<amount> <coin>]            Request test tokens from faucet
+  topup [<amount> <coin>]            Mint test tokens locally
   verify-balance                    Detect spent tokens via aggregator
   sync                              Sync tokens with IPFS
 
@@ -3831,90 +3831,117 @@ async function main(): Promise<void> {
       case 'topup':
       case 'top-up':
       case 'faucet': {
-        // Get nametag from wallet
+        // Local mint replaces the legacy HTTP faucet (sphere-sdk#455).
+        // The wallet mints fungible tokens to itself via the L3 aggregator,
+        // so no nametag is required and no external faucet service is
+        // touched. Default coin amounts match the historical bulk faucet
+        // (100 UCT, 1 BTC, 42 ETH, 1000 SOL/USDT/USDC/USDU).
         const sphere = await getSphere();
-        const nametag = sphere.getNametag();
-        if (!nametag) {
-          console.error('Error: No nametag registered. Use "nametag <name>" first.');
-          await closeSphere();
-          process.exit(1);
-        }
 
         // Parse options: topup [<amount> <coin>]
         const amountArg: string | undefined = args[1];
         const coinArg: string | undefined = args[2];
 
-        const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
+        const registry = TokenRegistry.getInstance();
 
-        // Default amounts in whole coins (the faucet API converts to smallest units internally).
-        const DEFAULT_COINS: Record<string, number> = {
-          'unicity': 100,
-          'bitcoin': 1,
-          'ethereum': 42,
-          'solana': 1000,
-          'tether': 1000,
-          'usd-coin': 1000,
-          'unicity-usd': 1000,
-        };
+        // Default coin set — must stay in sync with the legacy faucet
+        // service's bulk response so existing soaks/playbooks see the
+        // same balances after a no-arg `sphere faucet`.
+        const DEFAULT_COINS: ReadonlyArray<{ symbol: string; amount: number }> = [
+          { symbol: 'UCT',  amount: 100 },
+          { symbol: 'BTC',  amount: 1 },
+          { symbol: 'ETH',  amount: 42 },
+          { symbol: 'SOL',  amount: 1000 },
+          { symbol: 'USDT', amount: 1000 },
+          { symbol: 'USDC', amount: 1000 },
+          { symbol: 'USDU', amount: 1000 },
+        ];
 
-        async function requestFaucet(coin: string, amount: number): Promise<{ success: boolean; message?: string }> {
-          try {
-            const response = await fetch(FAUCET_URL, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                unicityId: nametag,  // Without @ prefix - faucet API expects raw nametag
-                coin,
-                amount,
-              }),
-            });
-            const result = await response.json() as { success: boolean; message?: string; error?: string };
-            // API returns 'error' field on failure, normalize to 'message'
-            return {
-              success: result.success,
-              message: result.message || result.error,
-            };
-          } catch (error) {
-            return { success: false, message: error instanceof Error ? error.message : 'Request failed' };
+        // FAUCET_COIN_MAP keys are symbols; values are legacy faucet
+        // names. Reverse the map so a legacy name argument (e.g.
+        // "unicity") still resolves to the symbol the registry knows.
+        const FAUCET_NAME_TO_SYMBOL: Record<string, string> = Object.fromEntries(
+          Object.entries(FAUCET_COIN_MAP).map(([sym, name]) => [name.toLowerCase(), sym])
+        );
+
+        function resolveSymbol(label: string): string | null {
+          const upper = label.toUpperCase();
+          if (FAUCET_COIN_MAP[upper]) return upper;                 // already a symbol
+          const fromName = FAUCET_NAME_TO_SYMBOL[label.toLowerCase()];
+          if (fromName) return fromName;
+          // Last resort — let the registry try (handles symbols not in
+          // FAUCET_COIN_MAP).
+          const def = registry.getDefinitionBySymbol(upper) ?? registry.getDefinitionByName(label);
+          return def?.symbol ?? null;
+        }
+
+        async function mintLocal(symbol: string, wholeAmount: number): Promise<{ success: boolean; message?: string; symbol: string }> {
+          const def = registry.getDefinitionBySymbol(symbol);
+          if (!def || def.assetKind !== 'fungible') {
+            return { success: false, symbol, message: `Unknown fungible coin "${symbol}"` };
           }
+          const decimals = def.decimals ?? 0;
+          // BigInt arithmetic for the multiplier; fractional whole-amounts
+          // (e.g. 0.5 BTC) are rounded to the nearest smallest-unit.
+          const scaled = Math.round(wholeAmount * Math.pow(10, decimals));
+          if (!Number.isFinite(scaled) || scaled <= 0) {
+            return { success: false, symbol, message: `Invalid amount ${wholeAmount}` };
+          }
+          const smallest = BigInt(scaled);
+          const r = await sphere.payments.mintFungibleToken(def.id, smallest);
+          if (r.success) return { success: true, symbol };
+          return { success: false, symbol, message: r.error };
         }
 
         if (coinArg) {
-          // Request specific coin — accept symbols (UCT, BTC) as well as faucet names (unicity, bitcoin)
-          const coin = FAUCET_COIN_MAP[coinArg.toUpperCase()] || coinArg.toLowerCase();
-          const amount = amountArg ? parseFloat(amountArg) : (DEFAULT_COINS[coin] || 1);
+          const symbol = resolveSymbol(coinArg);
+          if (!symbol) {
+            console.error(`\n✗ Failed: Unknown coin "${coinArg}"`);
+            await closeSphere();
+            process.exit(1);
+          }
+          const amount = amountArg ? parseFloat(amountArg) : 1;
+          if (!Number.isFinite(amount) || amount <= 0) {
+            console.error(`\n✗ Failed: Invalid amount "${amountArg}"`);
+            await closeSphere();
+            process.exit(1);
+          }
 
-          // The faucet API converts whole-coin amounts to smallest units internally.
-          console.log(`Requesting ${amount} ${coin} from faucet for @${nametag}...`);
-          const result = await requestFaucet(coin, amount);
-
+          console.log(`Minting ${amount} ${symbol} locally...`);
+          const result = await mintLocal(symbol, amount);
           if (result.success) {
-            console.log(`\n✓ Received ${amount} ${coin}`);
+            console.log(`\n✓ Received ${amount} ${symbol}`);
           } else {
             console.error(`\n✗ Failed: ${result.message || 'Unknown error'}`);
+            await closeSphere();
+            process.exit(1);
           }
         } else {
-          // Request all coins
-          console.log(`Requesting all test tokens for @${nametag}...`);
+          // Bulk mint — historical default set. Sequential to keep output
+          // ordered and to sidestep storage-write races between concurrent
+          // addToken() calls.
+          console.log('Minting test tokens locally...');
           console.log('─'.repeat(50));
 
-          const results = await Promise.all(
-            Object.entries(DEFAULT_COINS).map(async ([coin, amount]) => {
-              const result = await requestFaucet(coin, amount);
-              return { coin, amount, ...result };
-            })
-          );
-
-          for (const result of results) {
-            if (result.success) {
-              console.log(`✓ ${result.coin}: ${result.amount}`);
+          const results: Array<{ symbol: string; amount: number; success: boolean; message?: string }> = [];
+          for (const c of DEFAULT_COINS) {
+            const r = await mintLocal(c.symbol, c.amount);
+            results.push({ symbol: c.symbol, amount: c.amount, success: r.success, message: r.message });
+            // Print each line as it completes so progress is visible.
+            if (r.success) {
+              console.log(`✓ ${c.symbol}: ${c.amount}`);
             } else {
-              console.log(`✗ ${result.coin}: Failed - ${result.message || 'Unknown error'}`);
+              console.log(`✗ ${c.symbol}: ${r.message || 'Unknown error'}`);
             }
           }
 
           console.log('─'.repeat(50));
-          console.log('TopUp complete! Run "balance" to see updated balances.');
+          const failed = results.filter((r) => !r.success).length;
+          if (failed === 0) {
+            console.log('TopUp complete! Run "balance" to see updated balances.');
+          } else {
+            console.log(`TopUp finished with ${failed} failure(s). Run "balance" to see what landed.`);
+          }
         }
 
         await closeSphere();
@@ -6178,7 +6205,7 @@ function getCompletionCommands(): CompletionCommand[] {
     { name: 'assets', description: 'List registered assets (coins & NFTs)', flags: ['--type'] },
     { name: 'asset-info', description: 'Show detailed info for an asset' },
     { name: 'l1-balance', description: 'Show L1 (ALPHA) balance' },
-    { name: 'topup', description: 'Request test tokens from faucet' },
+    { name: 'topup', description: 'Mint test tokens locally' },
     { name: 'top-up', description: 'Alias for topup' },
     { name: 'faucet', description: 'Alias for topup' },
     { name: 'verify-balance', description: 'Verify tokens against aggregator', flags: ['--remove', '-v', '--verbose'] },

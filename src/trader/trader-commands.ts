@@ -21,6 +21,7 @@ import type { AcpDmTransport } from './acp-transport.js';
 import type { AcpResultPayload, AcpErrorPayload } from './acp-protocols.js';
 import { TimeoutError, TransportError } from '../transport/errors.js';
 import { MIN_TIMEOUT_MS } from '../shared/timeout-constants.js';
+import { spawnTrader, stopTrader, type TraderSpawnOptions, type TraderStopOptions } from './spawn.js';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -63,6 +64,26 @@ interface SetStrategyOpts {
   rateStrategy?: string;
   maxConcurrent?: string;
   trustedEscrows?: string;
+}
+
+interface TraderSpawnCliOpts {
+  name?: string;
+  trustedEscrows?: string;
+  scanIntervalMs?: string;
+  testFund?: string;
+  readyTimeoutMs?: string;
+  baseDir?: string;
+  hmImage?: string;
+  templatesFile?: string;
+  healthPort?: string;
+  image?: string;
+  network?: 'testnet' | 'mainnet' | 'dev';
+}
+
+interface TraderStopCliOpts {
+  name?: string;
+  keepHm?: boolean;
+  baseDir?: string;
 }
 
 // =============================================================================
@@ -361,6 +382,142 @@ async function handleSetStrategy(cmd: Command, opts: SetStrategyOpts): Promise<v
 }
 
 // =============================================================================
+// Local tenant lifecycle (`sphere trader spawn` / `sphere trader stop`)
+// =============================================================================
+//
+// These don't speak ACP to a running trader. They bring up (or tear down)
+// the per-user local HM + trader tenant pair. See trader/spawn.ts for the
+// orchestration; this layer just adapts commander options.
+
+/**
+ * Parse a positive integer from a CLI flag value. Returns the number on
+ * success, throws on invalid input. Shared shape used by --scan-interval-ms
+ * / --ready-timeout-ms / --health-port.
+ *
+ * Exported for unit tests.
+ */
+export function parsePositiveInt(raw: string | undefined, flag: string): number | undefined {
+  if (raw === undefined) return undefined;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`Invalid ${flag}: ${raw} (must be a positive integer)`);
+  }
+  return n;
+}
+
+/**
+ * Translate commander `--trusted-escrows '@a,@b'` into the array
+ * `trader/spawn.ts` consumes. Empty / whitespace-only entries are
+ * filtered out so a trailing comma doesn't become a phantom escrow.
+ *
+ * Exported for unit tests.
+ */
+export function parseTrustedEscrows(raw: string | undefined): ReadonlyArray<string> | undefined {
+  if (raw === undefined) return undefined;
+  const items = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+  return items.length > 0 ? items : undefined;
+}
+
+/**
+ * Map CLI spawn options to the `TraderSpawnOptions` shape. Pure —
+ * the unit tests cover the wallet-nametag → instance-name fallback
+ * and the option-passthrough.
+ *
+ * Exported for unit tests.
+ */
+export function buildSpawnOptions(opts: TraderSpawnCliOpts): TraderSpawnOptions {
+  const out: Record<string, unknown> = {};
+  if (opts.name) out['name'] = opts.name;
+  const escrows = parseTrustedEscrows(opts.trustedEscrows);
+  if (escrows) out['trustedEscrows'] = escrows;
+  const scan = parsePositiveInt(opts.scanIntervalMs, '--scan-interval-ms');
+  if (scan !== undefined) out['scanIntervalMs'] = scan;
+  if (opts.testFund) out['testFund'] = opts.testFund;
+  const ready = parsePositiveInt(opts.readyTimeoutMs, '--ready-timeout-ms');
+  if (ready !== undefined) out['readyTimeoutMs'] = ready;
+  if (opts.baseDir) out['baseDir'] = opts.baseDir;
+  if (opts.hmImage) out['hmImage'] = opts.hmImage;
+  if (opts.templatesFile) out['templatesFile'] = opts.templatesFile;
+  const health = parsePositiveInt(opts.healthPort, '--health-port');
+  if (health !== undefined) out['healthPort'] = health;
+  if (opts.image) out['image'] = opts.image;
+  if (opts.network) out['network'] = opts.network;
+  return out as TraderSpawnOptions;
+}
+
+async function handleSpawn(cmd: Command, opts: TraderSpawnCliOpts): Promise<void> {
+  const globals = parseGlobalOpts(cmd);
+  const json = globals.json ?? false;
+  let spawnOpts: TraderSpawnOptions;
+  try {
+    spawnOpts = buildSpawnOptions(opts);
+  } catch (err) {
+    writeStderr((err as Error).message);
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    const result = await spawnTrader(spawnOpts);
+    if (json) {
+      printJson(result);
+    } else {
+      process.stdout.write(
+        `Trader tenant ready:\n` +
+        `  instance_name:           ${result.instance_name}\n` +
+        `  instance_id:             ${result.instance_id}\n` +
+        `  tenant_direct_address:   ${result.tenant_direct_address}\n` +
+        `  tenant_nametag:          ${result.tenant_nametag ?? '(none)'}\n` +
+        `  hm_container:            ${result.hm_container}\n` +
+        `  hm_manager_address:      ${result.hm_manager_address}\n\n` +
+        `Use this address for subsequent ACP calls:\n` +
+        `  export SPHERE_TRADER_TENANT='${result.tenant_direct_address}'\n` +
+        `  sphere trader create-intent --direction sell --base UCT --quote USDU \\\n` +
+        `      --rate-min 1 --rate-max 1 --volume-min 1 --volume-max 100\n`,
+      );
+    }
+  } catch (err) {
+    writeStderr((err as Error).message);
+    process.exitCode = 1;
+  }
+}
+
+async function handleStop(cmd: Command, opts: TraderStopCliOpts): Promise<void> {
+  const globals = parseGlobalOpts(cmd);
+  const json = globals.json ?? false;
+  const stopOpts: TraderStopOptions = {};
+  const out = stopOpts as { name?: string; keepHm?: boolean; baseDir?: string };
+  if (opts.name)    out.name    = opts.name;
+  if (opts.keepHm)  out.keepHm  = true;
+  if (opts.baseDir) out.baseDir = opts.baseDir;
+  try {
+    const result = await stopTrader(stopOpts);
+    if (json) {
+      printJson(result);
+    } else {
+      if (result.tenant_stopped) {
+        process.stdout.write(`Trader tenant stopped: ${result.tenant_name ?? '(unknown)'}\n`);
+      } else if (result.tenant_name) {
+        process.stdout.write(`No live trader tenant '${result.tenant_name}' found.\n`);
+      } else {
+        process.stdout.write('No local HM running for this wallet.\n');
+      }
+      if (result.hm_stopped) {
+        process.stdout.write(
+          result.hm_removed
+            ? 'Local HM stopped and removed.\n'
+            : 'Local HM stopped (container kept).\n',
+        );
+      } else if (opts.keepHm) {
+        process.stdout.write('Local HM left running (--keep-hm).\n');
+      }
+    }
+  } catch (err) {
+    writeStderr((err as Error).message);
+    process.exitCode = 1;
+  }
+}
+
+// =============================================================================
 // Command tree
 // =============================================================================
 
@@ -437,6 +594,39 @@ export function createTraderCommand(): Command {
     .option('--trusted-escrows <list>', 'Comma-separated escrow addresses (overwrites)')
     .action(async function (this: Command, opts: SetStrategyOpts) {
       await handleSetStrategy(this, opts);
+    });
+
+  // ── Local tenant lifecycle (per-user HM + trader) ─────────────────
+  // `sphere trader spawn` and `sphere trader stop` don't talk to a
+  // running trader (no --tenant flag) — they bring up / tear down the
+  // per-user local HM + trader tenant pair. See sphere-cli#48 for the
+  // motivation.
+
+  trader
+    .command('spawn')
+    .description('Bring up a local trader tenant (and its HM) for the current wallet')
+    .option('--name <instance>', 'Tenant instance name (default: <wallet-nametag>-trader)')
+    .option('--trusted-escrows <list>', 'Comma-separated escrow addresses for the trader')
+    .option('--scan-interval-ms <ms>', 'Override TRADER_SCAN_INTERVAL_MS (default: 30000)')
+    .option('--test-fund <spec>', 'Self-mint test funds at startup, e.g. "<coinIdHex>:<amount>,..." (testnet only)')
+    .option('--ready-timeout-ms <ms>', 'Wait up to this long for HM + tenant ready (default: 180000)')
+    .option('--base-dir <path>', 'Override per-controller data dir (default: ./.sphere-cli/local-hm)')
+    .option('--hm-image <ref>', 'Override the local HM container image')
+    .option('--templates-file <path>', 'Override templates.json mounted into the HM')
+    .option('--health-port <port>', 'Override HM health-port host mapping (127.0.0.1:<port>)')
+    .option('--network <name>', 'Sphere network: testnet|mainnet|dev (default: testnet)')
+    .action(async function (this: Command, opts: TraderSpawnCliOpts) {
+      await handleSpawn(this, opts);
+    });
+
+  trader
+    .command('stop')
+    .description('Stop the local trader tenant (and the HM if no other tenants remain)')
+    .option('--name <instance>', 'Tenant instance name to stop (default: <wallet-nametag>-trader)')
+    .option('--keep-hm', 'Leave the local HM container running after stopping the tenant')
+    .option('--base-dir <path>', 'Override per-controller data dir (default: ./.sphere-cli/local-hm)')
+    .action(async function (this: Command, opts: TraderStopCliOpts) {
+      await handleStop(this, opts);
     });
 
   // Attach the shared-options help text to every subcommand.

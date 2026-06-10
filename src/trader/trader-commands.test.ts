@@ -11,6 +11,9 @@ import {
   resolveTenantAddress,
   createTraderCommand,
   buildCreateIntentParams,
+  parsePositiveInt,
+  parseTrustedEscrows,
+  buildSpawnOptions,
 } from './trader-commands.js';
 
 describe('parseTimeout (trader)', () => {
@@ -79,12 +82,15 @@ describe('resolveTenantAddress', () => {
 });
 
 describe('createTraderCommand', () => {
-  it('exposes the 6 controller-scoped trader subcommands', () => {
+  it('exposes the 8 trader subcommands (6 ACP + spawn/stop wrappers)', () => {
     const trader = createTraderCommand();
     const names = trader.commands.map((c) => c.name()).sort();
-    // No `status` here: STATUS is system-scoped per Unicity
-    // architecture and routes through the host manager via HMCP.
-    // Use `sphere host inspect <instance>` for trader liveness.
+    // ACP commands (controller→tenant): cancel-intent, create-intent,
+    // list-deals, list-intents, portfolio, set-strategy. `status` is
+    // system-scoped (routes through the HM via HMCP, not ACP) and
+    // doesn't appear here — use `sphere host inspect`.
+    // Wrapper commands (local lifecycle, no DM round-trip):
+    // `spawn` brings up local HM + trader tenant; `stop` tears down.
     expect(names).toEqual([
       'cancel-intent',
       'create-intent',
@@ -92,6 +98,8 @@ describe('createTraderCommand', () => {
       'list-intents',
       'portfolio',
       'set-strategy',
+      'spawn',
+      'stop',
     ]);
   });
 
@@ -285,5 +293,98 @@ describe('buildCreateIntentParams (wire shape)', () => {
     // Must preserve the exact string — coercion to Number would lose
     // precision and bigint serialization differs across SDKs.
     expect(result.params['volume_max']).toBe(huge);
+  });
+});
+
+// =============================================================================
+// `sphere trader spawn / stop` helper coverage
+// =============================================================================
+
+describe('parsePositiveInt', () => {
+  it('returns undefined for undefined input', () => {
+    expect(parsePositiveInt(undefined, '--x')).toBeUndefined();
+  });
+
+  it('parses a positive integer', () => {
+    expect(parsePositiveInt('1500', '--x')).toBe(1500);
+  });
+
+  it('rejects zero, negative, non-numeric', () => {
+    expect(() => parsePositiveInt('0', '--x')).toThrow(/positive integer/);
+    expect(() => parsePositiveInt('-1', '--x')).toThrow(/positive integer/);
+    expect(() => parsePositiveInt('abc', '--x')).toThrow(/positive integer/);
+  });
+
+  it('embeds the flag name in the error', () => {
+    expect(() => parsePositiveInt('0', '--my-flag')).toThrow(/--my-flag/);
+  });
+});
+
+describe('parseTrustedEscrows', () => {
+  it('returns undefined for undefined input', () => {
+    expect(parseTrustedEscrows(undefined)).toBeUndefined();
+  });
+
+  it('splits a comma-separated list', () => {
+    expect(parseTrustedEscrows('@a,@b,@c')).toEqual(['@a', '@b', '@c']);
+  });
+
+  it('trims whitespace around entries', () => {
+    expect(parseTrustedEscrows(' @a , @b ')).toEqual(['@a', '@b']);
+  });
+
+  it('drops empty entries (so trailing comma is harmless)', () => {
+    expect(parseTrustedEscrows('@a,,@b,')).toEqual(['@a', '@b']);
+  });
+
+  it('returns undefined when input is entirely empty entries', () => {
+    expect(parseTrustedEscrows(',,, ,')).toBeUndefined();
+  });
+});
+
+describe('buildSpawnOptions', () => {
+  it('maps trivial fields through', () => {
+    const opts = buildSpawnOptions({
+      name: 'my-trader',
+      hmImage: 'ghcr.io/x:y',
+      templatesFile: '/path/templates.json',
+      testFund: 'deadbeef:1000',
+    });
+    expect(opts).toMatchObject({
+      name: 'my-trader',
+      hmImage: 'ghcr.io/x:y',
+      templatesFile: '/path/templates.json',
+      testFund: 'deadbeef:1000',
+    });
+  });
+
+  it('parses numeric flags', () => {
+    const opts = buildSpawnOptions({
+      scanIntervalMs: '15000',
+      readyTimeoutMs: '60000',
+      healthPort: '9500',
+    });
+    expect(opts.scanIntervalMs).toBe(15000);
+    expect(opts.readyTimeoutMs).toBe(60000);
+    expect(opts.healthPort).toBe(9500);
+  });
+
+  it('rejects invalid scan-interval-ms with a clear flag-named error', () => {
+    expect(() => buildSpawnOptions({ scanIntervalMs: '0' })).toThrow(/--scan-interval-ms/);
+  });
+
+  it('omits unset fields entirely (so the spawnTrader API sees minimal opts)', () => {
+    const opts = buildSpawnOptions({});
+    expect(opts).toEqual({});
+  });
+
+  it('passes trustedEscrows through after parsing', () => {
+    const opts = buildSpawnOptions({ trustedEscrows: '@x,@y' });
+    expect(opts.trustedEscrows).toEqual(['@x', '@y']);
+  });
+
+  it('accepts the network override', () => {
+    const opts = buildSpawnOptions({ network: 'dev' });
+    expect(opts.network).toBe('dev');
   });
 });

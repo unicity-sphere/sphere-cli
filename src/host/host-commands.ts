@@ -29,6 +29,14 @@ import type {
 } from '../transport/hmcp-types.js';
 import { hasDangerousKeys } from '../transport/hmcp-types.js';
 import { initSphere, resolveManagerAddress } from './sphere-init.js';
+import {
+  ensureLocalHM,
+  localHmStatus,
+  stopLocalHM,
+  DEFAULT_HM_IMAGE,
+  type LocalHmMetadata,
+} from './local-hm.js';
+import * as path from 'node:path';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -67,6 +75,22 @@ interface ListOpts {
 interface CmdOpts extends NameOrIdOpts {
   params?: string;
   cmdTimeout?: string;
+}
+
+interface LocalSpawnOpts {
+  hmImage?: string;
+  templatesFile?: string;
+  healthPort?: string;
+  baseDir?: string;
+}
+
+interface LocalStopOpts {
+  keepContainer?: boolean;
+  baseDir?: string;
+}
+
+interface LocalStatusOpts {
+  baseDir?: string;
 }
 
 // =============================================================================
@@ -637,6 +661,174 @@ async function handleHelp(cmd: Command): Promise<void> {
 }
 
 // =============================================================================
+// Local HM helpers
+// =============================================================================
+//
+// `sphere host local-spawn / local-stop / local-status` manage a per-user
+// agentic-hosting HM container scoped to the operator's wallet. These
+// commands don't use the HMCP DM transport — they shell out to docker
+// directly and only need the wallet's identity (to derive the controller
+// pubkey, HOST_ID, container name, etc.).
+
+/**
+ * Default base directory under which sphere-cli stores per-controller
+ * local HM state. CWD-relative for consistency with the rest of
+ * sphere-cli (see sphere-init.ts:23-25). Override with `--base-dir`.
+ */
+const DEFAULT_LOCAL_HM_BASE_DIR = './.sphere-cli/local-hm';
+
+function resolveLocalHmBaseDir(raw: string | undefined): string {
+  if (raw && raw.trim()) return raw.trim();
+  return DEFAULT_LOCAL_HM_BASE_DIR;
+}
+
+/**
+ * Initialise a Sphere just to read the wallet identity, then destroy
+ * it. None of the local HM lifecycle commands need DM transport, so we
+ * skip the longer-lived setup that `runWithTransport` does. Errors from
+ * `initSphere` bubble out — handled by the action wrappers.
+ */
+async function withWalletIdentity<T>(
+  fn: (identity: { chainPubkey: string; directAddress: string | undefined; nametag: string | undefined }) => Promise<T>,
+): Promise<T> {
+  const sphere = await initSphere();
+  try {
+    const id = sphere.identity;
+    if (!id) throw new Error('Wallet has no identity. Run `sphere wallet init` first.');
+    return await fn({
+      chainPubkey: id.chainPubkey,
+      directAddress: id.directAddress,
+      nametag: id.nametag,
+    });
+  } finally {
+    try { await sphere.destroy(); } catch (e) {
+      if (process.env['DEBUG']) writeStderr(`sphere-cli: sphere.destroy error: ${e}`);
+    }
+  }
+}
+
+function parsePositivePort(raw: string | undefined, flag: string): number | undefined {
+  if (raw === undefined) return undefined;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0 || n > 65535) {
+    throw new Error(`Invalid ${flag}: ${raw} (must be 1..65535)`);
+  }
+  return n;
+}
+
+async function handleLocalSpawn(cmd: Command, opts: LocalSpawnOpts): Promise<void> {
+  const globals = parseGlobalOpts(cmd);
+  const json = globals.json ?? false;
+  let healthPort: number | undefined;
+  try {
+    healthPort = parsePositivePort(opts.healthPort, '--health-port');
+  } catch (err) {
+    writeStderr((err as Error).message);
+    process.exitCode = 1;
+    return;
+  }
+
+  try {
+    await withWalletIdentity(async (identity) => {
+      const baseDir = path.resolve(resolveLocalHmBaseDir(opts.baseDir));
+      const meta = await ensureLocalHM({
+        controllerPubkey: identity.chainPubkey,
+        baseDir,
+        templatesFile: opts.templatesFile,
+        image: opts.hmImage,
+        healthPort,
+      });
+      if (json) {
+        printJson(meta);
+      } else {
+        process.stdout.write(
+          `Local HM ready: ${meta.containerName}\n` +
+          `  manager_pubkey:          ${meta.managerPubkey}\n` +
+          `  manager_direct_address:  ${meta.managerDirectAddress}\n` +
+          `  manager_nametag:         ${meta.managerNametag}\n` +
+          `  host_id:                 ${meta.hostId}\n` +
+          `  image:                   ${meta.image}\n` +
+          `  health_port:             127.0.0.1:${meta.healthPort}\n`,
+        );
+      }
+    });
+  } catch (err) {
+    handleError(err, json);
+  }
+}
+
+async function handleLocalStop(cmd: Command, opts: LocalStopOpts): Promise<void> {
+  const globals = parseGlobalOpts(cmd);
+  const json = globals.json ?? false;
+  try {
+    await withWalletIdentity(async (identity) => {
+      const result = await stopLocalHM({
+        controllerPubkey: identity.chainPubkey,
+        keepContainer: opts.keepContainer === true,
+      });
+      // baseDir isn't used by stopLocalHM but accept the flag so the
+      // command surface mirrors local-spawn / local-status. Suppress
+      // unused-var noise.
+      void opts.baseDir;
+      if (json) {
+        printJson(result);
+      } else if (result.stopped) {
+        process.stdout.write(
+          result.removed ? 'Local HM stopped and removed.\n' : 'Local HM stopped (container kept).\n',
+        );
+      } else {
+        process.stdout.write('No local HM running for this wallet.\n');
+      }
+    });
+  } catch (err) {
+    handleError(err, json);
+  }
+}
+
+async function handleLocalStatus(cmd: Command, opts: LocalStatusOpts): Promise<void> {
+  const globals = parseGlobalOpts(cmd);
+  const json = globals.json ?? false;
+  try {
+    await withWalletIdentity(async (identity) => {
+      const baseDir = path.resolve(resolveLocalHmBaseDir(opts.baseDir));
+      const status = await localHmStatus({
+        controllerPubkey: identity.chainPubkey,
+        baseDir,
+      });
+      if (json) {
+        printJson(status);
+      } else {
+        process.stdout.write(`Container: ${status.containerName}\n`);
+        process.stdout.write(`Running:   ${String(status.running)}\n`);
+        if (status.containerId) {
+          process.stdout.write(`ID:        ${status.containerId}\n`);
+        }
+        if (status.metadata) {
+          printMetadataBlock(status.metadata);
+        } else {
+          process.stdout.write('Metadata:  (no sidecar metadata — has the HM ever been spawned?)\n');
+        }
+      }
+    });
+  } catch (err) {
+    handleError(err, json);
+  }
+}
+
+function printMetadataBlock(m: LocalHmMetadata): void {
+  process.stdout.write(
+    `Metadata:\n` +
+    `  manager_pubkey:          ${m.managerPubkey}\n` +
+    `  manager_direct_address:  ${m.managerDirectAddress}\n` +
+    `  manager_nametag:         ${m.managerNametag}\n` +
+    `  host_id:                 ${m.hostId}\n` +
+    `  image:                   ${m.image}\n` +
+    `  health_port:             127.0.0.1:${m.healthPort}\n` +
+    `  created_at:              ${m.createdAt}\n`,
+  );
+}
+
+// =============================================================================
 // Command tree
 // =============================================================================
 
@@ -745,6 +937,40 @@ export function createHostCommand(): Command {
     .description('Ask the host manager for its supported commands')
     .action(async function (this: Command) {
       await handleHelp(this);
+    });
+
+  // ── Local HM lifecycle (per-user, no shared HM whitelist needed) ───
+  // These don't use the DM transport. They wrap docker run/stop to bring
+  // up an agentic-hosting HM container scoped to the current wallet.
+  // Sister command: `sphere trader spawn` (chains local-spawn + a remote
+  // hm.spawn against the freshly-brought-up local HM).
+
+  host
+    .command('local-spawn')
+    .description('Bring up a local host-manager container for the current wallet')
+    .option('--hm-image <ref>', `Override HM container image (default: ${DEFAULT_HM_IMAGE})`)
+    .option('--templates-file <path>', 'Override templates.json (defaults to bundled trader-agent + escrow-service)')
+    .option('--health-port <port>', 'Override health-check port on 127.0.0.1 (default: derived from wallet)')
+    .option('--base-dir <path>', `Override per-controller data dir (default: ${DEFAULT_LOCAL_HM_BASE_DIR})`)
+    .action(async function (this: Command, opts: LocalSpawnOpts) {
+      await handleLocalSpawn(this, opts);
+    });
+
+  host
+    .command('local-stop')
+    .description('Stop the local host-manager container for the current wallet')
+    .option('--keep-container', 'Stop but do not remove the container (preserves docker logs)')
+    .option('--base-dir <path>', `Override per-controller data dir (default: ${DEFAULT_LOCAL_HM_BASE_DIR})`)
+    .action(async function (this: Command, opts: LocalStopOpts) {
+      await handleLocalStop(this, opts);
+    });
+
+  host
+    .command('local-status')
+    .description('Inspect the local host-manager container for the current wallet')
+    .option('--base-dir <path>', `Override per-controller data dir (default: ${DEFAULT_LOCAL_HM_BASE_DIR})`)
+    .action(async function (this: Command, opts: LocalStatusOpts) {
+      await handleLocalStatus(this, opts);
     });
 
   // Attach the shared-options help text to every subcommand. Iterating after

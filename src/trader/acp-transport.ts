@@ -10,7 +10,7 @@
  * Mirror of trader-service/src/cli/dm-transport.ts.
  */
 
-import type { DirectMessage } from '@unicitylabs/sphere-sdk';
+import type { DirectMessage, SendMessageOptions } from '@unicitylabs/sphere-sdk';
 
 import {
   createAcpMessage,
@@ -30,7 +30,11 @@ export type { TimeoutError, TransportError };
 export { MIN_TIMEOUT_MS };
 
 export interface SphereComms {
-  sendDM(recipient: string, content: string): Promise<{ recipientPubkey: string }>;
+  sendDM(
+    recipient: string,
+    content: string,
+    options?: SendMessageOptions,
+  ): Promise<{ recipientPubkey: string }>;
   onDirectMessage(handler: (message: DirectMessage) => void): () => void;
 }
 
@@ -165,7 +169,12 @@ class AcpDmTransportImpl implements AcpDmTransport {
         return;
       }
 
-      this.comms.sendDM(this.tenantAddress, payload).then((sent) => {
+      // sphere-sdk#559 / PR #558 — ACP RPC is short-lived (the trader
+      // CLI's `sphere trader <command>` exits as soon as the result
+      // lands). Skip the self-wrap so we don't leave a copy of every
+      // outgoing ACP command in the relay's `#p:controller` index for
+      // the next short-lived CLI process to pull down on subscribe.
+      this.comms.sendDM(this.tenantAddress, payload, { selfWrap: false }).then((sent) => {
         if (!this.resolvedPubkey) {
           this.resolvedPubkey = normalizeKey(sent.recipientPubkey);
           // Drain pre-resolution buffer.

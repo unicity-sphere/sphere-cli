@@ -13,7 +13,7 @@
  *   });
  */
 
-import type { DirectMessage } from '@unicitylabs/sphere-sdk';
+import type { DirectMessage, SendMessageOptions } from '@unicitylabs/sphere-sdk';
 import type { HmcpRequest, HmcpResponse } from './hmcp-types.js';
 import { parseHmcpResponse, byteLength, MAX_MESSAGE_SIZE } from './hmcp-types.js';
 import { TimeoutError, TransportError } from './errors.js';
@@ -47,7 +47,11 @@ export interface DmTransportConfig {
 
 /** Narrow slice of Sphere.communications needed by DmTransport — injectable for testing. */
 export interface SphereComms {
-  sendDM(recipient: string, content: string): Promise<{ recipientPubkey: string }>;
+  sendDM(
+    recipient: string,
+    content: string,
+    options?: SendMessageOptions,
+  ): Promise<{ recipientPubkey: string }>;
   onDirectMessage(handler: (message: DirectMessage) => void): () => void;
 }
 
@@ -286,7 +290,12 @@ class DmTransportImpl implements DmTransport {
         `Request too large: ${byteLength(serialized)} bytes exceeds MAX_MESSAGE_SIZE (${MAX_MESSAGE_SIZE})`,
       );
     }
-    const sent = await this.comms.sendDM(this.managerAddress, serialized);
+    // sphere-sdk#559 / PR #558 — HMCP RPC is short-lived (CLI exits
+    // shortly after the manager's reply). Suppressing the self-wrap
+    // halves the per-process relay-index pollution targeting the
+    // controller pubkey, which directly reduces the §3/§4 buffered-
+    // event noise the F1 soak measured at ~7 new events per spawn.
+    const sent = await this.comms.sendDM(this.managerAddress, serialized, { selfWrap: false });
     // Cache the resolved pubkey on first send. Subsequent sends for the same
     // manager address produce the same pubkey, so concurrent writes are safe.
     if (!this.resolvedPubkey) {

@@ -608,9 +608,10 @@ export function buildHmEnv(opts: {
  * the operator to ship their own templates registry.
  *
  * Image versions:
- *   - `trader:v0.2` — built from sphere-sdk@550114c with the four
- *     rotations the v0.1 image predated (#456 / #457 / #464 / #447).
- *     Cut as `vrogojin/trader-service` release v0.2 (2026-06-10).
+ *   - `trader:v0.6` — built from sphere-sdk@b2fd028 with the
+ *     price-as-string fix (sphere-sdk PR #483, trader-service PR #25).
+ *     Stops `Number()` casting the bigint midpoint rate (which lost
+ *     precision past 2^53 and caused market-api HTTP 500s).
  *   - `escrow:v0.3` — current production escrow image.
  *
  * Bumps land via agentic_hosting follow-ups + CLI updates.
@@ -619,7 +620,7 @@ export const DEFAULT_TEMPLATES: { templates: ReadonlyArray<unknown> } = {
   templates: [
     {
       template_id: 'trader-agent',
-      image: 'ghcr.io/vrogojin/agentic-hosting/trader:v0.2',
+      image: 'ghcr.io/vrogojin/agentic-hosting/trader:v0.6',
       entrypoint: ['node', '/app/dist/acp-adapter/main.js'],
       env_defaults: {
         LOG_LEVEL: 'info',

@@ -57,7 +57,7 @@
     "prepublishOnly": "npm run check && npm run build"
   },
   "dependencies": {
-    "@unicitylabs/sphere-sdk": "file:../../sphere-sdk",
+    "@unicitylabs/sphere-sdk": "file:../../uxf",
     "commander": "^12.1.0",
     "multiformats": "^14.0.0"
   },

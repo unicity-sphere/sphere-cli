@@ -60,14 +60,36 @@ export const DEFAULT_HM_IMAGE =
   'ghcr.io/unicitynetwork/agentic-hosting/host-manager:latest';
 
 /**
- * Where the HM expects its wallet to live inside the container. Pinned
- * by the agentic-hosting Dockerfile + docker-compose volume mapping —
- * not configurable on the HM side.
+ * Where the HM expects its wallet + state + templates inside the
+ * container. Pinned by the agentic-hosting Dockerfile.
  */
 const HM_WALLET_PATH_IN_CONTAINER = '/app/sphere-manager';
 const HM_STATE_PATH_IN_CONTAINER = '/app/state';
-const HM_TENANTS_PATH_IN_CONTAINER = '/var/lib/agentic-hosting/tenants';
 const HM_TEMPLATES_PATH_IN_CONTAINER = '/app/config/templates.json';
+
+/**
+ * Tenants directory: identical-path bind mount strategy.
+ *
+ * The HM uses `TENANTS_DIR` as the base path for tenant instance dirs
+ * (wallet, tokens, escrow). When the HM spawns a tenant, it tells the
+ * docker daemon (via the bind-mounted socket) to bind-mount
+ * `${TENANTS_DIR}/<instance>/wallet` into `/data/wallet` of the tenant.
+ *
+ * The trap: the HM runs in a container that shares the docker daemon
+ * socket with the host. When the HM asks docker to bind-mount a path
+ * that exists only inside the HM container (e.g. a container-only
+ * `/var/lib/agentic-hosting/tenants/X`, or a named volume that the host
+ * doesn't see at the same path), the daemon resolves the source on the
+ * HOST's filesystem, doesn't find it, and silently creates an empty
+ * root:root-owned dir there. The tenant's `node` user (uid 1000) then
+ * hits EACCES writing its wallet.
+ *
+ * Fix: mount the host tenants dir at the SAME host path inside the HM.
+ * The HM then sees an identical path, the docker daemon finds the same
+ * directory on the host, and the bind chain resolves correctly with
+ * the right ownership. This is what the agentic-hosting production
+ * docker-compose.override.yml does (see its comment block).
+ */
 
 /**
  * docker socket path (`/var/run/docker.sock`). Mounted read-write into
@@ -95,12 +117,20 @@ const DEFAULT_READY_TIMEOUT_MS = 90_000;
 const READY_LOG_MARKER = 'sphere_initialized';
 
 /**
- * Failure marker — the drift guard's exception message includes literal
- * "MANAGER_PUBKEY mismatch". A second-boot failure that's NOT this
- * exact shape (e.g., image entrypoint crashed) needs to surface to the
- * operator, not silently retry.
+ * Failure markers — the HM's drift guards emit two distinct error
+ * shapes depending on which check fails. We need both because the
+ * bootstrap dance reveals each value on a different boot:
+ *
+ *   - First boot (placeholder pubkey + placeholder DA): the pubkey
+ *     check fails first → DRIFT_GUARD_MARKER fires
+ *   - Second boot (real pubkey + pubkey-derived DA): the pubkey check
+ *     passes, the DA check fails → DIRECT_ADDRESS_DRIFT_MARKER fires
+ *
+ * A second-boot failure with neither marker (e.g., entrypoint crashed)
+ * surfaces to the operator as a timeout, not a silent retry.
  */
 const DRIFT_GUARD_MARKER = 'MANAGER_PUBKEY mismatch';
+const DIRECT_ADDRESS_DRIFT_MARKER = 'MANAGER_DIRECT_ADDRESS mismatch';
 
 /**
  * The placeholder values we ship to the HM on first boot. They MUST be
@@ -437,45 +467,71 @@ export function detectDockerGid(): number {
 // =============================================================================
 
 /**
- * Match the HM's drift-guard error message and extract the wallet's
- * real pubkey + direct address. The agentic_hosting source
- * (host-manager/main.ts:502-507) embeds both in the ConfigError
- * message; we match defensively in case logger formatting wraps lines.
+ * Match the HM's drift-guard error messages and extract whichever real
+ * wallet values the error message reveals. The agentic_hosting source
+ * (host-manager/main.ts:502-514) does TWO sequential checks against
+ * the loaded wallet identity:
  *
- * Returns null when the marker isn't present yet (poll again).
+ *   1. `pubkeysEqual(loadedPubkey, config.manager_pubkey)` — if false,
+ *      throws `MANAGER_PUBKEY mismatch: env="…", wallet="<loadedPubkey>"`
+ *      and exits BEFORE the next check.
+ *   2. `loadedDirectAddress !== config.manager_direct_address` — if
+ *      true, throws `MANAGER_DIRECT_ADDRESS mismatch: env="…", wallet="<addr>"`.
+ *
+ * Because the checks are sequential, a single boot can reveal AT MOST
+ * one of the two real values. The bootstrap caller has to do multiple
+ * boots:
+ *   - Boot 1 (placeholder both)        → pubkey mismatch surfaces (boot 2's input is real pubkey)
+ *   - Boot 2 (real pubkey, derived DA) → direct-address mismatch surfaces (boot 3's input is real both)
+ *   - Boot 3 (real both)               → succeeds
+ *
+ * A sphere wallet's directAddress is NOT `DIRECT://<chainPubkey>` —
+ * sphere-sdk computes a custom 36-byte address with a `0000…` prefix.
+ * That's why a 2-shot bootstrap (the old design) fails on boot 2 with
+ * a direct-address mismatch.
+ *
+ * Returns null when no drift marker present yet (poll again).
+ * Returns the field(s) the error reveals; the missing field is `null`
+ * and the caller carries forward its current best guess (placeholder
+ * on boot 1, pubkey-derived on boot 2).
  */
-export function parseDriftError(logs: string): { managerPubkey: string; managerDirectAddress: string } | null {
-  if (!logs.includes(DRIFT_GUARD_MARKER)) return null;
-  const pubkeyMatch = logs.match(/wallet=["']([0-9a-fA-F]{66,130})["']/);
-  // The direct address mismatch line is emitted SEPARATELY from the
-  // pubkey mismatch line — but the pubkey-mismatch line always fires
-  // first and aborts before the direct-address check runs. So we have
-  // to derive the direct address ourselves from the loaded wallet.
-  // The HM emits the loaded direct address in the "sphere_initialized"
-  // line — but on a drift-failed boot that line never runs. The only
-  // signal we have is the pubkey.
-  //
-  // Workaround: derive DIRECT://<pubkey> ourselves. agentic_hosting's
-  // main.ts:495 does the same fallback: `loadedDirectAddress = ... ?? \`DIRECT://${loadedPubkey}\``.
-  // We assume the wallet didn't register a custom direct address —
-  // first-boot wallets never do, since we don't pass nametag in the
-  // bootstrap env.
-  if (!pubkeyMatch || !pubkeyMatch[1]) return null;
-  const managerPubkey = pubkeyMatch[1].toLowerCase();
+export function parseDriftError(logs: string): {
+  managerPubkey: string | null;
+  managerDirectAddress: string | null;
+} | null {
+  if (!logs.includes(DRIFT_GUARD_MARKER) && !logs.includes(DIRECT_ADDRESS_DRIFT_MARKER)) {
+    return null;
+  }
+  // The pubkey mismatch line uses `wallet="<66-130 hex>"` (compressed/
+  // x-only/uncompressed pubkey hex). Match the most recent occurrence —
+  // logs may accumulate multiple lines across restarts.
+  const pubkeyMatches = Array.from(
+    logs.matchAll(/MANAGER_PUBKEY mismatch:[^\n]*wallet=["']([0-9a-fA-F]{66,130})["']/g),
+  );
+  // The direct-address mismatch line uses `wallet="DIRECT://<hex>"`.
+  // Match its most recent occurrence too.
+  const daMatches = Array.from(
+    logs.matchAll(/MANAGER_DIRECT_ADDRESS mismatch:[^\n]*wallet=["'](DIRECT:\/\/[0-9a-fA-F]+)["']/g),
+  );
+  const pubkeyMatch = pubkeyMatches[pubkeyMatches.length - 1];
+  const daMatch = daMatches[daMatches.length - 1];
+  if (!pubkeyMatch && !daMatch) return null;
   return {
-    managerPubkey,
-    managerDirectAddress: `DIRECT://${managerPubkey}`,
+    managerPubkey: pubkeyMatch ? pubkeyMatch[1].toLowerCase() : null,
+    managerDirectAddress: daMatch ? daMatch[1] : null,
   };
 }
 
 /**
- * Poll a container's logs until either the success marker or the
- * drift-guard marker appears. Returns whichever fired first, or null
- * on timeout.
+ * Poll a container's logs until either the success marker or any of
+ * the drift markers appears. Returns whichever fired first, or
+ * timeout. The drift result reports whichever real fields the HM's
+ * error message revealed; the caller is responsible for carrying
+ * forward whatever it hasn't learnt yet.
  */
 type WaitForLogResult =
   | { kind: 'ready' }
-  | { kind: 'drift'; managerPubkey: string; managerDirectAddress: string }
+  | { kind: 'drift'; managerPubkey: string | null; managerDirectAddress: string | null }
   | { kind: 'timeout'; lastLogs: string };
 
 async function waitForBootSignal(containerName: string, timeoutMs: number): Promise<WaitForLogResult> {
@@ -513,6 +569,15 @@ export function buildHmEnv(opts: {
   readonly hostId: string;
   readonly managerPubkey: string;
   readonly managerDirectAddress: string;
+  /**
+   * HOST-side absolute path to the tenants directory. This same path
+   * is also bind-mounted into the HM container at the same location,
+   * so docker-in-docker bind mounts the HM issues against
+   * `${tenantsHostDir}/<instance>/wallet` resolve correctly on the
+   * host. See the comment block above this file's HM constants for
+   * the docker-daemon path-resolution rationale.
+   */
+  readonly tenantsHostDir: string;
   readonly network?: string;
   readonly healthPort: number;
 }): Record<string, string> {
@@ -523,7 +588,7 @@ export function buildHmEnv(opts: {
     MANAGER_DIRECT_ADDRESS:   opts.managerDirectAddress,
     SPHERE_MANAGER_DATA_DIR:  HM_WALLET_PATH_IN_CONTAINER,
     TEMPLATES_PATH:           HM_TEMPLATES_PATH_IN_CONTAINER,
-    TENANTS_DIR:              HM_TENANTS_PATH_IN_CONTAINER,
+    TENANTS_DIR:              opts.tenantsHostDir,
     PERSISTENCE_PATH:         path.posix.join(HM_STATE_PATH_IN_CONTAINER, 'state.json'),
     DOCKER_SOCKET:            DOCKER_SOCKET,
     UNICITY_NETWORK:          opts.network ?? 'testnet',
@@ -542,15 +607,19 @@ export function buildHmEnv(opts: {
  * escrow-service so the local HM can spawn either without needing
  * the operator to ship their own templates registry.
  *
- * Image versions match what the trader-roundtrip soak script
- * expects today (`trader:v0.1`, `escrow:v0.3`). Bumps land via
- * agentic_hosting issue #26 (image rebuild) → CLI follow-up PR.
+ * Image versions:
+ *   - `trader:v0.2` — built from sphere-sdk@550114c with the four
+ *     rotations the v0.1 image predated (#456 / #457 / #464 / #447).
+ *     Cut as `vrogojin/trader-service` release v0.2 (2026-06-10).
+ *   - `escrow:v0.3` — current production escrow image.
+ *
+ * Bumps land via agentic_hosting follow-ups + CLI updates.
  */
 export const DEFAULT_TEMPLATES: { templates: ReadonlyArray<unknown> } = {
   templates: [
     {
       template_id: 'trader-agent',
-      image: 'ghcr.io/vrogojin/agentic-hosting/trader:v0.1',
+      image: 'ghcr.io/vrogojin/agentic-hosting/trader:v0.2',
       entrypoint: ['node', '/app/dist/acp-adapter/main.js'],
       env_defaults: {
         LOG_LEVEL: 'info',
@@ -668,9 +737,16 @@ export async function ensureLocalHM(config: LocalHmConfig): Promise<LocalHmMetad
   // Ensure data + bind directories exist with the right ownership for
   // the container's `node` user (uid 1000 in node:22-alpine). Without
   // chown, the first write inside the container hits EACCES.
-  const walletDir   = path.join(dataDir, 'manager-wallet');
-  const stateDir    = path.join(dataDir, 'state');
-  const tenantsDir  = path.join(dataDir, 'tenants');
+  //
+  // Paths are resolved to absolute host paths because the tenants dir
+  // is bound into the HM container at the SAME path (identical-path
+  // bind mount — see the constants block at the top of this file).
+  // A relative path would resolve differently on host vs inside the
+  // container; absolute paths sidestep that.
+  const absDataDir = path.resolve(dataDir);
+  const walletDir   = path.join(absDataDir, 'manager-wallet');
+  const stateDir    = path.join(absDataDir, 'state');
+  const tenantsDir  = path.join(absDataDir, 'tenants');
   for (const dir of [walletDir, stateDir, tenantsDir]) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -683,96 +759,126 @@ export async function ensureLocalHM(config: LocalHmConfig): Promise<LocalHmMetad
 
   const templatesFile = ensureTemplatesFile(dataDir, config.templatesFile);
 
-  // ── Phase 1: bootstrap boot ────────────────────────────────────────
-  // Start with placeholder MANAGER_PUBKEY / MANAGER_DIRECT_ADDRESS. The
-  // HM's drift guard will fail, but in the process it logs the wallet's
-  // real pubkey, which we scrape on the next step.
-  const bootstrapEnv = buildHmEnv({
-    controllerPubkey: config.controllerPubkey,
-    hostId,
-    managerPubkey: PLACEHOLDER_PUBKEY,
-    managerDirectAddress: PLACEHOLDER_DIRECT_ADDRESS,
-    healthPort,
-  });
+  // ── Drift-bootstrap loop ───────────────────────────────────────────
+  // The agentic-hosting HM does two sequential checks on its wallet
+  // identity vs the env-supplied values:
+  //   1. MANAGER_PUBKEY        — fails first if pubkey differs
+  //   2. MANAGER_DIRECT_ADDRESS — fails second if address differs
+  //
+  // Each failed boot reveals AT MOST one real value. With placeholder
+  // values on boot 1 the pubkey check fails and we learn the real
+  // pubkey. On boot 2 with the real pubkey but a (pubkey-derived) DA
+  // the DA check fails and we learn the real DA. On boot 3 with both
+  // real values the HM boots cleanly.
+  //
+  // Cap at 3 boots: that's the worst case in steady state. A 4th boot
+  // means something else is wrong; surface to the operator.
+  let currentPubkey = PLACEHOLDER_PUBKEY;
+  let currentDirectAddress = PLACEHOLDER_DIRECT_ADDRESS;
+  let realManagerPubkey: string | null = null;
+  let realManagerDirectAddress: string | null = null;
+  const maxBoots = 3;
+  let bootNum = 0;
+  let lastLogsForError = '';
 
-  await dockerRunDetached({
-    name: containerName,
-    image,
-    env: bootstrapEnv,
-    volumes: [
-      { host: DOCKER_SOCKET, container: DOCKER_SOCKET },
-      { host: templatesFile, container: HM_TEMPLATES_PATH_IN_CONTAINER, readonly: true },
-      { host: walletDir,     container: HM_WALLET_PATH_IN_CONTAINER },
-      { host: stateDir,      container: HM_STATE_PATH_IN_CONTAINER },
-      { host: tenantsDir,    container: HM_TENANTS_PATH_IN_CONTAINER },
-    ],
-    ports: [{ host: healthPort, container: 9401 }],
-    groupAddDockerGid: detectDockerGid(),
-  });
-
-  const bootstrapResult = await waitForBootSignal(containerName, BOOTSTRAP_LOG_TIMEOUT_MS);
-  if (bootstrapResult.kind === 'timeout') {
-    await dockerRm(containerName);
-    throw new Error(
-      `Local HM bootstrap timed out after ${BOOTSTRAP_LOG_TIMEOUT_MS}ms. Tail of logs:\n${bootstrapResult.lastLogs.slice(-2000)}`,
-    );
-  }
-
-  let realManagerPubkey: string;
-  let realManagerDirectAddress: string;
-
-  if (bootstrapResult.kind === 'ready') {
-    // Unexpected but acceptable: a re-used wallet directory might have
-    // already-matching env vars (e.g., metadata was stale but the
-    // placeholder happens to match a previously-recorded wallet). Just
-    // capture the live wallet info from logs.
-    const liveInfo = parseManagerIdentityFromLogs(await readContainerLogs(containerName, 1000));
-    if (!liveInfo) {
-      await dockerRm(containerName);
-      throw new Error(
-        'Local HM boot succeeded but sphere-cli could not parse the manager identity from logs. ' +
-          'Stop the container manually and re-run `sphere host local-spawn`.',
-      );
-    }
-    realManagerPubkey = liveInfo.managerPubkey;
-    realManagerDirectAddress = liveInfo.managerDirectAddress;
-  } else {
-    realManagerPubkey = bootstrapResult.managerPubkey;
-    realManagerDirectAddress = bootstrapResult.managerDirectAddress;
-
-    // ── Phase 2: restart with corrected env ──────────────────────────
-    await dockerRm(containerName);
-
-    const realEnv = buildHmEnv({
+  for (; bootNum < maxBoots; bootNum++) {
+    const env = buildHmEnv({
       controllerPubkey: config.controllerPubkey,
       hostId,
-      managerPubkey: realManagerPubkey,
-      managerDirectAddress: realManagerDirectAddress,
+      managerPubkey: currentPubkey,
+      managerDirectAddress: currentDirectAddress,
+      tenantsHostDir: tenantsDir,
       healthPort,
     });
 
     await dockerRunDetached({
       name: containerName,
       image,
-      env: realEnv,
+      env,
       volumes: [
         { host: DOCKER_SOCKET, container: DOCKER_SOCKET },
         { host: templatesFile, container: HM_TEMPLATES_PATH_IN_CONTAINER, readonly: true },
         { host: walletDir,     container: HM_WALLET_PATH_IN_CONTAINER },
         { host: stateDir,      container: HM_STATE_PATH_IN_CONTAINER },
-        { host: tenantsDir,    container: HM_TENANTS_PATH_IN_CONTAINER },
+        // Identical-path bind for tenants — host path = container path.
+        // The HM tells the docker daemon to bind-mount sub-paths into
+        // each tenant; the daemon resolves them on the host, so both
+        // sides MUST agree on the path. See the rationale comment on
+        // the HM constants block at the top of this file.
+        { host: tenantsDir,    container: tenantsDir },
       ],
       ports: [{ host: healthPort, container: 9401 }],
       groupAddDockerGid: detectDockerGid(),
     });
 
-    const ready = await waitForReady(containerName, DEFAULT_READY_TIMEOUT_MS);
-    if (!ready.ok) {
+    // On the LAST attempt (boot 3 with both values known) use the full
+    // ready timeout. Earlier attempts only need to wait long enough for
+    // the drift error to surface, which happens in <2s after boot.
+    const expectingReady = bootNum > 0 && realManagerPubkey !== null && realManagerDirectAddress !== null;
+    const timeoutMs = expectingReady ? DEFAULT_READY_TIMEOUT_MS : BOOTSTRAP_LOG_TIMEOUT_MS;
+
+    const result = await waitForBootSignal(containerName, timeoutMs);
+
+    if (result.kind === 'timeout') {
+      lastLogsForError = result.lastLogs;
       await dockerRm(containerName);
       throw new Error(
-        `Local HM second-boot did not reach sphere_initialized within ${DEFAULT_READY_TIMEOUT_MS}ms. Tail of logs:\n${ready.lastLogs.slice(-2000)}`,
+        `Local HM boot ${bootNum + 1}/${maxBoots} timed out after ${timeoutMs}ms. Tail of logs:\n${lastLogsForError.slice(-2000)}`,
       );
     }
+
+    if (result.kind === 'ready') {
+      // Success. If we didn't learn both values from drift errors
+      // (e.g., boot 1 succeeded because the wallet directory's pubkey
+      // happened to match the placeholder — rare but possible on a
+      // reuse), pull them from the success log.
+      if (realManagerPubkey === null || realManagerDirectAddress === null) {
+        const liveInfo = parseManagerIdentityFromLogs(await readContainerLogs(containerName, 1000));
+        if (!liveInfo) {
+          await dockerRm(containerName);
+          throw new Error(
+            'Local HM boot succeeded but sphere-cli could not parse the manager identity from logs. ' +
+              'Stop the container manually and re-run `sphere host local-spawn`.',
+          );
+        }
+        realManagerPubkey = realManagerPubkey ?? liveInfo.managerPubkey;
+        realManagerDirectAddress = realManagerDirectAddress ?? liveInfo.managerDirectAddress;
+      }
+      break;
+    }
+
+    // result.kind === 'drift' — extract whichever real value the error
+    // revealed and prep for the next boot.
+    if (result.managerPubkey) {
+      realManagerPubkey = result.managerPubkey;
+      currentPubkey = result.managerPubkey;
+    }
+    if (result.managerDirectAddress) {
+      realManagerDirectAddress = result.managerDirectAddress;
+      currentDirectAddress = result.managerDirectAddress;
+    }
+
+    // The HM exits after throwing — we have to docker rm before the
+    // next attempt or docker run will conflict on the container name.
+    await dockerRm(containerName);
+
+    // Loop iterates and tries again with the updated env values.
+  }
+
+  if (bootNum === maxBoots) {
+    throw new Error(
+      `Local HM bootstrap exhausted ${maxBoots} attempts without reaching sphere_initialized. ` +
+      `Last known state: pubkey=${realManagerPubkey ?? '(unknown)'}, ` +
+      `directAddress=${realManagerDirectAddress ?? '(unknown)'}. ` +
+      `Inspect docker logs ${containerName} for the underlying ConfigError.`,
+    );
+  }
+
+  if (realManagerPubkey === null || realManagerDirectAddress === null) {
+    throw new Error(
+      'Local HM bootstrap completed but sphere-cli was unable to determine the manager identity. ' +
+      'This is a sphere-cli bug; please file a report with the docker logs.',
+    );
   }
 
   const meta: LocalHmMetadata = {

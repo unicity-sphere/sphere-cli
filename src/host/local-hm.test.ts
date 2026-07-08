@@ -109,16 +109,19 @@ describe('localHmDataDir', () => {
 });
 
 describe('parseDriftError', () => {
-  it('returns null when the marker is absent', () => {
+  it('returns null when no drift marker is present', () => {
     expect(parseDriftError('container started\nlogging stuff')).toBeNull();
   });
 
-  it('returns null when the marker is present but no wallet= match', () => {
-    // Marker without a wallet= field — can't extract the real pubkey.
+  it('returns null when the pubkey marker is present but no wallet= match', () => {
     expect(parseDriftError('Error: MANAGER_PUBKEY mismatch: env="abc"')).toBeNull();
   });
 
-  it('extracts the real pubkey from the drift-guard message', () => {
+  it('returns null when the direct-address marker is present but no wallet= match', () => {
+    expect(parseDriftError('Error: MANAGER_DIRECT_ADDRESS mismatch: env="xyz"')).toBeNull();
+  });
+
+  it('extracts the real pubkey from the pubkey-drift message; direct address is null', () => {
     const msg =
       'Error: MANAGER_PUBKEY mismatch: env="placeholderxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", ' +
       'wallet="02ab558ab81a2343beeed5fe95b159d3ed2a65ed51d7aaa7dcf92bc7ed35bcaafc". ' +
@@ -126,8 +129,23 @@ describe('parseDriftError', () => {
     const got = parseDriftError(msg);
     expect(got).not.toBeNull();
     expect(got?.managerPubkey).toBe('02ab558ab81a2343beeed5fe95b159d3ed2a65ed51d7aaa7dcf92bc7ed35bcaafc');
+    // Direct address is NOT inferred from the pubkey — sphere wallets
+    // have a custom direct-address encoding that's not just the pubkey
+    // prefixed with DIRECT://. The 3-shot bootstrap reveals it on the
+    // next iteration.
+    expect(got?.managerDirectAddress).toBeNull();
+  });
+
+  it('extracts the real direct address from the direct-address drift message; pubkey is null', () => {
+    const msg =
+      'Fatal startup error: ConfigError: MANAGER_DIRECT_ADDRESS mismatch: env="DIRECT://03d934...", ' +
+      'wallet="DIRECT://00006695dc5d4fb02706a69b587d3ccf06ed6000af6df053ccff7665a6e1c46cbec4e69282f0". ' +
+      'Either fix the env var or point at the correct wallet.';
+    const got = parseDriftError(msg);
+    expect(got).not.toBeNull();
+    expect(got?.managerPubkey).toBeNull();
     expect(got?.managerDirectAddress).toBe(
-      'DIRECT://02ab558ab81a2343beeed5fe95b159d3ed2a65ed51d7aaa7dcf92bc7ed35bcaafc',
+      'DIRECT://00006695dc5d4fb02706a69b587d3ccf06ed6000af6df053ccff7665a6e1c46cbec4e69282f0',
     );
   });
 
@@ -135,6 +153,16 @@ describe('parseDriftError', () => {
     const msg =
       'MANAGER_PUBKEY mismatch: env="x", ' +
       'wallet="02AB558AB81A2343BEEED5FE95B159D3ED2A65ED51D7AAA7DCF92BC7ED35BCAAFC".';
+    const got = parseDriftError(msg);
+    expect(got?.managerPubkey).toBe('02ab558ab81a2343beeed5fe95b159d3ed2a65ed51d7aaa7dcf92bc7ed35bcaafc');
+  });
+
+  it('honours the most recent occurrence when multiple drift errors are logged', () => {
+    // Container restart loop would replay old errors in the log buffer;
+    // we want the freshest values.
+    const msg =
+      'MANAGER_PUBKEY mismatch: env="x", wallet="0200000000000000000000000000000000000000000000000000000000000000aa".\n' +
+      'MANAGER_PUBKEY mismatch: env="y", wallet="02ab558ab81a2343beeed5fe95b159d3ed2a65ed51d7aaa7dcf92bc7ed35bcaafc".';
     const got = parseDriftError(msg);
     expect(got?.managerPubkey).toBe('02ab558ab81a2343beeed5fe95b159d3ed2a65ed51d7aaa7dcf92bc7ed35bcaafc');
   });
@@ -147,6 +175,7 @@ describe('buildHmEnv', () => {
       hostId: 'u-test',
       managerPubkey: '0279...',
       managerDirectAddress: 'DIRECT://0279...',
+      tenantsHostDir: '/home/u/.sphere-cli/local-hm/02ab/tenants',
       healthPort: 9501,
     });
     expect(env).toMatchObject({
@@ -166,6 +195,7 @@ describe('buildHmEnv', () => {
       hostId: 'u-test',
       managerPubkey: '0279...',
       managerDirectAddress: 'DIRECT://0279...',
+      tenantsHostDir: '/tmp/tenants',
       network: 'mainnet',
       healthPort: 9401,
     });
@@ -178,12 +208,31 @@ describe('buildHmEnv', () => {
       hostId: 'u-test',
       managerPubkey: '0279...',
       managerDirectAddress: 'DIRECT://0279...',
+      tenantsHostDir: '/tmp/tenants',
       healthPort: 9401,
     });
     // Pinned by Dockerfile.host-manager — not configurable on the HM side.
     expect(env['TEMPLATES_PATH']).toBe('/app/config/templates.json');
     expect(env['SPHERE_MANAGER_DATA_DIR']).toBe('/app/sphere-manager');
     expect(env['PERSISTENCE_PATH']).toBe('/app/state/state.json');
+  });
+
+  it('sets TENANTS_DIR to the supplied host path (identical-path bind mount)', () => {
+    // Identical-path bind mount: TENANTS_DIR must be the SAME host
+    // path that's bind-mounted into the HM container. Otherwise the
+    // HM's docker-in-docker bind mounts for tenants resolve a
+    // non-existent path on the host, docker creates an empty
+    // root-owned dir there, and the tenant hits EACCES.
+    const tenantsHostDir = '/home/dev/.sphere-cli/local-hm/abc123/tenants';
+    const env = buildHmEnv({
+      controllerPubkey: '02ab',
+      hostId: 'u-test',
+      managerPubkey: '0279...',
+      managerDirectAddress: 'DIRECT://0279...',
+      tenantsHostDir,
+      healthPort: 9401,
+    });
+    expect(env['TENANTS_DIR']).toBe(tenantsHostDir);
   });
 });
 

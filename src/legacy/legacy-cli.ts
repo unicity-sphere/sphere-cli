@@ -723,6 +723,12 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
 
   const result = await Sphere.init({
     ...initProviders,
+    // Phase 6 P2 fork — pass network through so ensureTokenEngine picks
+    // up NETWORKS[network].trustBaseUrl + aggregatorApiKey and constructs
+    // the v2 SphereTokenEngine. Without this Sphere.init defaults to
+    // 'mainnet' and testnet2 wallets fail to mint nametags with
+    // "Token engine not available".
+    network: config.network,
     autoGenerate: options?.autoGenerate,
     mnemonic: options?.mnemonic,
     nametag: options?.nametag,
@@ -2746,6 +2752,8 @@ async function main(): Promise<void> {
 
               const { sphere: legacySphere } = await Sphere.init({
                 ...legacyProviders,
+                // Phase 6 P2 fork — network for v2 token engine construction.
+                network: config.network,
                 transport: createNoopTransport(),
                 autoGenerate: false,
               });

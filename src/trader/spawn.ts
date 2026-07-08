@@ -29,6 +29,7 @@ import { initSphere } from '../host/sphere-init.js';
 import { createDmTransport, type DmTransport } from '../transport/dm-transport.js';
 import { createHmcpRequest, type HmcpRequest, type HmcpResponse } from '../transport/hmcp-types.js';
 import { TimeoutError, TransportError } from '../transport/errors.js';
+import { createAcpDmTransport } from './acp-transport.js';
 
 // =============================================================================
 // Types
@@ -152,33 +153,37 @@ export function deriveTenantName(
  *   DMs signed by our wallet
  * - `UNICITY_NETWORK` / `UNICITY_RELAYS` (relays inherited from HM's
  *   template defaults; we don't override unless asked)
- * - `UNICITY_TRUSTED_ESCROWS` / `TRADER_SCAN_INTERVAL_MS`
+ * - `TRADER_SCAN_INTERVAL_MS` (non-UNICITY_ prefix, so the HM accepts it)
  * - Test-fund + fault-injection allow-flag for testnet self-mint
  *
- * Critically: we do NOT synthesize the ACP boot envelope
- * (UNICITY_MANAGER_PUBKEY, UNICITY_BOOT_TOKEN, UNICITY_INSTANCE_ID,
- * UNICITY_INSTANCE_NAME, UNICITY_TEMPLATE_ID) — the HM injects those
- * itself when it spawns the tenant container, because parseTenantConfig
- * reads them from the env the HM passes (`docker run -e ...`).
+ * Critically: we do NOT pass ANY `UNICITY_*` env vars via `hm.spawn`.
+ * The HM blocks the entire `UNICITY_*` prefix in user-supplied env
+ * (`shared/forbidden-env.ts`) to prevent boot-envelope spoofing, and
+ * injects the boot envelope itself: `UNICITY_MANAGER_PUBKEY`,
+ * `UNICITY_MANAGER_DIRECT_ADDRESS`, `UNICITY_BOOT_TOKEN`,
+ * `UNICITY_INSTANCE_ID`, `UNICITY_INSTANCE_NAME`, `UNICITY_TEMPLATE_ID`,
+ * `UNICITY_NETWORK`, `UNICITY_DATA_DIR`, `UNICITY_TOKENS_DIR`, AND
+ * `UNICITY_CONTROLLER_PUBKEY` (derived from the request's sender pubkey).
+ * See `agentic_hosting/src/host-manager/manager.ts:1021-1033`.
+ *
+ * Trusted escrows are NOT passed via env (they'd need `UNICITY_TRUSTED_ESCROWS`
+ * which the HM blocks). Instead, after spawn we chain a `SET_STRATEGY`
+ * ACP command — see `spawnTrader()` below.
  *
  * Exported for unit tests.
  */
 export function buildTraderEnv(opts: {
   readonly controllerPubkey: string;
-  readonly trustedEscrows?: ReadonlyArray<string>;
   readonly scanIntervalMs?: number;
   readonly testFund?: string;
-  readonly network?: string;
 }): Record<string, string> {
-  const env: Record<string, string> = {
-    UNICITY_CONTROLLER_PUBKEY: opts.controllerPubkey,
-  };
-  if (opts.network) env['UNICITY_NETWORK'] = opts.network;
+  // controllerPubkey accepted in the signature for back-compat / call-site
+  // consistency but NOT emitted — the HM derives it from the request's
+  // sender pubkey on its own.
+  void opts.controllerPubkey;
+  const env: Record<string, string> = {};
   if (opts.scanIntervalMs !== undefined) {
     env['TRADER_SCAN_INTERVAL_MS'] = String(opts.scanIntervalMs);
-  }
-  if (opts.trustedEscrows && opts.trustedEscrows.length > 0) {
-    env['UNICITY_TRUSTED_ESCROWS'] = opts.trustedEscrows.join(',');
   }
   if (opts.testFund && opts.testFund.trim()) {
     // The trader's production guard requires TRADER_FAULT_INJECTION_ALLOWED=1
@@ -239,17 +244,37 @@ export async function spawnTrader(opts: TraderSpawnOptions): Promise<TraderSpawn
     const instanceName = deriveTenantName(id.nametag, id.chainPubkey, opts.name);
     const traderEnv = buildTraderEnv({
       controllerPubkey: id.chainPubkey,
-      trustedEscrows: opts.trustedEscrows,
       scanIntervalMs: opts.scanIntervalMs,
       testFund: opts.testFund,
-      network,
     });
+    // Network goes via the HM's manager-config (UNICITY_NETWORK is auto-
+    // injected by the HM); the wrapper doesn't pass it via hm.spawn env.
+    void network;
 
+    // Default the tenant's nametag to its instance name. The HM accepts
+    // a `nametag` field on hm.spawn (HmSpawnPayload in hmcp-types.ts);
+    // when omitted, the HM auto-generates an opaque `@t-<hex>` nametag.
+    // Operator workflows (the trader-roundtrip soak, the demo playbook,
+    // typical scripted callers) expect to address the tenant under the
+    // human-readable instance name they chose, so we default to that.
+    // A future flag (`--tenant-nametag`) could override.
     const result = await spawnOrAdoptTenant(sphere, hmMeta, {
       instance_name: instanceName,
       template_id: DEFAULT_TEMPLATE_ID,
+      nametag: instanceName,
       env: traderEnv,
     }, opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS);
+
+    // ── 3. Configure trusted escrows via post-spawn SET_STRATEGY ──────
+    // UNICITY_TRUSTED_ESCROWS can't ride in the hm.spawn env (UNICITY_*
+    // prefix is HM-blocked to prevent boot-envelope spoofing — see
+    // agentic_hosting/src/shared/forbidden-env.ts). The trader exposes
+    // a SET_STRATEGY ACP command that overrides DEFAULT_STRATEGY at
+    // runtime. We use it here so `--trusted-escrows` works end-to-end
+    // through the wrapper.
+    if (opts.trustedEscrows && opts.trustedEscrows.length > 0) {
+      await applyTrustedEscrows(sphere, result.tenant_direct_address, opts.trustedEscrows);
+    }
 
     return {
       ...result,
@@ -332,7 +357,7 @@ interface AdoptedTenant {
 async function spawnOrAdoptTenant(
   sphere: Sphere,
   hmMeta: LocalHmMetadata,
-  payload: { instance_name: string; template_id: string; env: Record<string, string> },
+  payload: { instance_name: string; template_id: string; nametag?: string; env: Record<string, string> },
   readyTimeoutMs: number,
 ): Promise<AdoptedTenant> {
   const transport = createDmTransport(sphere.communications, {
@@ -537,6 +562,50 @@ async function findRunningTenantByName(
 export function isLiveState(state: string): boolean {
   const s = state.toUpperCase();
   return s === 'CREATED' || s === 'BOOTING' || s === 'RUNNING';
+}
+
+/**
+ * Set the freshly-spawned trader tenant's `trusted_escrows` strategy via
+ * a SET_STRATEGY ACP command. Needed because UNICITY_TRUSTED_ESCROWS
+ * can't ride in `hm.spawn` env (HM blocks all UNICITY_* keys in user-
+ * supplied env to prevent boot-envelope spoofing). The trader exposes
+ * SET_STRATEGY directly via ACP — see `agentic_hosting/.../trader-main.ts:240`
+ * for the precedence rules (DEFAULT_STRATEGY → persisted → file → env →
+ * ACP). The ACP override sticks for the tenant's lifetime.
+ *
+ * Best-effort: a SET_STRATEGY failure is logged-and-swallowed because
+ * the tenant is otherwise healthy and the operator can re-issue the
+ * strategy update via `sphere trader set-strategy` manually.
+ */
+async function applyTrustedEscrows(
+  sphere: Sphere,
+  tenantAddress: string,
+  trustedEscrows: ReadonlyArray<string>,
+): Promise<void> {
+  const transport = createAcpDmTransport(sphere.communications, {
+    tenantAddress,
+    timeoutMs: 30_000,
+    instanceId: 'sphere-cli',
+    instanceName: 'sphere-cli',
+  });
+  try {
+    const res = await transport.sendCommand('SET_STRATEGY', {
+      trusted_escrows: Array.from(trustedEscrows),
+    });
+    if (res.ok === false) {
+      process.stderr.write(
+        `sphere-cli: SET_STRATEGY (post-spawn trusted_escrows) returned ${res.error_code}: ${res.message}\n` +
+        `  Use \`sphere trader set-strategy --tenant ${tenantAddress} --trusted-escrows ${trustedEscrows.join(',')}\` to re-apply.\n`,
+      );
+    }
+  } catch (e) {
+    process.stderr.write(
+      `sphere-cli: SET_STRATEGY (post-spawn trusted_escrows) threw ${String((e as Error).message ?? e)}\n` +
+      `  Use \`sphere trader set-strategy --tenant ${tenantAddress} --trusted-escrows ${trustedEscrows.join(',')}\` to re-apply.\n`,
+    );
+  } finally {
+    await transport.dispose().catch(() => undefined);
+  }
 }
 
 async function safeDestroy(sphere: Sphere): Promise<void> {

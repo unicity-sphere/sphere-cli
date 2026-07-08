@@ -44,32 +44,17 @@ describe('deriveTenantName', () => {
 });
 
 describe('buildTraderEnv', () => {
-  it('always sets UNICITY_CONTROLLER_PUBKEY', () => {
+  it('produces an empty env when only controllerPubkey is set (controller pubkey is HM-injected, not user-supplied)', () => {
+    // The HM auto-injects UNICITY_CONTROLLER_PUBKEY from the request's
+    // sender pubkey. The wrapper deliberately does NOT include it in
+    // user-supplied env — the HM would reject UNICITY_* prefix anyway.
     const env = buildTraderEnv({ controllerPubkey: '0398' });
-    expect(env['UNICITY_CONTROLLER_PUBKEY']).toBe('0398');
+    expect(env).toEqual({});
   });
 
-  it('omits TRADER_SCAN_INTERVAL_MS when not set', () => {
-    const env = buildTraderEnv({ controllerPubkey: '0398' });
-    expect(env).not.toHaveProperty('TRADER_SCAN_INTERVAL_MS');
-  });
-
-  it('passes scanIntervalMs through as string', () => {
+  it('passes scanIntervalMs through as TRADER_SCAN_INTERVAL_MS', () => {
     const env = buildTraderEnv({ controllerPubkey: '0398', scanIntervalMs: 15000 });
     expect(env['TRADER_SCAN_INTERVAL_MS']).toBe('15000');
-  });
-
-  it('joins trustedEscrows with commas', () => {
-    const env = buildTraderEnv({
-      controllerPubkey: '0398',
-      trustedEscrows: ['@escrow-test-02', '@my-local-escrow'],
-    });
-    expect(env['UNICITY_TRUSTED_ESCROWS']).toBe('@escrow-test-02,@my-local-escrow');
-  });
-
-  it('omits UNICITY_TRUSTED_ESCROWS when list is empty', () => {
-    const env = buildTraderEnv({ controllerPubkey: '0398', trustedEscrows: [] });
-    expect(env).not.toHaveProperty('UNICITY_TRUSTED_ESCROWS');
   });
 
   it('pairs TRADER_TEST_FUND with TRADER_FAULT_INJECTION_ALLOWED=1', () => {
@@ -87,22 +72,19 @@ describe('buildTraderEnv', () => {
     expect(env).not.toHaveProperty('TRADER_FAULT_INJECTION_ALLOWED');
   });
 
-  it('passes through the network override', () => {
-    const env = buildTraderEnv({ controllerPubkey: '0398', network: 'dev' });
-    expect(env['UNICITY_NETWORK']).toBe('dev');
-  });
-
-  it('does NOT set ACP boot envelope keys (HM injects those)', () => {
-    // UNICITY_MANAGER_PUBKEY / UNICITY_BOOT_TOKEN / UNICITY_INSTANCE_ID /
-    // UNICITY_INSTANCE_NAME / UNICITY_TEMPLATE_ID are injected by the HM
-    // when it spawns the tenant container. The wrapper layer must not
-    // override them — see spawn.ts comment block.
-    const env = buildTraderEnv({ controllerPubkey: '0398' });
-    expect(env).not.toHaveProperty('UNICITY_MANAGER_PUBKEY');
-    expect(env).not.toHaveProperty('UNICITY_BOOT_TOKEN');
-    expect(env).not.toHaveProperty('UNICITY_INSTANCE_ID');
-    expect(env).not.toHaveProperty('UNICITY_INSTANCE_NAME');
-    expect(env).not.toHaveProperty('UNICITY_TEMPLATE_ID');
+  it('does NOT emit any UNICITY_* key — HM blocks the entire prefix in user env', () => {
+    // Defense-in-depth: even if a future opt sets a UNICITY_* key, the
+    // HM (agentic_hosting/src/host-manager/manager.ts:113) rejects the
+    // entire hm.spawn payload with `Forbidden env var prefix`. The
+    // wrapper must keep this surface clean.
+    const env = buildTraderEnv({
+      controllerPubkey: '0398',
+      scanIntervalMs: 30000,
+      testFund: 'aa:1',
+    });
+    for (const key of Object.keys(env)) {
+      expect(key.toUpperCase().startsWith('UNICITY_'), `key ${key} has forbidden UNICITY_ prefix`).toBe(false);
+    }
   });
 });
 

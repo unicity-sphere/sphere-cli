@@ -77,7 +77,7 @@ interface TraderSpawnCliOpts {
   templatesFile?: string;
   healthPort?: string;
   image?: string;
-  network?: 'testnet' | 'mainnet' | 'dev';
+  network?: 'testnet' | 'testnet2' | 'mainnet' | 'dev';
 }
 
 interface TraderStopCliOpts {
@@ -614,7 +614,7 @@ export function createTraderCommand(): Command {
     .option('--hm-image <ref>', 'Override the local HM container image')
     .option('--templates-file <path>', 'Override templates.json mounted into the HM')
     .option('--health-port <port>', 'Override HM health-port host mapping (127.0.0.1:<port>)')
-    .option('--network <name>', 'Sphere network: testnet|mainnet|dev (default: testnet)')
+    .option('--network <name>', 'Sphere network: testnet|testnet2|mainnet|dev (default: testnet)')
     .action(async function (this: Command, opts: TraderSpawnCliOpts) {
       await handleSpawn(this, opts);
     });

@@ -89,7 +89,7 @@ export interface TraderSpawnOptions {
    * Sphere network for both wallet sanity-check and the test-fund gate.
    * Defaults to whatever the wallet's `Sphere` instance reports.
    */
-  readonly network?: 'testnet' | 'mainnet' | 'dev';
+  readonly network?: 'testnet' | 'testnet2' | 'mainnet' | 'dev';
 }
 
 export interface TraderSpawnResult {
@@ -237,6 +237,7 @@ export async function spawnTrader(opts: TraderSpawnOptions): Promise<TraderSpawn
       baseDir,
       templatesFile: opts.templatesFile,
       image: opts.hmImage,
+      network,
       healthPort: opts.healthPort,
     });
 

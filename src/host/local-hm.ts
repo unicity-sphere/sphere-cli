@@ -180,6 +180,13 @@ export interface LocalHmConfig {
    */
   readonly image?: string;
   /**
+   * Sphere network to inject into the HM (`UNICITY_NETWORK`) so the
+   * HM inherits it into every tenant it spawns. Defaults to 'testnet'
+   * for backward compat; pass 'testnet2' to run tenants against the
+   * v2 gateway (Phase-6 UXF fork).
+   */
+  readonly network?: string;
+  /**
    * Health-port to expose on `127.0.0.1`. The HM listens on 9401
    * internally; we map each per-developer HM to a different host port
    * derived from the wallet prefix to avoid collisions. Pass an explicit
@@ -788,6 +795,7 @@ export async function ensureLocalHM(config: LocalHmConfig): Promise<LocalHmMetad
       managerPubkey: currentPubkey,
       managerDirectAddress: currentDirectAddress,
       tenantsHostDir: tenantsDir,
+      network: config.network ?? process.env['SPHERE_LOCAL_HM_NETWORK'],
       healthPort,
     });
 

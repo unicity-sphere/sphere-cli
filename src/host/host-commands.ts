@@ -82,6 +82,7 @@ interface LocalSpawnOpts {
   templatesFile?: string;
   healthPort?: string;
   baseDir?: string;
+  network?: string;
 }
 
 interface LocalStopOpts {
@@ -736,6 +737,7 @@ async function handleLocalSpawn(cmd: Command, opts: LocalSpawnOpts): Promise<voi
         baseDir,
         templatesFile: opts.templatesFile,
         image: opts.hmImage,
+        network: opts.network,
         healthPort,
       });
       if (json) {
@@ -952,6 +954,7 @@ export function createHostCommand(): Command {
     .option('--templates-file <path>', 'Override templates.json (defaults to bundled trader-agent + escrow-service)')
     .option('--health-port <port>', 'Override health-check port on 127.0.0.1 (default: derived from wallet)')
     .option('--base-dir <path>', `Override per-controller data dir (default: ${DEFAULT_LOCAL_HM_BASE_DIR})`)
+    .option('--network <name>', 'Sphere network for the HM (testnet|testnet2|mainnet|dev)')
     .action(async function (this: Command, opts: LocalSpawnOpts) {
       await handleLocalSpawn(this, opts);
     });
